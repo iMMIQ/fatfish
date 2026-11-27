@@ -74,6 +74,20 @@ func (s *Service) LoadIndex(ctx context.Context) (int, error) {
 
 // BuildSnapshot constructs a channel-scoped SnapshotInput for a new Frame Segment.
 func (s *Service) BuildSnapshot(ctx context.Context, ch model.ChannelID, activeMemberIDs []string) (model.SnapshotInput, error) {
+	return s.BuildSnapshotWithTime(ctx, ch, activeMemberIDs, time.Now(), time.Local)
+}
+
+// BuildSnapshotWithTime constructs a channel-scoped SnapshotInput frozen ONCE at segment creation,
+// including a human-readable local time anchor and recent 48h group highlights without breaking KV cache.
+func (s *Service) BuildSnapshotWithTime(ctx context.Context, ch model.ChannelID, activeMemberIDs []string, now time.Time, loc *time.Location) (model.SnapshotInput, error) {
+	if loc == nil {
+		loc = time.UTC
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	localNow := now.In(loc)
+
 	lore, _ := s.store.ListLore(ctx, ch, 15)
 	notes, _ := s.store.ListNotes(ctx, ch, true)
 	names, _ := s.store.GetMemberNames(ctx, ch)
@@ -94,15 +108,56 @@ func (s *Service) BuildSnapshot(ctx context.Context, ch model.ChannelID, activeM
 			cards = append(cards, card)
 		}
 	}
+
+	var highlights []string
+	if eps, err := s.store.RecentEpisodesSince(ctx, ch, now.Add(-48*time.Hour), 3); err == nil && len(eps) > 0 {
+		for _, ep := range eps {
+			ts := ep.EndTS.In(loc).Format("01-02 15:04")
+			highlights = append(highlights, fmt.Sprintf("- [%s] %s: %s", ts, ep.Topic, truncateText(ep.Summary, 90)))
+		}
+	} else if digests, err := s.store.ListDailyDigests(ctx, ch, 1); err == nil && len(digests) > 0 {
+		d := digests[0]
+		if now.Sub(d.CreatedAt) <= 72*time.Hour && strings.TrimSpace(d.Report) != "" {
+			highlights = append(highlights, fmt.Sprintf("- [%s 群日报] %s", d.DayKey, truncateText(d.Report, 140)))
+		}
+	}
+
 	return model.SnapshotInput{
-		Lore:        lore,
-		PinnedNotes: notes,
-		MemberCards: cards,
+		SessionTime:      formatSessionTime(localNow),
+		Lore:             lore,
+		PinnedNotes:      notes,
+		RecentHighlights: highlights,
+		MemberCards:      cards,
 	}, nil
 }
 
-// FormatMemberCard formats corroborated (non-tentative) facts ranked by time-decayed confidence
-// and jokes cleanly for prompt injection.
+func formatSessionTime(t time.Time) string {
+	weekdays := [...]string{"周日", "周一", "周二", "周三", "周四", "周五", "周六"}
+	h := t.Hour()
+	period := "白天"
+	switch {
+	case h < 5:
+		period = "凌晨"
+	case h < 8:
+		period = "早上"
+	case h < 11:
+		period = "上午"
+	case h < 13:
+		period = "中午"
+	case h < 17:
+		period = "下午"
+	case h < 19:
+		period = "傍晚"
+	case h < 23:
+		period = "晚上"
+	default:
+		period = "深夜"
+	}
+	return fmt.Sprintf("%s %s %s %s", t.Format("2006-01-02"), weekdays[t.Weekday()], period, t.Format("15:04"))
+}
+
+// FormatMemberCard formats corroborated (non-tentative) facts ranked by time-decayed confidence,
+// interaction style note, and recent jokes cleanly for prompt injection.
 func FormatMemberCard(p model.MemberProfile, displayName string) string {
 	nowMs := time.Now().UnixMilli()
 	type scoredFact struct {
@@ -126,19 +181,35 @@ func FormatMemberCard(p model.MemberProfile, displayName string) string {
 			break
 		}
 	}
-	if len(facts) == 0 && len(p.Jokes) == 0 {
+	style := strings.TrimSpace(p.StyleNote)
+	if len(facts) == 0 && len(p.Jokes) == 0 && style == "" {
 		return ""
 	}
 	label := p.MemberID
 	if displayName != "" && displayName != p.MemberID {
 		label = fmt.Sprintf("%s(%s)", displayName, p.MemberID)
 	}
-	parts := make([]string, 0, 2)
+	parts := make([]string, 0, 3)
+	if style != "" {
+		parts = append(parts, "互动风格: "+style)
+	}
 	if len(facts) > 0 {
 		parts = append(parts, strings.Join(facts, "; "))
 	}
 	if len(p.Jokes) > 0 {
-		parts = append(parts, "memes: "+p.Jokes[len(p.Jokes)-1].Text)
+		start := len(p.Jokes) - 2
+		if start < 0 {
+			start = 0
+		}
+		var jokes []string
+		for _, j := range p.Jokes[start:] {
+			if t := strings.TrimSpace(j.Text); t != "" {
+				jokes = append(jokes, t)
+			}
+		}
+		if len(jokes) > 0 {
+			parts = append(parts, "梗: "+strings.Join(jokes, " / "))
+		}
 	}
 	return fmt.Sprintf("- %s: %s", label, strings.Join(parts, " | "))
 }
@@ -375,6 +446,10 @@ type EpisodeExtraction struct {
 		MemberID string `json:"member_id"`
 		Joke     string `json:"joke"`
 	} `json:"candidate_jokes"`
+	MemberStyles []struct {
+		MemberID string `json:"member_id"`
+		Style    string `json:"style"`
+	} `json:"member_styles"`
 	CandidateLore []struct {
 		Term    string `json:"term"`
 		Meaning string `json:"meaning"`
@@ -582,10 +657,11 @@ func (s *Service) DistillWindow(ctx context.Context, ch model.ChannelID, win []m
 Rules:
 1. Key every participant strictly by their immutable member_id shown in parentheses, NEVER by nickname.
 2. Separate jokes/sarcasm/shitposting into candidate_jokes or candidate_lore; NEVER record sarcasm as candidate_facts.
-3. Never extract candidate_facts or candidate_jokes for the bot itself.
-4. Keep arrays compact (at most 5 items each) so the JSON stays concise and valid.
-5. Output ONLY valid compact JSON matching:
-{"topic":"...","summary":"...","participants":[{"id":"...","role_in_topic":"..."}],"notable_quotes":["..."],"candidate_facts":[{"member_id":"...","fact":"...","serious":true}],"candidate_jokes":[{"member_id":"...","joke":"..."}],"candidate_lore":[{"term":"...","meaning":"..."}]}`
+3. Never extract candidate_facts, candidate_jokes, or member_styles for the bot itself.
+4. For member_styles, capture brief interaction vibe with the group/bot when clear (e.g. "爱互怼的熟人", "爱聊技术的老哥", "话少但爱发图"), at most 12 chars.
+5. Keep arrays compact (at most 5 items each) so the JSON stays concise and valid.
+6. Output ONLY valid compact JSON matching:
+{"topic":"...","summary":"...","participants":[{"id":"...","role_in_topic":"..."}],"notable_quotes":["..."],"candidate_facts":[{"member_id":"...","fact":"...","serious":true}],"candidate_jokes":[{"member_id":"...","joke":"..."}],"member_styles":[{"member_id":"...","style":"..."}],"candidate_lore":[{"term":"...","meaning":"..."}]}`
 
 	resp, err := s.hub.Chat(ctx, role, infer.ChatRequest{
 		Messages: []infer.ChatMessage{
@@ -666,6 +742,12 @@ Rules:
 			continue
 		}
 		_ = s.AddProfileJoke(ctx, ch, cj.MemberID, cj.Joke, ep.ID)
+	}
+	for _, ms := range ext.MemberStyles {
+		if ms.MemberID == "" || botIDs[ms.MemberID] || strings.TrimSpace(ms.Style) == "" {
+			continue
+		}
+		_ = s.UpdateProfileStyle(ctx, ch, ms.MemberID, ms.Style)
 	}
 	for _, cl := range ext.CandidateLore {
 		if strings.TrimSpace(cl.Term) == "" || strings.TrimSpace(cl.Meaning) == "" {
@@ -820,6 +902,19 @@ func (s *Service) AddProfileJoke(ctx context.Context, ch model.ChannelID, member
 	if len(p.Jokes) > 12 {
 		p.Jokes = p.Jokes[len(p.Jokes)-12:]
 	}
+	return s.store.SaveProfile(ctx, p)
+}
+
+// UpdateProfileStyle updates the concise interaction vibe note for a channel member.
+func (s *Service) UpdateProfileStyle(ctx context.Context, ch model.ChannelID, memberID, style string) error {
+	s.profileMu.Lock()
+	defer s.profileMu.Unlock()
+
+	p, err := s.store.GetProfile(ctx, ch, memberID)
+	if err != nil {
+		return err
+	}
+	p.StyleNote = truncateText(strings.TrimSpace(style), 24)
 	return s.store.SaveProfile(ctx, p)
 }
 

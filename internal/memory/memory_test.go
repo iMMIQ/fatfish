@@ -205,4 +205,23 @@ func TestFactDecayHalfLifeAndOverlappingEpisodeDedup(t *testing.T) {
 	if err != nil || outEp != nil {
 		t.Fatalf("expected overlapping window to be skipped (nil, nil), got ep=%+v err=%v", outEp, err)
 	}
+
+	// BuildSnapshotWithTime must include SessionTime, RecentHighlights, and member StyleNote.
+	_ = st.UpsertMember(ctx, model.Member{ChannelID: ch, MemberID: "u9", DisplayName: "Bob", UpdatedAt: time.Now()})
+	if err := svc.UpdateProfileStyle(ctx, ch, "u9", "爱互怼的熟人"); err != nil {
+		t.Fatalf("UpdateProfileStyle: %v", err)
+	}
+	snap, err := svc.BuildSnapshotWithTime(ctx, ch, []string{"u9"}, time.Now(), time.UTC)
+	if err != nil {
+		t.Fatalf("BuildSnapshotWithTime: %v", err)
+	}
+	if snap.SessionTime == "" {
+		t.Fatal("expected non-empty SessionTime")
+	}
+	if len(snap.RecentHighlights) == 0 || !strings.Contains(snap.RecentHighlights[0], "test") {
+		t.Fatalf("expected recent 48h episode highlight, got %#v", snap.RecentHighlights)
+	}
+	if len(snap.MemberCards) == 0 || !strings.Contains(snap.MemberCards[0], "爱互怼的熟人") {
+		t.Fatalf("expected StyleNote in member card, got %#v", snap.MemberCards)
+	}
 }

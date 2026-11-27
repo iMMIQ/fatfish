@@ -148,6 +148,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     member_id  TEXT NOT NULL,
     facts_json TEXT NOT NULL,
     jokes_json TEXT NOT NULL,
+    style_note TEXT NOT NULL DEFAULT '',
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (channel_id, member_id)
 );

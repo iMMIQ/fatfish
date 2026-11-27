@@ -276,6 +276,7 @@ type turnOutcome struct {
 	trig             triggerState
 	committed        bool
 	proactiveActed   bool
+	skippedThread    bool
 	uncommittedBatch []model.Message
 	segID            int64
 	seenMembers      []string
@@ -484,6 +485,18 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		return 0, false
 	}
 
+	// Enrich poke targets, @mentions, and silent group notices (recall/join) with known member display names.
+	r.enrichInboundEvent(ctx, msg)
+
+	// Silent background notices (e.g. group_recall, group_increase) enter pendingMsgs without triggering a turn.
+	if msg.SilentNotice {
+		r.pendingMsgs = append(r.pendingMsgs, cloneMessage(*msg))
+		if len(r.pendingMsgs) > 60 {
+			r.pendingMsgs = r.pendingMsgs[len(r.pendingMsgs)-60:]
+		}
+		return 0, false
+	}
+
 	// Resolve RepliedToBot and bounded quote chain (depth <= 3) via local L0 + transport.GetMessage fallback.
 	if msg.ReplyToMsgID != "" {
 		r.resolveQuoteChain(ctx, msg, 3)
@@ -591,26 +604,43 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		return 0, false
 	}
 
-	// Poke mode filtering & optional reverse poke (SPEC §5.3 / PokeConfig).
+	// Poke mode filtering & delayed natural reverse poke (SPEC §5.3 / PokeConfig).
 	isPokeOnly := len(msg.Parts) == 1 && msg.Parts[0].Kind == model.PartPoke
 	pokedForPolicy := msg.PokedBot
+	pokeBystander := false
 	if isPokeOnly {
 		switch strings.ToLower(strings.TrimSpace(cfg.Policy.Poke.Mode)) {
 		case "ignore":
 			pokedForPolicy = false
 		case "all":
-			pokedForPolicy = true
+			if msg.PokedBot {
+				pokedForPolicy = true
+			} else {
+				pokedForPolicy = false
+				pokeBystander = true
+			}
 		default: // "bot_only"
 			pokedForPolicy = msg.PokedBot
 		}
-		if pokedForPolicy && cfg.Policy.Poke.ReverseProb > 0 && rand.Float64() < cfg.Policy.Poke.ReverseProb && r.mgr.tr != nil {
+		// Only reverse-poke when the bot itself was poked, with a humanlike 1.0~2.5s delay.
+		if msg.PokedBot && pokedForPolicy && cfg.Policy.Poke.ReverseProb > 0 && rand.Float64() < cfg.Policy.Poke.ReverseProb && r.mgr.tr != nil {
+			expEpoch := r.epoch.Load()
+			delay := time.Duration((1.0 + rand.Float64()*1.5) * float64(time.Second))
 			r.mgr.wg.Add(1)
-			go func(target string) {
+			go func(target string, d time.Duration, ep int64) {
 				defer r.mgr.wg.Done()
+				select {
+				case <-time.After(d):
+				case <-r.mgr.shutdownCtx.Done():
+					return
+				}
+				if r.epoch.Load() != ep {
+					return
+				}
 				pctx, cancel := context.WithTimeout(r.mgr.shutdownCtx, 2*time.Second)
 				defer cancel()
 				_ = r.mgr.tr.SendPoke(pctx, r.ch, target)
-			}(msg.SenderID)
+			}(msg.SenderID, delay, expEpoch)
 		}
 	}
 
@@ -619,7 +649,6 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 	if r.ch.IsGroup() && cfg.Policy.PlusOne.Enabled && !msg.MentionedBot && !msg.RepliedToBot && !pokedForPolicy {
 		switch r.tryPlusOne(ctx, msg, cfg) {
 		case plusOneEcho:
-			r.pendingMsgs = append(r.pendingMsgs, cloneMessage(*msg))
 			return 0, false
 		case plusOneBreak:
 			plusOneBreakTriggered = true
@@ -657,8 +686,18 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 	}
 
 	shouldReply := !r.ch.IsGroup() || plusOneBreakTriggered // Always reply in DMs or +1 chain break
+	pokeBystanderTriggered := false
 	if r.ch.IsGroup() && !plusOneBreakTriggered {
-		if ok, err := r.mgr.policy.EvalReplyGate(r.ch, env); err == nil {
+		if pokeBystander {
+			prob := cfg.Policy.Poke.OtherPokeReplyProb
+			if prob <= 0 {
+				prob = 0.15
+			}
+			if cooldownOK && !isNight && rand.Float64() < prob {
+				shouldReply = true
+				pokeBystanderTriggered = true
+			}
+		} else if ok, err := r.mgr.policy.EvalReplyGate(r.ch, env); err == nil {
 			shouldReply = ok
 		}
 	}
@@ -716,6 +755,9 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 	case pokedForPolicy:
 		trigKind = "poke"
 		proactive = false
+	case pokeBystanderTriggered:
+		trigKind = "poke_bystander"
+		proactive = true
 	case inThread:
 		trigKind = "thread"
 		proactive = false
@@ -742,8 +784,15 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 	if msg.MentionedBot && plain == "" {
 		return time.Duration(cfg.Policy.MentionWaitSec * float64(time.Second)), true
 	}
-	// Explicit @mention (with content) / reply / poke / +1 break wakes immediately (SPEC §5.3).
-	if msg.MentionedBot || msg.RepliedToBot || pokedForPolicy || plusOneBreakTriggered {
+	// Explicit @mention (with content) / reply optionally coalesces brief multi-bubble bursts via explicit_debounce_sec.
+	if msg.MentionedBot || msg.RepliedToBot {
+		if cfg.Policy.ExplicitDebounceSec > 0 {
+			return time.Duration(cfg.Policy.ExplicitDebounceSec * float64(time.Second)), true
+		}
+		return 0, true
+	}
+	// Direct poke / +1 break wakes immediately.
+	if pokedForPolicy || plusOneBreakTriggered {
 		return 0, true
 	}
 	// DMs, thread continuations, and proactive triggers debounce over input_debounce_sec.
@@ -980,17 +1029,25 @@ func (r *Room) tryPlusOne(ctx context.Context, msg *model.Message, cfg *config.C
 			if errors.Is(err, transport.ErrRiskMuted) {
 				r.engageMute(ctx, cfg)
 			} else if err == nil {
-				_ = r.mgr.store.AppendMessage(ctx, &model.Message{
+				botMsg := model.Message{
 					ChannelID:     r.ch,
 					PlatformMsgID: pid,
 					SenderID:      r.mgr.tr.SelfID(),
-					SenderName:    "fatfish",
+					SenderName:    r.botDisplayName(cfg),
 					FromBot:       true,
 					Parts:         []model.Part{{Kind: model.PartText, Text: txt}},
 					CreatedAt:     time.Now(),
-				})
+				}
+				_ = r.mgr.store.AppendMessage(ctx, &botMsg)
+				// Keep the bot's own +1 echo visible in pendingMsgs so the next LLM turn remembers joining the chain.
+				r.pendingMsgs = append(r.pendingMsgs, cloneMessage(*msg), botMsg)
+				if len(r.pendingMsgs) > 60 {
+					r.pendingMsgs = r.pendingMsgs[len(r.pendingMsgs)-60:]
+				}
+				return plusOneEcho
 			}
 		}
+		r.pendingMsgs = append(r.pendingMsgs, cloneMessage(*msg))
 		return plusOneEcho
 	}
 	if cfg.Policy.PlusOne.BreakProb > 0 && roll < cfg.Policy.PlusOne.RepeatProb+cfg.Policy.PlusOne.BreakProb {
@@ -1059,6 +1116,10 @@ func (r *Room) startTurn(trig triggerState) {
 func (r *Room) applyTurnOutcome(out turnOutcome) {
 	if out.proactiveActed {
 		r.lastProactive = time.Now()
+	}
+	if out.skippedThread {
+		r.threadUserID = ""
+		r.threadTurns = 0
 	}
 	if out.segID > 0 {
 		if out.segID != r.lastSegID {
@@ -1152,7 +1213,7 @@ func (r *Room) runTurnWorker(
 			if r.mgr.memory == nil {
 				return frame.SnapshotInput{}, nil
 			}
-			return r.mgr.memory.BuildSnapshot(sctx, r.ch, activeMembers)
+			return r.mgr.memory.BuildSnapshotWithTime(sctx, r.ch, activeMembers, time.Now(), cfg.Location())
 		},
 		func(sctx context.Context, closed *store.SegmentRecord) string {
 			// Summarize closed segment inline within a short 6s budget so Segment N+1 gets Segment N's summary immediately.
@@ -1202,7 +1263,9 @@ func (r *Room) runTurnWorker(
 		cfg.Frame.MaxBackgroundImages, cfg.Frame.MaxImagesPerRequest,
 	)
 	if trig.kind == "plus_one_break" {
-		userPayload.Text += "\n[Hint: Multiple members repeated the same phrase; playfully break the chain in one brief casual line.]"
+		userPayload.Text += "\n[提示: 多名群友正在刷屏复读同一句话，用一句简短俏皮的话自然打断复读。]"
+	} else if trig.kind == "poke_bystander" {
+		userPayload.Text += "\n[提示: 这是群友之间互戳，不是戳你；觉得有节目效果就随口吃瓜调侃一句，没必要接就回复 [[skip]]。]"
 	}
 	out, err := r.mgr.runner.Run(ctx, agent.TurnInput{
 		ChannelID:    r.ch,
@@ -1219,6 +1282,18 @@ func (r *Room) runTurnWorker(
 	if err != nil {
 		if ctx.Err() == nil {
 			r.mgr.log.Error("agent turn failed", "channel", r.ch, "err", err)
+		}
+		return outcome
+	}
+
+	// Graceful natural silence when the model outputs [[skip]] with no text/media/sticker.
+	if out.Skipped && out.Text == "" && len(out.DirectMedia) == 0 && out.StickerIntent == "" {
+		r.mgr.log.Info("turn skipped gracefully", "channel", r.ch, "trigger", trig.kind)
+		if trig.kind == "thread" {
+			outcome.skippedThread = true
+		}
+		if trig.proactive {
+			outcome.proactiveActed = true
 		}
 		return outcome
 	}
@@ -1329,7 +1404,7 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 				ChannelID:     r.ch,
 				PlatformMsgID: pid,
 				SenderID:      r.mgr.tr.SelfID(),
-				SenderName:    "fatfish",
+				SenderName:    r.botDisplayName(cfg),
 				FromBot:       true,
 				Parts:         []model.Part{{Kind: model.PartText, Text: b}},
 				CreatedAt:     time.Now(),
@@ -1379,7 +1454,7 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 					ChannelID:     r.ch,
 					PlatformMsgID: pid,
 					SenderID:      r.mgr.tr.SelfID(),
-					SenderName:    "fatfish",
+					SenderName:    r.botDisplayName(cfg),
 					FromBot:       true,
 					Parts: []model.Part{{
 						Kind:     model.PartImage,
@@ -1397,6 +1472,8 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 		if status == model.DeliverySent && plan.StickerIntent != "" && r.mgr.stickers != nil {
 			stickerDispatched = true
 			ctxQ := trig.msg.PlainText() + " -> " + plan.RawText
+			hasPrecedingText := strings.TrimSpace(plan.RawText) != ""
+			botName := r.botDisplayName(cfg)
 			r.mgr.stickers.DispatchAsync(
 				r.mgr.shutdownCtx,
 				r.ch,
@@ -1405,6 +1482,17 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 				ctxQ,
 				func() int64 { return r.epoch.Load() },
 				func(sctx context.Context, st model.Sticker, imgBytes []byte) error {
+					if hasPrecedingText {
+						delay := time.Duration((0.35 + rand.Float64()*0.65) * float64(time.Second))
+						select {
+						case <-time.After(delay):
+						case <-sctx.Done():
+							return sctx.Err()
+						}
+						if r.epoch.Load() != plan.Epoch {
+							return context.Canceled
+						}
+					}
 					mime := sticker.MimeTypeFor(st)
 					pid, err := r.mgr.tr.SendImage(sctx, r.ch, imgBytes, mime, transport.SendOptions{})
 					if err != nil {
@@ -1418,7 +1506,7 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 						ChannelID:     r.ch,
 						PlatformMsgID: pid,
 						SenderID:      r.mgr.tr.SelfID(),
-						SenderName:    "fatfish",
+						SenderName:    botName,
 						FromBot:       true,
 						Parts: []model.Part{{
 							Kind:     model.PartImage,
@@ -1522,11 +1610,16 @@ func (r *Room) runProactiveGate(ctx context.Context, trig triggerState, cfg *con
 	if budget <= 0 {
 		budget = 4096
 	}
+	botName := r.botDisplayName(cfg)
 	var lines []string
 	usedTok := 0
 	for i := len(recent) - 1; i >= 0; i-- {
 		m := recent[i]
-		line := fmt.Sprintf("%s: %s", m.SenderName, m.PlainText())
+		sender := m.SenderName
+		if m.FromBot {
+			sender = "你(" + botName + ")"
+		}
+		line := fmt.Sprintf("%s: %s", sender, m.PlainText())
 		tok := frame.EstimateTextTokens(line)
 		if usedTok+tok > budget && len(lines) > 0 {
 			break
@@ -1537,9 +1630,19 @@ func (r *Room) runProactiveGate(ctx context.Context, trig triggerState, cfg *con
 	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
 		lines[i], lines[j] = lines[j], lines[i]
 	}
+	gatePrompt := fmt.Sprintf(`你是群友“%s”，正在潜水看群聊。判断对最新一条消息应该怎么反应，不要抢话、不要强行插嘴：
+- "reply"：真的有接梗/吐槽/搭话空间，或者别人提到了你感兴趣的话题/在叫你。
+- "react"：不需要说话，悄悄给最新消息贴一个 QQ 表情表态更有活人感（例如附和、吃瓜、觉得好笑或无语）。
+- "ignore"：别人正在聊私事/互怼/无聊灌水，或者你刚发过言，保持潜水。
+
+若选 "react"，emoji_id 必须从以下数字 ID 中选一个：
+76(赞), 66(爱心), 182(笑哭), 179(doge/狗头), 271(吃瓜), 357(裂开/无语), 424(续火/热闹), 181(戳一戳), 319(比心)
+
+只输出严格 JSON：{"action":"reply"|"react"|"ignore","emoji_id":"数字ID或空字符串"}`, botName)
+
 	resp, err := r.mgr.hub.Chat(ctx, "fast", infer.ChatRequest{
 		Messages: []infer.ChatMessage{
-			{Role: "system", Content: `Decide whether the bot should chime in naturally in this group chat. Output JSON: {"action":"reply"|"ignore"|"react","emoji_id":"optional"}`},
+			{Role: "system", Content: gatePrompt},
 			{Role: "user", Content: strings.Join(lines, "\n")},
 		},
 		MaxTokens:          128,
@@ -1561,12 +1664,109 @@ func (r *Room) runProactiveGate(ctx context.Context, trig triggerState, cfg *con
 	case "reply":
 		return "reply"
 	case "react":
-		if strings.TrimSpace(res.EmojiID) == "" {
+		eid := normalizeQQEmojiID(res.EmojiID)
+		if eid == "" {
 			return "ignore"
 		}
-		return "react:" + strings.TrimSpace(res.EmojiID)
+		return "react:" + eid
 	default:
 		return "ignore"
+	}
+}
+
+func normalizeQQEmojiID(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	allDigits := true
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			allDigits = false
+			break
+		}
+	}
+	if allDigits {
+		return s
+	}
+	aliases := map[string]string{
+		"赞": "76", "👍": "76", "like": "76",
+		"爱心": "66", "❤": "66", "❤️": "66", "heart": "66",
+		"笑哭": "182", "😂": "182", "🤣": "182",
+		"狗头": "179", "doge": "179", "🐶": "179",
+		"吃瓜": "271", "🍉": "271",
+		"裂开": "357", "无语": "357", "💔": "357",
+		"续火": "424", "🔥": "424",
+		"戳一戳": "181",
+		"比心": "319",
+	}
+	if id, ok := aliases[strings.ToLower(s)]; ok {
+		return id
+	}
+	return ""
+}
+
+func (r *Room) botDisplayName(cfg *config.Config) string {
+	if cfg != nil {
+		for _, n := range cfg.Policy.Nicknames {
+			if t := strings.TrimSpace(n); t != "" {
+				return t
+			}
+		}
+	}
+	return "fatfish"
+}
+
+func (r *Room) enrichInboundEvent(ctx context.Context, msg *model.Message) {
+	if r.mgr.store == nil || msg == nil {
+		return
+	}
+	needNames := msg.SilentNotice || msg.SenderName == "" || msg.SenderName == msg.SenderID
+	if !needNames {
+		for _, p := range msg.Parts {
+			if p.Kind == model.PartPoke || p.Kind == model.PartMention || p.Kind == model.PartNotice {
+				needNames = true
+				break
+			}
+		}
+	}
+	if !needNames {
+		return
+	}
+	names, _ := r.mgr.store.GetMemberNames(ctx, r.ch)
+	if (msg.SenderName == "" || msg.SenderName == msg.SenderID) && names[msg.SenderID] != "" {
+		msg.SenderName = names[msg.SenderID]
+	}
+	for i := range msg.Parts {
+		p := &msg.Parts[i]
+		switch p.Kind {
+		case model.PartPoke:
+			if msg.PokedBot {
+				p.Text = "[戳了你]"
+			} else if tName := names[p.TargetID]; tName != "" && tName != p.TargetID {
+				p.Text = fmt.Sprintf("[戳了 %s]", tName)
+			} else if p.TargetID != "" {
+				p.Text = fmt.Sprintf("[戳了 %s]", p.TargetID)
+			} else {
+				p.Text = "[戳了别人]"
+			}
+		case model.PartMention:
+			if tName := names[p.TargetID]; tName != "" && tName != p.TargetID {
+				p.Text = fmt.Sprintf("@%s(%s)", tName, p.TargetID)
+			}
+		case model.PartNotice:
+			if p.RefMsgID != "" {
+				if recalled, err := r.mgr.store.GetMessageByPlatformID(ctx, r.ch, p.RefMsgID); err == nil && recalled != nil {
+					if txt := strings.TrimSpace(recalled.PlainText()); txt != "" {
+						runes := []rune(txt)
+						if len(runes) > 40 {
+							txt = string(runes[:40]) + "..."
+						}
+						p.Text = fmt.Sprintf("[撤回了刚才的消息: %q]", txt)
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -1688,7 +1888,7 @@ func SmartReplyDecoration(trig triggerState, msgsSinceTrigger int, pol config.Po
 	if !pol.SmartReplyDecoration {
 		return trig.msg.PlatformMsgID, ""
 	}
-	if trig.kind == "poke" || trig.kind == "cron" || trig.kind == "dm" {
+	if trig.kind == "poke" || trig.kind == "poke_bystander" || trig.kind == "cron" || trig.kind == "dm" {
 		return "", ""
 	}
 	if msgsSinceTrigger <= 0 {
@@ -1699,9 +1899,14 @@ func SmartReplyDecoration(trig triggerState, msgsSinceTrigger int, pol config.Po
 
 func bubbleDelay(bubble string, maxSec float64) time.Duration {
 	if maxSec <= 0 {
-		maxSec = 1.0
+		maxSec = 1.4
 	}
-	sec := 0.3 + float64(len([]rune(bubble)))*0.02
+	base := 0.35 + float64(len([]rune(bubble)))*0.035
+	jitter := 0.7 + rand.Float64()*0.6 // +-30% human typing rhythm jitter
+	sec := base * jitter
+	if sec < 0.25 {
+		sec = 0.25
+	}
 	if sec > maxSec {
 		sec = maxSec
 	}

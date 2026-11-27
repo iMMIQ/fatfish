@@ -68,17 +68,21 @@ type ModelsConfig struct {
 }
 
 type ModelEndpointConfig struct {
-	Enabled         *bool  `yaml:"enabled,omitempty"`
-	BaseURL         string `yaml:"base_url"`
-	APIKey          string `yaml:"api_key"`
-	Model           string `yaml:"model"`
-	Multimodal      bool   `yaml:"multimodal"`
-	ReasoningEffort string `yaml:"reasoning_effort,omitempty"` // Optional: "low" | "medium" | "high"
-	ThinkingType    string `yaml:"thinking_type,omitempty"`    // Optional: "enabled" | "disabled"
-	Dim             int    `yaml:"dim"`
-	MaxBatch        int    `yaml:"max_batch"`
-	TimeoutSec      int    `yaml:"timeout_sec"`
-	MaxConcurrent   int    `yaml:"max_concurrent"`
+	Enabled          *bool    `yaml:"enabled,omitempty"`
+	BaseURL          string   `yaml:"base_url"`
+	APIKey           string   `yaml:"api_key"`
+	Model            string   `yaml:"model"`
+	Multimodal       bool     `yaml:"multimodal"`
+	Temperature      *float64 `yaml:"temperature,omitempty"`
+	TopP             *float64 `yaml:"top_p,omitempty"`
+	PresencePenalty  *float64 `yaml:"presence_penalty,omitempty"`
+	FrequencyPenalty *float64 `yaml:"frequency_penalty,omitempty"`
+	ReasoningEffort  string   `yaml:"reasoning_effort,omitempty"` // Optional: "low" | "medium" | "high"
+	ThinkingType     string   `yaml:"thinking_type,omitempty"`    // Optional: "enabled" | "disabled"
+	Dim              int      `yaml:"dim"`
+	MaxBatch         int      `yaml:"max_batch"`
+	TimeoutSec       int      `yaml:"timeout_sec"`
+	MaxConcurrent    int      `yaml:"max_concurrent"`
 }
 
 func (m ModelEndpointConfig) IsEnabled() bool {
@@ -110,9 +114,10 @@ type FrameConfig struct {
 }
 
 type PinnedSnapshotBudgets struct {
-	Lore     int `yaml:"lore"`
-	Notes    int `yaml:"notes"`
-	Profiles int `yaml:"profiles"`
+	Lore       int `yaml:"lore"`
+	Notes      int `yaml:"notes"`
+	Profiles   int `yaml:"profiles"`
+	Highlights int `yaml:"highlights"`
 }
 
 type PolicyConfig struct {
@@ -121,6 +126,7 @@ type PolicyConfig struct {
 	IgnoredBots            []string                       `yaml:"ignored_bots"`
 	Nicknames              []string                       `yaml:"nicknames"`
 	MentionWaitSec         float64                        `yaml:"mention_wait_sec"`
+	ExplicitDebounceSec    float64                        `yaml:"explicit_debounce_sec"`
 	MediaWaitSec           float64                        `yaml:"media_wait_sec"`
 	ASRWaitSec             float64                        `yaml:"asr_wait_sec"`
 	InputDebounceSec       float64                        `yaml:"input_debounce_sec"`
@@ -153,6 +159,7 @@ type PlusOneConfig struct {
 type PokeConfig struct {
 	Mode               string  `yaml:"mode"` // bot_only | all | ignore
 	ReverseProb        float64 `yaml:"reverse_prob"`
+	OtherPokeReplyProb float64 `yaml:"other_poke_reply_prob"`
 	AfterReplyProb     float64 `yaml:"after_reply_prob"`
 	AfterReplyMaxChars int     `yaml:"after_reply_max_chars"`
 	AfterReplyDelaySec float64 `yaml:"after_reply_delay_sec"`
@@ -286,9 +293,10 @@ func defaultConfig() *Config {
 			SegmentIdleMinutes: 30,
 			SummaryTokenBudget: 512,
 			PinnedSnapshotBudgets: PinnedSnapshotBudgets{
-				Lore:     120,
-				Notes:    140,
-				Profiles: 220,
+				Lore:       120,
+				Notes:      140,
+				Profiles:   220,
+				Highlights: 220,
 			},
 			MaxImagesPerRequest: 6,
 			MaxBackgroundImages: 2,
@@ -324,6 +332,7 @@ func defaultConfig() *Config {
 			},
 			Poke: PokeConfig{
 				Mode:               "bot_only",
+				OtherPokeReplyProb: 0.15,
 				AfterReplyProb:     0.15,
 				AfterReplyMaxChars: 35,
 				AfterReplyDelaySec: 0.5,

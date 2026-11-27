@@ -319,6 +319,7 @@ func ParseEvent(raw []byte, fallbackSelfID string) *model.Message {
 		SelfID      any             `json:"self_id"`
 		GroupID     any             `json:"group_id"`
 		UserID      any             `json:"user_id"`
+		OperatorID  any             `json:"operator_id"`
 		TargetID    any             `json:"target_id"`
 		MessageID   any             `json:"message_id"`
 		Time        int64           `json:"time"`
@@ -359,14 +360,56 @@ func ParseEvent(raw []byte, fallbackSelfID string) *model.Message {
 			ch = model.MakeChannelID("onebot", selfID, model.ChannelDM, userID)
 		}
 		return &model.Message{
-			ChannelID: ch,
-			SenderID:  userID,
+			ChannelID:  ch,
+			SenderID:   userID,
 			SenderName: userID,
-			PokedBot:  targetID == selfID,
+			PokedBot:   targetID == selfID,
 			Parts: []model.Part{{
 				Kind:     model.PartPoke,
 				TargetID: targetID,
 				Text:     "[戳一戳]",
+			}},
+			CreatedAt: ts,
+		}
+	}
+
+	// Handle silent background group notices (recall, member join) so the bot notices room events.
+	if ev.PostType == "notice" && ev.NoticeType == "group_recall" {
+		userID := anyToString(ev.UserID)
+		groupID := anyToString(ev.GroupID)
+		if userID == "" || userID == selfID || groupID == "" {
+			return nil
+		}
+		ch := model.MakeChannelID("onebot", selfID, model.ChannelGroup, groupID)
+		return &model.Message{
+			ChannelID:    ch,
+			SenderID:     userID,
+			SenderName:   userID,
+			SilentNotice: true,
+			Parts: []model.Part{{
+				Kind:     model.PartNotice,
+				RefMsgID: anyToString(ev.MessageID),
+				TargetID: anyToString(ev.OperatorID),
+				Text:     "[撤回了一条消息]",
+			}},
+			CreatedAt: ts,
+		}
+	}
+	if ev.PostType == "notice" && ev.NoticeType == "group_increase" {
+		userID := anyToString(ev.UserID)
+		groupID := anyToString(ev.GroupID)
+		if userID == "" || userID == selfID || groupID == "" {
+			return nil
+		}
+		ch := model.MakeChannelID("onebot", selfID, model.ChannelGroup, groupID)
+		return &model.Message{
+			ChannelID:    ch,
+			SenderID:     userID,
+			SenderName:   userID,
+			SilentNotice: true,
+			Parts: []model.Part{{
+				Kind: model.PartNotice,
+				Text: "[加入了本群]",
 			}},
 			CreatedAt: ts,
 		}
@@ -418,9 +461,21 @@ func ParseEvent(raw []byte, fallbackSelfID string) *model.Message {
 				qq := anyToString(seg.Data["qq"])
 				if qq == selfID {
 					msg.MentionedBot = true
-				} else if qq != "" && qq != "all" {
-					msg.Parts = append(msg.Parts, model.Part{Kind: model.PartText, Text: "@" + qq})
+				} else if qq == "all" {
+					msg.Parts = append(msg.Parts, model.Part{Kind: model.PartText, Text: "@全体成员"})
+				} else if qq != "" {
+					msg.Parts = append(msg.Parts, model.Part{Kind: model.PartMention, TargetID: qq, Text: "@" + qq})
 				}
+			case "face":
+				if ftxt := formatQQFace(seg.Data); ftxt != "" {
+					msg.Parts = append(msg.Parts, model.Part{Kind: model.PartText, Text: ftxt})
+				}
+			case "mface":
+				sum := strings.TrimSpace(anyToString(seg.Data["summary"]))
+				if sum == "" {
+					sum = "[大表情]"
+				}
+				msg.Parts = append(msg.Parts, model.Part{Kind: model.PartText, Text: sum})
 			case "reply":
 				rid := anyToString(seg.Data["id"])
 				if rid != "" {

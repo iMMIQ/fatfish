@@ -202,3 +202,18 @@ func TestRunnerExhaustedToolIterationsSynthesizesReply(t *testing.T) {
 		t.Fatalf("expected synthesized reply after tool exhaustion, got %q", out.Text)
 	}
 }
+
+func TestExtractSkipMarker(t *testing.T) {
+	clean, skip := ExtractSkipMarker("[[skip]]")
+	if !skip || clean != "" {
+		t.Fatalf("expected pure skip, got clean=%q skip=%v", clean, skip)
+	}
+	clean2, skip2 := ExtractSkipMarker("  [[ SKIP ]]  ")
+	if !skip2 || clean2 != "" {
+		t.Fatalf("expected case-insensitive skip, got clean=%q skip=%v", clean2, skip2)
+	}
+	clean3, skip3 := ExtractSkipMarker("行吧 [[skip]]")
+	if skip3 || clean3 != "行吧" {
+		t.Fatalf("expected text+skip to strip marker without skipping, got clean=%q skip=%v", clean3, skip3)
+	}
+}

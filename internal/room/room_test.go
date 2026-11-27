@@ -285,3 +285,75 @@ policy:
 		t.Fatalf("expected 0 stale bubbles after mid-turn /reset, got %d", got)
 	}
 }
+
+func TestNormalizeQQEmojiIDAndEnrichEvents(t *testing.T) {
+	if got := normalizeQQEmojiID("76"); got != "76" {
+		t.Fatalf("expected 76, got %q", got)
+	}
+	if got := normalizeQQEmojiID("狗头"); got != "179" {
+		t.Fatalf("expected 179 for 狗头, got %q", got)
+	}
+	if got := normalizeQQEmojiID("invalid_emoji"); got != "" {
+		t.Fatalf("expected empty for invalid emoji, got %q", got)
+	}
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "fatfish.yaml")
+	yamlCfg := "data_dir: \"" + filepath.ToSlash(dir) + "\"\ntimezone: \"UTC\"\npolicy:\n  nicknames: [\"TestBot\"]\n"
+	if err := os.WriteFile(cfgPath, []byte(yamlCfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfgMgr, _ := config.NewManager(cfgPath, policy.ValidateConfig)
+	st, err := store.Open(dir, 512, 5)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+	pol, _ := policy.NewEngine(cfgMgr.Get().Policy)
+	mgr := NewManager(Dependencies{Config: cfgMgr, Store: st, Policy: pol})
+	ch := model.MakeChannelID("onebot", "10001", model.ChannelGroup, "77777")
+	ctx := context.Background()
+
+	_ = st.UpsertMember(ctx, model.Member{ChannelID: ch, MemberID: "u1", DisplayName: "Alice", UpdatedAt: time.Now()})
+	_ = st.UpsertMember(ctx, model.Member{ChannelID: ch, MemberID: "u2", DisplayName: "Bob", UpdatedAt: time.Now()})
+	_ = st.AppendMessage(ctx, &model.Message{
+		ChannelID:     ch,
+		PlatformMsgID: "m99",
+		SenderID:      "u1",
+		SenderName:    "Alice",
+		Parts:         []model.Part{{Kind: model.PartText, Text: "secret typo"}},
+		CreatedAt:     time.Now(),
+	})
+
+	r := newRoom(mgr, ch)
+	// 1. Poke between other members resolves both sender and target display names.
+	pokeMsg := &model.Message{
+		ChannelID:  ch,
+		SenderID:   "u1",
+		SenderName: "u1",
+		PokedBot:   false,
+		Parts:      []model.Part{{Kind: model.PartPoke, TargetID: "u2", Text: "[戳一戳]"}},
+		CreatedAt:  time.Now(),
+	}
+	r.enrichInboundEvent(ctx, pokeMsg)
+	if pokeMsg.SenderName != "Alice" || pokeMsg.Parts[0].Text != "[戳了 Bob]" {
+		t.Fatalf("unexpected enriched poke: sender=%q part=%+v", pokeMsg.SenderName, pokeMsg.Parts[0])
+	}
+
+	// 2. Silent recall notice enriches recalled message snippet and does not trigger a turn.
+	recallMsg := &model.Message{
+		ChannelID:    ch,
+		SenderID:     "u1",
+		SenderName:   "u1",
+		SilentNotice: true,
+		Parts:        []model.Part{{Kind: model.PartNotice, RefMsgID: "m99", Text: "[撤回了一条消息]"}},
+		CreatedAt:    time.Now(),
+	}
+	wait, arm := r.onMessage(recallMsg)
+	if arm || wait != 0 {
+		t.Fatalf("silent recall notice must not trigger reply: wait=%v arm=%v", wait, arm)
+	}
+	if len(r.pendingMsgs) != 1 || r.pendingMsgs[0].SenderName != "Alice" || r.pendingMsgs[0].Parts[0].Text != `[撤回了刚才的消息: "secret typo"]` {
+		t.Fatalf("unexpected pending recall notice: %+v", r.pendingMsgs)
+	}
+}

@@ -67,6 +67,8 @@ const (
 	PartPoke    PartKind = "poke"
 	PartQuote   PartKind = "quote"
 	PartForward PartKind = "forward"
+	PartMention PartKind = "mention"
+	PartNotice  PartKind = "notice"
 )
 
 // Part represents a single normalized content segment in a Message.
@@ -104,6 +106,7 @@ type Message struct {
 	MentionedBot  bool      `json:"mentioned_bot,omitempty"`
 	RepliedToBot  bool      `json:"replied_to_bot,omitempty"`
 	PokedBot      bool      `json:"poked_bot,omitempty"`
+	SilentNotice  bool      `json:"silent_notice,omitempty"`
 	ReplyToMsgID  string    `json:"reply_to_msg_id,omitempty"`
 	Parts         []Part    `json:"parts"`
 	CreatedAt     time.Time `json:"created_at"`
@@ -142,7 +145,7 @@ func (m Message) PlainText() string {
 				}
 				b.WriteString(p.Title)
 			}
-		case PartPoke:
+		case PartPoke, PartMention, PartNotice:
 			if p.Text != "" {
 				if b.Len() > 0 {
 					b.WriteByte(' ')
@@ -293,12 +296,13 @@ type ProfileJoke struct {
 	UpdatedAt int64  `json:"updated_at"`
 }
 
-// MemberProfile holds channel-scoped L2 facts and jokes for one member.
+// MemberProfile holds channel-scoped L2 facts, jokes, and interaction style for one member.
 type MemberProfile struct {
 	ChannelID ChannelID     `json:"channel_id"`
 	MemberID  string        `json:"member_id"`
 	Facts     []ProfileFact `json:"facts"`
 	Jokes     []ProfileJoke `json:"jokes"`
+	StyleNote string        `json:"style_note,omitempty"`
 	UpdatedAt time.Time     `json:"updated_at"`
 }
 
@@ -378,8 +382,10 @@ type KVMetric struct {
 // SnapshotInput provides the channel-scoped memory components used ONCE when opening a new Frame segment.
 // Lives in internal/model so internal/memory does not need to import internal/frame (SPEC §2 DAG).
 type SnapshotInput struct {
-	Lore            []LoreEntry
-	PinnedNotes     []Note
-	PreviousSummary string
-	MemberCards     []string // Pre-formatted active member summaries
+	SessionTime      string   // Local date/weekday/period anchor frozen at segment start
+	Lore             []LoreEntry
+	PinnedNotes      []Note
+	PreviousSummary  string
+	RecentHighlights []string // Recent 48h high-signal episodes / digest snippets
+	MemberCards      []string // Pre-formatted active member summaries
 }

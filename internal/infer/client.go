@@ -69,6 +69,9 @@ type ChatRequest struct {
 	Tools              []ToolDefinition `json:"tools,omitempty"`
 	ToolChoice         any              `json:"tool_choice,omitempty"`
 	Temperature        *float64         `json:"temperature,omitempty"`
+	TopP               *float64         `json:"top_p,omitempty"`
+	PresencePenalty    *float64         `json:"presence_penalty,omitempty"`
+	FrequencyPenalty   *float64         `json:"frequency_penalty,omitempty"`
 	MaxTokens          int              `json:"max_tokens,omitempty"`
 	ReasoningEffort    string           `json:"reasoning_effort,omitempty"`
 	Thinking           map[string]any   `json:"thinking,omitempty"`
@@ -251,6 +254,18 @@ func (h *Hub) chatOnce(ctx context.Context, role string, req ChatRequest) (*Chat
 
 	if req.Model == "" {
 		req.Model = ep.Model
+	}
+	if req.Temperature == nil && ep.Temperature != nil {
+		req.Temperature = ep.Temperature
+	}
+	if req.TopP == nil && ep.TopP != nil {
+		req.TopP = ep.TopP
+	}
+	if req.PresencePenalty == nil && ep.PresencePenalty != nil {
+		req.PresencePenalty = ep.PresencePenalty
+	}
+	if req.FrequencyPenalty == nil && ep.FrequencyPenalty != nil {
+		req.FrequencyPenalty = ep.FrequencyPenalty
 	}
 	if req.ReasoningEffort == "" && strings.TrimSpace(ep.ReasoningEffort) != "" {
 		req.ReasoningEffort = strings.TrimSpace(ep.ReasoningEffort)

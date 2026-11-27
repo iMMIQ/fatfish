@@ -46,6 +46,8 @@ func Open(dataDir string, imageMaxDim, maxImageMiB int) (*Store, error) {
 		_ = writeDB.Close()
 		return nil, fmt.Errorf("store: migrate schema: %w", err)
 	}
+	// Idempotent additive migrations for existing SQLite databases.
+	_, _ = writeDB.Exec(`ALTER TABLE profiles ADD COLUMN style_note TEXT NOT NULL DEFAULT ''`)
 
 	readDSN := buildDSN(dbPath, true)
 	readDB, err := sql.Open("sqlite", readDSN)
@@ -1248,6 +1250,24 @@ func (s *Store) ListEpisodes(ctx context.Context, ch model.ChannelID, limit int)
 	return scanEpisodes(rows)
 }
 
+// RecentEpisodesSince returns recent channel episodes ending at or after sinceTS (newest first).
+func (s *Store) RecentEpisodesSince(ctx context.Context, ch model.ChannelID, sinceTS time.Time, limit int) ([]model.Episode, error) {
+	if limit <= 0 {
+		limit = 3
+	}
+	rows, err := s.readDB.QueryContext(ctx,
+		`SELECT id, channel_id, start_seq, end_seq, start_ts, end_ts, topic, summary, participants_json, notable_json, NULL, created_at
+		 FROM episodes WHERE channel_id = ? AND end_ts >= ? ORDER BY end_ts DESC LIMIT ?`,
+		string(ch), sinceTS.UnixMilli(), limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	eps, _, err := scanEpisodes(rows)
+	return eps, err
+}
+
 func (s *Store) AllEpisodesWithEmbeds(ctx context.Context) ([]model.Episode, [][]byte, error) {
 	rows, err := s.readDB.QueryContext(ctx,
 		`SELECT id, channel_id, start_seq, end_seq, start_ts, end_ts, topic, summary, participants_json, notable_json, embed_f16, created_at
@@ -1327,12 +1347,12 @@ func scanEpisodes(rows *sql.Rows) ([]model.Episode, [][]byte, error) {
 }
 
 func (s *Store) GetProfile(ctx context.Context, ch model.ChannelID, memberID string) (*model.MemberProfile, error) {
-	var fJSON, jJSON string
+	var fJSON, jJSON, styleNote string
 	var updMs int64
 	err := s.readDB.QueryRowContext(ctx,
-		`SELECT facts_json, jokes_json, updated_at FROM profiles WHERE channel_id = ? AND member_id = ?`,
+		`SELECT facts_json, jokes_json, style_note, updated_at FROM profiles WHERE channel_id = ? AND member_id = ?`,
 		string(ch), memberID,
-	).Scan(&fJSON, &jJSON, &updMs)
+	).Scan(&fJSON, &jJSON, &styleNote, &updMs)
 	if errors.Is(err, sql.ErrNoRows) {
 		return &model.MemberProfile{ChannelID: ch, MemberID: memberID}, nil
 	}
@@ -1342,6 +1362,7 @@ func (s *Store) GetProfile(ctx context.Context, ch model.ChannelID, memberID str
 	p := &model.MemberProfile{
 		ChannelID: ch,
 		MemberID:  memberID,
+		StyleNote: styleNote,
 		UpdatedAt: time.UnixMilli(updMs),
 	}
 	_ = json.Unmarshal([]byte(fJSON), &p.Facts)
@@ -1354,9 +1375,9 @@ func (s *Store) SaveProfile(ctx context.Context, p *model.MemberProfile) error {
 	jJSON, _ := json.Marshal(p.Jokes)
 	now := time.Now().UnixMilli()
 	_, err := s.writeDB.ExecContext(ctx,
-		`INSERT INTO profiles (channel_id, member_id, facts_json, jokes_json, updated_at) VALUES (?, ?, ?, ?, ?)
-		 ON CONFLICT(channel_id, member_id) DO UPDATE SET facts_json = excluded.facts_json, jokes_json = excluded.jokes_json, updated_at = excluded.updated_at`,
-		string(p.ChannelID), p.MemberID, string(fJSON), string(jJSON), now,
+		`INSERT INTO profiles (channel_id, member_id, facts_json, jokes_json, style_note, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(channel_id, member_id) DO UPDATE SET facts_json = excluded.facts_json, jokes_json = excluded.jokes_json, style_note = excluded.style_note, updated_at = excluded.updated_at`,
+		string(p.ChannelID), p.MemberID, string(fJSON), string(jJSON), strings.TrimSpace(p.StyleNote), now,
 	)
 	return err
 }
@@ -1366,7 +1387,7 @@ func (s *Store) ListProfiles(ctx context.Context, ch model.ChannelID, limit int)
 		limit = 50
 	}
 	rows, err := s.readDB.QueryContext(ctx,
-		`SELECT member_id, facts_json, jokes_json, updated_at FROM profiles WHERE channel_id = ? ORDER BY updated_at DESC LIMIT ?`,
+		`SELECT member_id, facts_json, jokes_json, style_note, updated_at FROM profiles WHERE channel_id = ? ORDER BY updated_at DESC LIMIT ?`,
 		string(ch), limit,
 	)
 	if err != nil {
@@ -1376,12 +1397,13 @@ func (s *Store) ListProfiles(ctx context.Context, ch model.ChannelID, limit int)
 	var out []model.MemberProfile
 	for rows.Next() {
 		var p model.MemberProfile
-		var fJSON, jJSON string
+		var fJSON, jJSON, styleNote string
 		var updMs int64
-		if err := rows.Scan(&p.MemberID, &fJSON, &jJSON, &updMs); err != nil {
+		if err := rows.Scan(&p.MemberID, &fJSON, &jJSON, &styleNote, &updMs); err != nil {
 			return nil, err
 		}
 		p.ChannelID = ch
+		p.StyleNote = styleNote
 		p.UpdatedAt = time.UnixMilli(updMs)
 		_ = json.Unmarshal([]byte(fJSON), &p.Facts)
 		_ = json.Unmarshal([]byte(jJSON), &p.Jokes)

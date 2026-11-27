@@ -24,7 +24,10 @@ import (
 
 const maxToolIterations = 6
 
-var stickerMarkerRe = regexp.MustCompile(`\[\[\s*sticker\s*:\s*([^\]]+?)\s*\]\]`)
+var (
+	stickerMarkerRe = regexp.MustCompile(`\[\[\s*sticker\s*:\s*([^\]]+?)\s*\]\]`)
+	skipMarkerRe    = regexp.MustCompile(`(?i)\[\[\s*skip\s*\]\]`)
+)
 
 // Runner executes a single LLM turn (with optional multi-step tool calling, parallel read-only tool
 // execution, KV cache metrics recording, and Text/Media delivery splitting).
@@ -81,6 +84,7 @@ type TurnOutput struct {
 	Text          string
 	DirectMedia   []model.DirectMedia
 	StickerIntent string
+	Skipped       bool
 	NewFrames     []frame.StoredFramePayload
 	TrimUpToIndex int // >= 0 if AssemblePlan deferred a whole-turn trim; -1 otherwise
 	Stats         TurnStats
@@ -255,10 +259,12 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 		}
 	}
 
-	// Extract optional zero-latency async sticker marker [[sticker: ...]].
+	// Extract optional zero-latency async sticker marker [[sticker: ...]] and [[skip]] graceful no-reply marker.
 	cleanText, stickerIntent := ExtractStickerMarker(finalText)
+	cleanText, skipped := ExtractSkipMarker(cleanText)
 
 	if cleanText != "" || len(directMedia) > 0 || stickerIntent != "" {
+		skipped = false
 		assistantText := cleanText
 		if assistantText == "" && stickerIntent != "" {
 			assistantText = "[sticker:" + stickerIntent + "]"
@@ -273,6 +279,7 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 		Text:          cleanText,
 		DirectMedia:   directMedia,
 		StickerIntent: stickerIntent,
+		Skipped:       skipped,
 		NewFrames:     newFrames,
 		TrimUpToIndex: assembled.TrimUpToIndex,
 		Stats:         stats,
@@ -336,4 +343,13 @@ func ExtractStickerMarker(s string) (clean string, intent string) {
 	intent = strings.TrimSpace(matches[len(matches)-1][1])
 	clean = strings.TrimSpace(stickerMarkerRe.ReplaceAllString(s, ""))
 	return clean, intent
+}
+
+// ExtractSkipMarker detects and strips [[skip]] when the model chooses a natural silent close.
+func ExtractSkipMarker(s string) (clean string, skipped bool) {
+	if !skipMarkerRe.MatchString(s) {
+		return strings.TrimSpace(s), false
+	}
+	clean = strings.TrimSpace(skipMarkerRe.ReplaceAllString(s, ""))
+	return clean, clean == ""
 }

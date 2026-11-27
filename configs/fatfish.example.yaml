@@ -23,11 +23,15 @@ models:
     api_key: "${LLM_API_KEY}"
     model: "glm-5.4"
     multimodal: true
+    temperature: 0.9
+    presence_penalty: 0.2
     reasoning_effort: "low"
     timeout_sec: 90
   primary_fallback:
     model: "glm-5.3-flash" # Inherits primary base_url/api_key if omitted
     multimodal: true
+    temperature: 0.9
+    presence_penalty: 0.2
     reasoning_effort: "low"
     timeout_sec: 90
   fast:
@@ -80,6 +84,7 @@ frame:
     lore: 120
     notes: 140
     profiles: 220
+    highlights: 220
   max_images_per_request: 6
   max_background_images: 2
   image_token_reserve: 1600
@@ -95,6 +100,7 @@ policy:
   ignored_bots: []
   nicknames: ["fatfish", "fish"]
   mention_wait_sec: 1.0
+  explicit_debounce_sec: 0.8
   media_wait_sec: 3.0
   asr_wait_sec: 4.0
   input_debounce_sec: 1.2
@@ -119,6 +125,7 @@ policy:
   poke:
     mode: "bot_only" # bot_only | all | ignore
     reverse_prob: 0.0
+    other_poke_reply_prob: 0.15
     after_reply_prob: 0.15
     after_reply_max_chars: 35
     after_reply_delay_sec: 0.5

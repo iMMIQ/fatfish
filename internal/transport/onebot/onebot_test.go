@@ -47,4 +47,43 @@ func TestParseEventMultimodalAndPoke(t *testing.T) {
 	if pMsg == nil || !pMsg.PokedBot {
 		t.Fatalf("expected PokedBot=true, got %+v", pMsg)
 	}
+
+	// QQ native face, mface, and @other mention
+	faceRaw := []byte(`{
+		"post_type": "message",
+		"message_type": "group",
+		"self_id": 10001,
+		"group_id": 99999,
+		"user_id": 20001,
+		"message_id": 889,
+		"sender": {"user_id": 20001, "card": "Alice"},
+		"message": [
+			{"type": "at", "data": {"qq": "20002"}},
+			{"type": "text", "data": {"text": " 真行"}},
+			{"type": "face", "data": {"id": "179"}},
+			{"type": "mface", "data": {"summary": "[捂脸哭]"}}
+		]
+	}`)
+	fMsg := ParseEvent(faceRaw, "10001")
+	if fMsg == nil || len(fMsg.Parts) != 4 {
+		t.Fatalf("expected 4 parts for face/mface/mention, got %+v", fMsg)
+	}
+	if fMsg.Parts[0].Kind != model.PartMention || fMsg.Parts[0].TargetID != "20002" {
+		t.Fatalf("expected PartMention for @other, got %+v", fMsg.Parts[0])
+	}
+	if fMsg.Parts[2].Text != "[表情:doge]" || fMsg.Parts[3].Text != "[捂脸哭]" {
+		t.Fatalf("unexpected face/mface parts: %+v", fMsg.Parts)
+	}
+
+	// Silent group_recall and group_increase notices
+	recallRaw := []byte(`{"post_type":"notice","notice_type":"group_recall","self_id":10001,"group_id":99999,"user_id":20001,"operator_id":20001,"message_id":888}`)
+	rMsg := ParseEvent(recallRaw, "10001")
+	if rMsg == nil || !rMsg.SilentNotice || len(rMsg.Parts) != 1 || rMsg.Parts[0].Kind != model.PartNotice || rMsg.Parts[0].RefMsgID != "888" {
+		t.Fatalf("unexpected recall notice: %+v", rMsg)
+	}
+	joinRaw := []byte(`{"post_type":"notice","notice_type":"group_increase","self_id":10001,"group_id":99999,"user_id":20003}`)
+	jMsg := ParseEvent(joinRaw, "10001")
+	if jMsg == nil || !jMsg.SilentNotice || len(jMsg.Parts) != 1 || jMsg.Parts[0].Text != "[加入了本群]" {
+		t.Fatalf("unexpected join notice: %+v", jMsg)
+	}
 }
