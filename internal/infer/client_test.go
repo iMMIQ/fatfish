@@ -145,3 +145,47 @@ func TestPrimaryAutomaticFallback(t *testing.T) {
 			primaryHits.Load(), fallbackHits.Load())
 	}
 }
+
+func TestReasoningEffortAndThinkingTypeInjection(t *testing.T) {
+	var gotEffort string
+	var gotThinkingType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model           string         `json:"model"`
+			ReasoningEffort string         `json:"reasoning_effort"`
+			Thinking        map[string]any `json:"thinking"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Model == "m-primary" {
+			gotEffort = req.ReasoningEffort
+		}
+		if req.Model == "m-fast" && req.Thinking != nil {
+			gotThinkingType, _ = req.Thinking["type"].(string)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"finish_reason": "stop",
+				"message":       map[string]any{"content": "ok"},
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	hub := NewHub(config.ModelsConfig{
+		Primary: config.ModelEndpointConfig{BaseURL: srv.URL, Model: "m-primary", ReasoningEffort: "low", TimeoutSec: 5},
+		Fast:    config.ModelEndpointConfig{BaseURL: srv.URL, Model: "m-fast", ThinkingType: "disabled", TimeoutSec: 5},
+	})
+
+	if _, err := hub.Chat(context.Background(), "primary", ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "hi"}}}); err != nil {
+		t.Fatalf("primary Chat: %v", err)
+	}
+	if _, err := hub.Chat(context.Background(), "fast", ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "hi"}}}); err != nil {
+		t.Fatalf("fast Chat: %v", err)
+	}
+	if gotEffort != "low" {
+		t.Fatalf("expected reasoning_effort=low, got %q", gotEffort)
+	}
+	if gotThinkingType != "disabled" {
+		t.Fatalf("expected thinking.type=disabled, got %q", gotThinkingType)
+	}
+}

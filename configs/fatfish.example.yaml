@@ -23,15 +23,18 @@ models:
     api_key: "${LLM_API_KEY}"
     model: "glm-5.4"
     multimodal: true
+    reasoning_effort: "low"
     timeout_sec: 90
   primary_fallback:
     model: "glm-5.3-flash" # Inherits primary base_url/api_key if omitted
     multimodal: true
+    reasoning_effort: "low"
     timeout_sec: 90
   fast:
     base_url: "${LLM_BASE_URL}"
     api_key: "${LLM_API_KEY}"
     model: "glm-5.3-flash"
+    thinking_type: "disabled"
     timeout_sec: 20
   distill:
     base_url: "http://127.0.0.1:8088/v1"

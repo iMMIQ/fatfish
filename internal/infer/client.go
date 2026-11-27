@@ -69,6 +69,8 @@ type ChatRequest struct {
 	ToolChoice         any              `json:"tool_choice,omitempty"`
 	Temperature        *float64         `json:"temperature,omitempty"`
 	MaxTokens          int              `json:"max_tokens,omitempty"`
+	ReasoningEffort    string           `json:"reasoning_effort,omitempty"`
+	Thinking           map[string]any   `json:"thinking,omitempty"`
 	ResponseFormat     map[string]any   `json:"response_format,omitempty"`
 	ChatTemplateKwargs map[string]any   `json:"chat_template_kwargs,omitempty"`
 }
@@ -247,6 +249,12 @@ func (h *Hub) chatOnce(ctx context.Context, role string, req ChatRequest) (*Chat
 
 	if req.Model == "" {
 		req.Model = ep.Model
+	}
+	if req.ReasoningEffort == "" && strings.TrimSpace(ep.ReasoningEffort) != "" {
+		req.ReasoningEffort = strings.TrimSpace(ep.ReasoningEffort)
+	}
+	if req.Thinking == nil && strings.TrimSpace(ep.ThinkingType) != "" {
+		req.Thinking = map[string]any{"type": strings.TrimSpace(ep.ThinkingType)}
 	}
 	body, err := json.Marshal(req)
 	if err != nil {

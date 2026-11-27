@@ -68,15 +68,17 @@ type ModelsConfig struct {
 }
 
 type ModelEndpointConfig struct {
-	Enabled       *bool  `yaml:"enabled,omitempty"`
-	BaseURL       string `yaml:"base_url"`
-	APIKey        string `yaml:"api_key"`
-	Model         string `yaml:"model"`
-	Multimodal    bool   `yaml:"multimodal"`
-	Dim           int    `yaml:"dim"`
-	MaxBatch      int    `yaml:"max_batch"`
-	TimeoutSec    int    `yaml:"timeout_sec"`
-	MaxConcurrent int    `yaml:"max_concurrent"`
+	Enabled         *bool  `yaml:"enabled,omitempty"`
+	BaseURL         string `yaml:"base_url"`
+	APIKey          string `yaml:"api_key"`
+	Model           string `yaml:"model"`
+	Multimodal      bool   `yaml:"multimodal"`
+	ReasoningEffort string `yaml:"reasoning_effort,omitempty"` // Optional: "low" | "medium" | "high"
+	ThinkingType    string `yaml:"thinking_type,omitempty"`    // Optional: "enabled" | "disabled"
+	Dim             int    `yaml:"dim"`
+	MaxBatch        int    `yaml:"max_batch"`
+	TimeoutSec      int    `yaml:"timeout_sec"`
+	MaxConcurrent   int    `yaml:"max_concurrent"`
 }
 
 func (m ModelEndpointConfig) IsEnabled() bool {
