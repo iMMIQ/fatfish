@@ -11,7 +11,7 @@ scan_pattern() {
   local label="$1"
   local pattern="$2"
   local hits
-  hits="$(grep -rnE --exclude-dir=.git --exclude='privacy-check.sh' "$pattern" . || true)"
+  hits="$(grep -rnIE --exclude-dir=.git --exclude='privacy-check.sh' "$pattern" . || true)"
   if [[ -n "$hits" ]]; then
     echo "[PRIVACY FAIL] $label:"
     echo "$hits"
@@ -20,9 +20,11 @@ scan_pattern() {
 }
 
 scan_pattern "Private RFC1918 192.168.x.x host IP" '192\.168\.([1-9][0-9]{0,2}\.[0-9]{1,3}|0\.[1-9][0-9]{0,2})'
-scan_pattern "Private RFC1918 10.x.x.x IP (non-doc)" 'https?://10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}'
+scan_pattern "Private RFC1918 10.x.x.x IP (non-doc)" '(https?|wss?)://10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}'
+scan_pattern "Private RFC1918 172.16-31.x.x IP (non-doc)" '(https?|wss?)://172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}'
 scan_pattern "API key / token literal" '(sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AIza[0-9A-Za-z_-]{20,})'
 scan_pattern "Hardcoded Bearer token" 'Bearer [A-Za-z0-9._-]{20,}'
+scan_pattern "Private key block" 'BEGIN [A-Z0-9 ]*PRIVATE KEY'
 scan_pattern "Private heiyu/lazycat hostnames" 'heiyu\.space|lzcbox-[a-z0-9]+'
 
 if [[ "$FAIL" -ne 0 ]]; then

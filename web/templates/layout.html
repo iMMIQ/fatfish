@@ -177,7 +177,13 @@
         {{range .Notes}}
         <tr>
           <td>{{.Key}}</td><td>{{.Content}}</td><td>{{.Pinned}}</td>
-          <td><button class="secondary" hx-post="/api/memory/note/delete" hx-vals='{"channel":"{{$.SelectedChannel}}","key":"{{.Key}}"}' hx-swap="outerHTML">Delete</button></td>
+          <td>
+            <form hx-post="/api/memory/note/delete" hx-swap="outerHTML" style="display:inline">
+              <input type="hidden" name="channel" value="{{$.SelectedChannel}}" />
+              <input type="hidden" name="key" value="{{.Key}}" />
+              <button class="secondary" type="submit">Delete</button>
+            </form>
+          </td>
         </tr>
         {{end}}
       </tbody>
@@ -230,6 +236,9 @@
     <h2>Sticker Dual-Vector Search Lab</h2>
     <form hx-get="/api/stickers/search" hx-target="#stk-results" class="row">
       <input name="q" placeholder="Test query e.g. 无语摊手 / 摸鱼" required />
+      <label style="flex:0 0 auto;display:flex;align-items:center;gap:4px;font-size:12px;">
+        <input type="checkbox" name="explicit" value="1" style="width:auto;" /> Explicit lookup (0.25/0.75)
+      </label>
       <button type="submit" style="flex:0 0 auto;">Search</button>
     </form>
     <div id="stk-results"></div>
@@ -238,11 +247,12 @@
   <div class="card">
     <h2>Needs Review Queue ({{len .ReviewStickers}})</h2>
     <table>
-      <thead><tr><th>ID</th><th>Pack</th><th>Path</th><th>Intent / Content</th><th>Action</th></tr></thead>
+      <thead><tr><th>Preview</th><th>ID</th><th>Pack</th><th>Intent / Content</th><th>Action</th></tr></thead>
       <tbody>
         {{range .ReviewStickers}}
         <tr>
-          <td>{{.StickerID}}</td><td>{{.PackID}}</td><td class="muted">{{.RelPath}}</td>
+          <td><img src="/api/stickers/image?id={{.StickerID}}" alt="{{.StickerID}}" style="max-width:56px;max-height:56px;border-radius:4px;" /></td>
+          <td>{{.StickerID}}</td><td>{{.PackID}}</td>
           <td>
             <form hx-post="/api/stickers/approve" hx-swap="outerHTML" class="row">
               <input type="hidden" name="id" value="{{.StickerID}}" />
@@ -252,7 +262,12 @@
               <button type="submit" style="flex:0 0 auto;">Approve</button>
             </form>
           </td>
-          <td><span class="badge warn">{{.Status}}</span></td>
+          <td>
+            <form hx-post="/api/stickers/reject" hx-swap="outerHTML" style="display:inline">
+              <input type="hidden" name="id" value="{{.StickerID}}" />
+              <button class="secondary" type="submit">Reject</button>
+            </form>
+          </td>
         </tr>
         {{end}}
       </tbody>

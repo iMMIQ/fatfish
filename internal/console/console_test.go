@@ -1,6 +1,7 @@
 package console
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -102,13 +103,21 @@ func TestLogBroadcasterWithAttrsConcurrentSafe(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for j := 0; j < 20; j++ {
-				childLogger.Info("hello", "g", id, "n", j)
+				childLogger.Info("hello", "g", id, "n", j, "err", errors.New("boom-err"))
 			}
 		}(i)
 	}
 	wg.Wait()
-	if len(lb.Recent()) == 0 {
+	recent := lb.Recent()
+	if len(recent) == 0 {
 		t.Fatal("expected buffered logs from derived logger")
+	}
+	last := recent[len(recent)-1]
+	if !strings.Contains(last, `"component":"test"`) {
+		t.Fatalf("expected WithAttrs preserved in ring buffer, got %s", last)
+	}
+	if !strings.Contains(last, `"err":"boom-err"`) {
+		t.Fatalf("expected error serialized as string instead of {}, got %s", last)
 	}
 	select {
 	case <-ch:

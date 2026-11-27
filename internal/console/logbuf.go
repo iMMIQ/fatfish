@@ -17,10 +17,13 @@ type logBus struct {
 }
 
 // LogBroadcaster is an slog.Handler wrapper that tees JSON logs to a bounded ring buffer
-// and live SSE subscribers. Derived handlers from WithAttrs/WithGroup share the same bus & lock.
+// and live SSE subscribers. Derived handlers from WithAttrs/WithGroup share the same bus & lock
+// and preserve derived attributes/groups in Console & SSE output.
 type LogBroadcaster struct {
-	bus   *logBus
-	inner slog.Handler
+	bus    *logBus
+	inner  slog.Handler
+	attrs  []slog.Attr
+	groups []string
 }
 
 func NewLogBroadcaster(out io.Writer, level slog.Level, maxSize int) *LogBroadcaster {
@@ -47,8 +50,17 @@ func (l *LogBroadcaster) Handle(ctx context.Context, r slog.Record) error {
 		"level": r.Level.String(),
 		"msg":   r.Message,
 	}
+	target := entry
+	for _, g := range l.groups {
+		sub := make(map[string]any)
+		target[g] = sub
+		target = sub
+	}
+	for _, a := range l.attrs {
+		addSlogAttr(target, a)
+	}
 	r.Attrs(func(a slog.Attr) bool {
-		entry[a.Key] = a.Value.Any()
+		addSlogAttr(target, a)
 		return true
 	})
 	raw, _ := json.Marshal(entry)
@@ -69,17 +81,49 @@ func (l *LogBroadcaster) Handle(ctx context.Context, r slog.Record) error {
 	return nil
 }
 
+func addSlogAttr(dst map[string]any, a slog.Attr) {
+	a.Value = a.Value.Resolve()
+	if a.Key == "" {
+		return
+	}
+	if a.Value.Kind() == slog.KindGroup {
+		sub := make(map[string]any)
+		for _, ga := range a.Value.Group() {
+			addSlogAttr(sub, ga)
+		}
+		dst[a.Key] = sub
+		return
+	}
+	v := a.Value.Any()
+	if err, ok := v.(error); ok && err != nil {
+		dst[a.Key] = err.Error()
+		return
+	}
+	dst[a.Key] = v
+}
+
 func (l *LogBroadcaster) WithAttrs(attrs []slog.Attr) slog.Handler {
+	merged := make([]slog.Attr, 0, len(l.attrs)+len(attrs))
+	merged = append(merged, l.attrs...)
+	merged = append(merged, attrs...)
 	return &LogBroadcaster{
-		bus:   l.bus,
-		inner: l.inner.WithAttrs(attrs),
+		bus:    l.bus,
+		inner:  l.inner.WithAttrs(attrs),
+		attrs:  merged,
+		groups: append([]string(nil), l.groups...),
 	}
 }
 
 func (l *LogBroadcaster) WithGroup(name string) slog.Handler {
+	groups := append([]string(nil), l.groups...)
+	if name != "" {
+		groups = append(groups, name)
+	}
 	return &LogBroadcaster{
-		bus:   l.bus,
-		inner: l.inner.WithGroup(name),
+		bus:    l.bus,
+		inner:  l.inner.WithGroup(name),
+		attrs:  append([]slog.Attr(nil), l.attrs...),
+		groups: groups,
 	}
 }
 

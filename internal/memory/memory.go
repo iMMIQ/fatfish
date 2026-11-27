@@ -31,6 +31,7 @@ type Service struct {
 	mu         sync.RWMutex
 	epIndex    *vec.FlatF16Index // key: "ep:<id>"
 	epChannels map[string]model.ChannelID
+	profileMu  sync.Mutex // Serializes L2 profile read-modify-write across concurrent distill workers
 }
 
 func NewService(st *store.Store, hub *infer.Hub, dim int, logger *slog.Logger) *Service {
@@ -216,7 +217,10 @@ func (s *Service) recallHybridMemory(ctx context.Context, opts RecallOptions) (R
 	}
 
 	var vecHits []vec.Hit
-	if s.hub != nil && strings.TrimSpace(opts.Query) != "" && s.epIndex.Len() > 0 {
+	s.mu.RLock()
+	hasEpVecs := s.epIndex.Len() > 0
+	s.mu.RUnlock()
+	if s.hub != nil && strings.TrimSpace(opts.Query) != "" && hasEpVecs {
 		if embs, err := s.hub.Embed(ctx, []string{opts.Query}); err == nil && len(embs) == 1 && len(embs[0]) == s.dim {
 			s.mu.RLock()
 			vecHits = s.epIndex.Search(embs[0], 20, func(id string) bool {
@@ -229,15 +233,25 @@ func (s *Service) recallHybridMemory(ctx context.Context, opts RecallOptions) (R
 	fused := vec.WeightedRRF([][]vec.Hit{ftsHits, vecHits}, []float32{1.0, 1.0}, 60, 15)
 	candidates := make([]model.Episode, 0, len(fused))
 	for _, h := range fused {
-		if ep, ok := epMap[h.ID]; ok {
-			candidates = append(candidates, ep)
-			continue
-		}
-		if id, err := parseEpisodeKey(h.ID); err == nil {
-			if ep, err := s.store.GetEpisodeByID(ctx, id); err == nil && ep.ChannelID == opts.ChannelID {
-				candidates = append(candidates, *ep)
+		var ep *model.Episode
+		if e, ok := epMap[h.ID]; ok {
+			epCopy := e
+			ep = &epCopy
+		} else if id, err := parseEpisodeKey(h.ID); err == nil {
+			if e, err := s.store.GetEpisodeByID(ctx, id); err == nil && e.ChannelID == opts.ChannelID {
+				ep = e
 			}
 		}
+		if ep == nil {
+			continue
+		}
+		if opts.SinceMs > 0 && ep.EndTS.UnixMilli() < opts.SinceMs {
+			continue
+		}
+		if opts.UntilMs > 0 && ep.StartTS.UnixMilli() > opts.UntilMs {
+			continue
+		}
+		candidates = append(candidates, *ep)
 	}
 
 	// Optional precision rerank (gracefully skipped if rerank circuit is open).
@@ -453,19 +467,13 @@ func (s *Service) DistillChannel(ctx context.Context, opts DistillOptions) (int,
 	if err != nil {
 		return 0, err
 	}
-	msgs, err := s.store.MessagesAfterSeq(ctx, ch, afterSeq, 100000)
+	var sinceMs int64
+	if opts.SinceDays > 0 {
+		sinceMs = time.Now().AddDate(0, 0, -opts.SinceDays).UnixMilli()
+	}
+	msgs, err := s.store.MessagesAfterSeqSince(ctx, ch, afterSeq, sinceMs, 100000)
 	if err != nil {
 		return 0, err
-	}
-	if opts.SinceDays > 0 {
-		cutoff := time.Now().AddDate(0, 0, -opts.SinceDays)
-		filtered := msgs[:0]
-		for _, m := range msgs {
-			if !m.CreatedAt.Before(cutoff) {
-				filtered = append(filtered, m)
-			}
-		}
-		msgs = filtered
 	}
 	windows := PartitionWindows(msgs, 30*time.Minute, 100, 8)
 	if opts.MaxEpisodes > 0 && len(windows) > opts.MaxEpisodes {
@@ -561,6 +569,13 @@ func (s *Service) distillWindowWithRetry(ctx context.Context, ch model.ChannelID
 func (s *Service) DistillWindow(ctx context.Context, ch model.ChannelID, win []model.Message, role string) (*model.Episode, error) {
 	if len(win) == 0 {
 		return nil, fmt.Errorf("memory: empty window")
+	}
+	startSeq := win[0].Seq
+	endSeq := win[len(win)-1].Seq
+	if startSeq > 0 && endSeq >= startSeq {
+		if dup, err := s.store.HasOverlappingEpisode(ctx, ch, startSeq, endSeq); err == nil && dup {
+			return nil, nil
+		}
 	}
 	transcript := formatMessages(win)
 	sysPrompt := `Extract a concise structured JSON summary of this chat episode in the primary language of the chat (e.g. Simplified Chinese).
@@ -669,6 +684,9 @@ Rules:
 // MergeCandidateFact enforces SPEC 8 anti-sarcasm corroboration:
 // a fact from a single episode remains tentative until corroborated by >=2 distinct episodes.
 func (s *Service) MergeCandidateFact(ctx context.Context, ch model.ChannelID, memberID, factText string, episodeID int64, serious bool) error {
+	s.profileMu.Lock()
+	defer s.profileMu.Unlock()
+
 	p, err := s.store.GetProfile(ctx, ch, memberID)
 	if err != nil {
 		return err
@@ -721,7 +739,7 @@ func decayedFactScore(f model.ProfileFact, nowMs int64) float64 {
 		return f.Confidence
 	}
 	ageDays := float64(nowMs-f.UpdatedAt) / (24 * 3600 * 1000)
-	return f.Confidence * math.Exp(-ageDays/factDecayHalfLifeDays)
+	return f.Confidence * math.Exp(-math.Ln2*ageDays/factDecayHalfLifeDays)
 }
 
 // CompactProfileFacts applies time decay, expires uncorroborated tentative facts older than 60d,
@@ -787,6 +805,9 @@ func (s *Service) ReloadIndex(ctx context.Context) (int, error) {
 }
 
 func (s *Service) AddProfileJoke(ctx context.Context, ch model.ChannelID, memberID, jokeText string, episodeID int64) error {
+	s.profileMu.Lock()
+	defer s.profileMu.Unlock()
+
 	p, err := s.store.GetProfile(ctx, ch, memberID)
 	if err != nil {
 		return err

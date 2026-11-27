@@ -1,7 +1,7 @@
 # fatfish — Detailed System Design Specification
 
-> **Status**: Draft v1.0 (Post-Audit Baseline)  
-> **Language**: Pure Go (`CGO_ENABLED=0`, Go 1.23+)  
+> **Status**: v1.1 (Aligned with Production Implementation)  
+> **Language**: Pure Go (`CGO_ENABLED=0`, Go 1.26+)  
 > **Repository**: Public Open-Source (strict zero-PII / zero-legacy-coupling hygiene)
 
 ---
@@ -96,6 +96,7 @@ fatfish/
 │   ├── policy/                     # expr rule compiler, PolicyEnv, per-channel overrides
 │   ├── frame/                      # Segment-pinned memory, FrozenFrame, KV guard, calibrator
 │   ├── memory/                     # L0/L1/L2 memory service + resumable offline distiller
+│   ├── ingest/                     # Generic JSONL / sticker directory importer
 │   ├── sticker/                    # Dual-vector retrieval, benchmark eval, async sender, tagger
 │   ├── cron/                       # Persistent scheduler & channel daily digest
 │   ├── tool/                       # Frozen Registry, MCP cached bridge, built-in tools
@@ -203,7 +204,7 @@ To eliminate `SQLITE_BUSY` under concurrent actors while capping total SQLite RA
 | `writeDB` | `1` | `rwc` | `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`, `foreign_keys=ON`, `temp_store=MEMORY`, `cache_size=-8000` | 8 MiB |
 | `readDB` | `3` | `ro` | `busy_timeout=5000`, `temp_store=MEMORY`, `cache_size=-4000` | 12 MiB |
 
-- **Maintenance**: Daily low-traffic job executes `PRAGMA wal_checkpoint(TRUNCATE)` and prunes expired `media_assets` / `calibrator_samples`.
+- **Maintenance**: Periodic 6-hour job executes `PRAGMA wal_checkpoint(TRUNCATE)` and enforces `media_assets` expiry + BlobStore quotas (`calibrator_samples` is pruned inline per insert to the latest 128 samples per model).
 - **Graceful Shutdown**: `SIGTERM` executes `PRAGMA wal_checkpoint(PASSIVE)` before closing pools.
 
 ### 4.2 Zero-RAM CJK FTS5 Tokenization
@@ -267,6 +268,7 @@ CREATE VIRTUAL TABLE messages_fts USING fts5(
     sender_id  UNINDEXED,
     created_at UNINDEXED,
     content='',
+    contentless_delete=1,
     tokenize='unicode61'
 );
 
@@ -356,7 +358,7 @@ CREATE TABLE episodes (
 CREATE INDEX idx_episodes_chan_ts ON episodes(channel_id, end_ts DESC);
 
 CREATE VIRTUAL TABLE episodes_fts USING fts5(
-    tokens, channel_id UNINDEXED, content='', tokenize='unicode61'
+    tokens, channel_id UNINDEXED, content='', contentless_delete=1, tokenize='unicode61'
 );
 
 CREATE TABLE profiles (
@@ -406,7 +408,7 @@ CREATE TABLE stickers (
 );
 
 CREATE VIRTUAL TABLE stickers_fts USING fts5(
-    tokens, pack_id UNINDEXED, content='', tokenize='unicode61'
+    tokens, pack_id UNINDEXED, content='', contentless_delete=1, tokenize='unicode61'
 );
 
 CREATE TABLE sticker_uses (
@@ -452,6 +454,11 @@ CREATE TABLE calibrator_samples (
     actual_tok  INTEGER NOT NULL,
     image_count INTEGER NOT NULL,
     created_at  INTEGER NOT NULL
+);
+
+CREATE TABLE kv_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 ```
 
@@ -562,7 +569,7 @@ type PolicyEnv struct {
 ### 6.2 Segment Lifecycle & Budget Calibration
 - **Scope Key**: `scope_hash = SHA256(persona_hash | tools_hash | model_id)`. Any intentional change cleanly opens a new segment.
 - **Idle Rotation**: After `segment_idle_minutes` (default `30m`), close segment → asynchronously generate L1 Episode & rotated summary (with fast model) → next turn opens a fresh segment with updated `Segment-Pinned Memory Snapshot`.
-- **Batch Trim (80% → 50%)**: When estimated tokens reach `80%` of `input_token_budget` (default `32768`), drop oldest complete turns (user + tool + assistant together) down to `~50%` so prefix cache stabilizes again across the next 10–15 turns rather than sliding-window invalidating on every single turn!
+- **Batch Trim (80% → 50% & Image Cap)**: When estimated tokens reach `80%` of `input_token_budget` (default `32768`) or total images exceed `max_images_per_request`, drop oldest complete turns (user + tool + assistant together) down to `~50%` so prefix cache stabilizes again across the next 10–15 turns rather than sliding-window invalidating on every single turn! Trims are deferred until turn delivery succeeds so failed/stale turns never lose history.
 - **Adaptive Token Budget Calibrator**: Rolling window of last `96` first-attempt actual `prompt_tokens` per `provider|endpoint|model`. Adjusts text token multiplier with `+20%` safety margin (never modifies prompt/frames; image reserve only adjusts upward).
 - **Mandatory CI Guard (`TestKVCacheInvariants`)**: Simulates 10 multi-turn interactions with images, tool calls, new members, and simulated MCP outage; asserts `tools` JSON bytes, `msg[0]` bytes, `msg[1]` bytes, and all `FrozenFrame[0..i-1]` bytes remain **100% bit-for-bit identical**.
 
@@ -574,14 +581,14 @@ Thin, zero-SDK stdlib `net/http` clients giving full control over wire JSON, tim
 
 | Capability | Protocol | Key Guarantees | Degradation When Unavailable |
 | :--- | :--- | :--- | :--- |
-| **`Chat` / `Vision`** | OpenAI `POST /v1/chat/completions` | Preserves raw `cached_tokens`, `reasoning_content`; **never** silently strips images on error; independent request client | Return concise failure log; never corrupt timeline |
+| **`Chat` / `Vision`** | OpenAI `POST /v1/chat/completions` | Preserves raw `cached_tokens`, `reasoning_content`; configurable `reasoning_effort` & `thinking_type`; transparent `primary` → `primary_fallback` failover on error/open circuit; **never** silently strips images on error | Fail over to `primary_fallback`; return concise failure log; never corrupt timeline |
 | **`Embed`** | OpenAI `POST /v1/embeddings` | Enforces hard `max_batch` chunking (`1..128`, default `64`) at client boundary | Circuit opens → `recall` & `sticker` fall back to SQLite FTS5 |
 | **`Rerank`** | `POST /v1/rerank` (JSON) | Enforces `max_batch` cap (`1..128`, default `64`); returns normalized scores | Circuit opens → keep RRF ranking order directly |
 | **`ASR`** | OpenAI `POST /v1/audio/transcriptions` (multipart) | Sends `file` (`wav`) + `model`; bounded per-turn wait (`4s`) | Circuit opens → store `[语音 Xs，暂不可转写]` |
 | **`Translate`** *(internal)* | OpenAI `POST /v1/chat/completions` | Used internally by `read_source` for long foreign docs or explicit `/tr` command (NOT a primary LLM tool) | Falls back to primary LLM |
 
 ### Local Inference GPU Protection (Preventing VRAM Thrashing)
-- **Hot vs Cold Separation**: Online hot traffic uses only compact resident models (`embed`, `rerank`, `asr`). Heavy local models (`distill`) are strictly isolated to offline CLI (`fatfish distill`) or configurable off-peak windows behind a concurrency semaphore (`max_concurrent_heavy=1`).
+- **Hot vs Cold Separation**: Online hot traffic uses compact resident models (`embed`, `rerank`, `asr`). Heavy local `distill` is concurrency-bounded by `models.distill.max_concurrent` (default `1`), used for both bulk offline CLI (`fatfish distill`) and bounded hourly incremental distillation (`<=5` episodes/channel + `ReloadIndex()`).
 - **Circuit Breaker**: Per-capability sliding window (`3` consecutive failures → Open for `30s` → Half-Open single probe). Exposes live state on `:6185` console.
 
 ---
@@ -656,13 +663,13 @@ type Tool[Args any] interface {
 | **`note`** | No | Actions: `save(key, content, pinned)`, `list`, `delete(key)`. Exact channel-scoped facts/lists; server enforces max 50 notes/channel. |
 | **`web_search`** | Yes | Uncensored fallback search (`bing`, `baidu`, `github`, `hf_mirror`, `arxiv`) via `netutil` + `goquery`. Used when primary MCP search is filtered or unavailable. |
 | **`read_source`** | Yes | Deep reader for: `bilibili` (`b23.tv` expand, meta, pages, subtitles, top comments), `arxiv` (Atom + PDF pages), `hf` (`hf-mirror.com` API + README), generic URLs, and QQ `file` URLs (`.xlsx` via `excelize`, `.docx` via stdlib `zip+xml`, `.pdf` via `pdftotext`, plain text). **Hardened**: `safehttp` post-DNS SSRF Dialer, `10 MiB` cap, untrusted-content framing, optional internal `translate` via `infer.Translate` for long foreign docs. |
-| **`compute`** | Yes | Pure-Go `go.starlark.net` sandbox + optional PNG chart output. Preloads `math`, `json`, `time`, plus Go-native `stats` (`mean/median/stdev/percentile/corr/linreg`), `finance` (`pmt/irr/npv/cagr/drawdown`), and `chart` (`line/bar/pie/scatter/kline` rendered via `go-charts`/`gg` + bundled **TrueType `.ttf`** CJK font). **Hardened**: 40-line `syntax` AST pre-validator blocking giant list/string multiplication & huge ranges (prevents OOM DoS) + `SetMaxExecutionSteps(500_000)` + `3s` wall timeout + `64 KiB` output cap. |
+| **`compute`** | Yes | Pure-Go `go.starlark.net` sandbox + optional PNG chart output. Preloads `math`, `json`, `time`, plus Go-native `stats` (`mean/median/stdev/percentile/corr/linreg`), `finance` (`pmt/irr/npv/cagr/drawdown`), and `chart` (`line/bar/pie/scatter/kline` rendered via pure-Go rasterizer + `x/image/font/opentype` + bundled **TrueType `.ttf`** CJK font). **Hardened**: `syntax` AST pre-validator blocking giant/chained sequence multiplication, loop self-doubling & huge ranges + `SetMaxExecutionSteps(500_000)` + `3s` wall timeout + `64 KiB` output cap + max 4 charts/call + NaN/Inf rejection. |
 | **`quote`** | Yes | Direct Tencent realtime quote + 60-day daily K-line for US (`usNVDA`), HK (`hk00700`), and A-share (`sh600519`/`sz000001`), decoded cleanly via `golang.org/x/text` (GBK). |
 | **`schedule`** | No | Actions: `create(once/cron, prompt)`, `list`, `cancel(id)`. Enforces `(channel_id, creator_id)` ownership, max `10` active jobs/channel, min cron interval `>=5m`. Fires by posting `SystemTriggerEvent` to target `Room` Actor. |
 | **`send_sticker`** | No | Explicit sticker search & delivery (dual-vector + FTS5 + Rerank + MMR). |
 | **`send_media`** | No | Re-sends a visible image from current channel by short `media_id`. Enforces `(channel_id, media_id)` ownership at DB layer. |
 | **`interact`** | No | Actions: `poke` (current sender, `2s` timeout, max once/turn), `react` (emoji like on trigger msg), `relay` (send to another channel — **disabled by default for non-admins**, explicit channel allowlist enforced server-side). |
-| **`mcp.*`** | per-spec | External MCP servers (e.g., web search, web reader, repo reader, future tools), strictly namespaced & timeout-bounded. |
+| **`mcp_<server>_<tool>`** | per-spec | External MCP servers (e.g., web search, web reader, repo reader, future tools), strictly namespaced (OpenAI function-name compatible) & timeout-bounded. |
 
 ---
 
@@ -691,8 +698,8 @@ type Tool[Args any] interface {
 3. Stop scheduler, close MCP connections, flush `PRAGMA wal_checkpoint(PASSIVE)`, close `readDB` and `writeDB`.
 
 ### 11.4 Container Packaging (`Dockerfile`)
-- Stage 1: `golang:1.24-bookworm`, `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" ./cmd/fatfish`
-- Stage 2: `debian:bookworm-slim` + `ca-certificates` + `poppler-utils` (`pdftotext`) + bundled `.ttf` CJK font (`assets/fonts/`).
+- Stage 1: `golang:1.26-bookworm`, `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" ./cmd/fatfish`
+- Stage 2: `debian:bookworm-slim` (or Alpine runtime) + `ca-certificates` + `tzdata` + `poppler-utils` (`pdftotext`) + bundled `.ttf` CJK font (`assets/fonts/`).
 - Target image size: **~55–65 MB**; runtime RSS target: **60–100 MiB**.
 
 ---
@@ -700,7 +707,7 @@ type Tool[Args any] interface {
 ## 12. Security, Privacy & Phased Delivery Plan
 
 ### Security & Privacy Checklist
-- **Post-DNS SSRF Protection (`internal/netutil`)**: Custom `net.Dialer.Control` inspects resolved IP addresses before TCP `connect()`, blocking `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `100.64.0.0/10`, `::1`, `fc00::/7`, `fe80::/10` unless explicitly matched by `netutil.allow_hosts` (for configured local inference endpoints only).
+- **Post-DNS SSRF Protection (`internal/netutil`)**: Custom `net.Dialer.Control` inspects resolved IP addresses before TCP `connect()`, blocking `0.0.0.0/8`, `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `100.64.0.0/10`, `224.0.0.0/4`, `240.0.0.0/4`, `::/128`, `::1`, `fc00::/7`, `fe80::/10`, `ff00::/8` unless explicitly matched by `tools.ssrf_allow_hosts` (empty by default).
 - **Untrusted Content Framing**: All external web/document/file/card contents returned to the LLM are wrapped in `<external_data source="...">...</external_data>` boundaries; authorization checks never trust LLM parameters alone.
 - **Public Repo Privacy Gate (`scripts/privacy-check.sh`)**: Runs locally and in GitHub Actions to reject commits containing private LAN IPs, real secret prefixes (`sk-`, `ghp_`, `Bearer `), private hostnames, or unmasked personal IDs.
 

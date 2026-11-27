@@ -37,12 +37,26 @@ type MediaRef struct {
 // StoredFramePayload is persisted in SQLite `frames.payload_json` without inline base64 bloat,
 // and deterministically rehydrated into byte-identical infer.ChatMessage objects.
 type StoredFramePayload struct {
-	Role       string           `json:"role"`
-	Text       string           `json:"text,omitempty"`
-	Images     []MediaRef       `json:"images,omitempty"`
-	ToolCalls  []infer.ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string           `json:"tool_call_id,omitempty"`
-	Name       string           `json:"name,omitempty"`
+	Role             string           `json:"role"`
+	Text             string           `json:"text,omitempty"`
+	ReasoningContent string           `json:"reasoning_content,omitempty"`
+	Images           []MediaRef       `json:"images,omitempty"`
+	ToolCalls        []infer.ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string           `json:"tool_call_id,omitempty"`
+	Name             string           `json:"name,omitempty"`
+}
+
+// AssembleResult holds the assembled OpenAI messages plus deferred trim metadata
+// so SQLite history is only pruned once the turn actually delivers (preventing data loss on error/stale-drop).
+type AssembleResult struct {
+	Messages             []infer.ChatMessage
+	PrefixHash           string
+	EstTextTokens        int
+	ImageCount           int
+	TrimUpToIndex        int  // >= 0 when older frames should be pruned on commit; -1 means no trim
+	Trimmed              bool // true when either image or token batch trim occurred
+	HadHistory           bool // true when at least one FrozenFrame existed in the segment
+	EffectiveUserPayload *StoredFramePayload
 }
 
 // SnapshotInput provides the channel-scoped memory components used ONCE when opening a new segment.
@@ -112,7 +126,13 @@ func (b *Builder) BuildPinnedSnapshot(in SnapshotInput) string {
 	}
 
 	if s := strings.TrimSpace(in.PreviousSummary); s != "" {
-		if sec := truncateToTokens(s, maxInt(cfg.SummaryTokenBudget/2, 250)); sec != "" {
+		sumBudget := 250
+		if cfg.SummaryTokenBudget > 0 {
+			if half := cfg.SummaryTokenBudget / 2; half > 0 && half < sumBudget {
+				sumBudget = half
+			}
+		}
+		if sec := truncateToTokens(s, sumBudget); sec != "" {
 			sections = append(sections, "[Previous Segment Summary]\n"+sec)
 		}
 	}
@@ -141,13 +161,28 @@ func (b *Builder) EnsureActiveSegment(
 	scopeHash string,
 	snapshotFn func(ctx context.Context) (SnapshotInput, error),
 ) (*store.SegmentRecord, *store.SegmentRecord, error) {
+	return b.EnsureActiveSegmentWithClose(ctx, ch, epoch, scopeHash, snapshotFn, nil)
+}
+
+// EnsureActiveSegmentWithClose rotates idle/stale segments and optionally invokes onClose
+// BEFORE freezing the new segment's PinnedSnapshot so Segment N+1 receives Segment N's summary
+// immediately (eliminating off-by-one summary lag).
+func (b *Builder) EnsureActiveSegmentWithClose(
+	ctx context.Context,
+	ch model.ChannelID,
+	epoch int64,
+	scopeHash string,
+	snapshotFn func(ctx context.Context) (SnapshotInput, error),
+	onClose func(ctx context.Context, closed *store.SegmentRecord) string,
+) (*store.SegmentRecord, *store.SegmentRecord, error) {
 	cfg := b.getConfig()
 	chState, err := b.store.EnsureChannel(ctx, ch)
 	if err != nil {
 		return nil, nil, err
 	}
 	var closedSeg *store.SegmentRecord
-	idleLimit := time.Duration(maxInt(cfg.SegmentIdleMinutes, 30)) * time.Minute
+	var rotatedSummary string
+	idleLimit := time.Duration(defaultIfNonPos(cfg.SegmentIdleMinutes, 30)) * time.Minute
 
 	if chState.ActiveSegmentID > 0 {
 		seg, err := b.store.GetSegment(ctx, chState.ActiveSegmentID)
@@ -155,11 +190,19 @@ func (b *Builder) EnsureActiveSegment(
 			if time.Since(seg.LastActiveAt) <= idleLimit {
 				return seg, nil, nil
 			}
-			// Idle rotation: close old segment so caller can asynchronously summarize/distill it.
-			_ = b.store.CloseSegment(ctx, seg.ID, "")
+			// Idle rotation: close old segment and optionally summarize inline within a short timeout.
+			if onClose != nil {
+				rotatedSummary = strings.TrimSpace(onClose(ctx, seg))
+			}
+			_ = b.store.CloseSegment(ctx, seg.ID, rotatedSummary)
+			seg.SummaryText = rotatedSummary
 			closedSeg = seg
 		} else if err == nil && seg.ClosedAt.IsZero() {
-			_ = b.store.CloseSegment(ctx, seg.ID, "")
+			if onClose != nil {
+				rotatedSummary = strings.TrimSpace(onClose(ctx, seg))
+			}
+			_ = b.store.CloseSegment(ctx, seg.ID, rotatedSummary)
+			seg.SummaryText = rotatedSummary
 			closedSeg = seg
 		}
 	}
@@ -169,7 +212,11 @@ func (b *Builder) EnsureActiveSegment(
 		in, _ = snapshotFn(ctx)
 	}
 	if in.PreviousSummary == "" {
-		in.PreviousSummary, _ = b.store.LatestClosedSegmentSummary(ctx, ch)
+		if rotatedSummary != "" {
+			in.PreviousSummary = rotatedSummary
+		} else {
+			in.PreviousSummary, _ = b.store.LatestClosedSegmentSummary(ctx, ch)
+		}
 	}
 	snapText := b.BuildPinnedSnapshot(in)
 
@@ -202,11 +249,32 @@ func (b *Builder) Assemble(
 	currentPayload *StoredFramePayload,
 	modelKey string,
 ) (msgs []infer.ChatMessage, prefixHash string, estTextTokens int, imageCount int, err error) {
-	cfg := b.getConfig()
-	frames, err := b.store.ListFrames(ctx, seg.ID)
+	res, err := b.AssemblePlan(ctx, seg, personaText, currentPayload, modelKey, 0)
 	if err != nil {
 		return nil, "", 0, 0, err
 	}
+	if res.TrimUpToIndex >= 0 {
+		_ = b.store.DeleteFramesUpToIndex(ctx, seg.ID, res.TrimUpToIndex)
+	}
+	return res.Messages, res.PrefixHash, res.EstTextTokens, res.ImageCount, nil
+}
+
+// AssemblePlan builds the OpenAI messages slice WITHOUT mutating SQLite frames yet.
+// Callers pass res.TrimUpToIndex to AppendFrozenFramesWithTrim after delivery succeeds.
+func (b *Builder) AssemblePlan(
+	ctx context.Context,
+	seg *store.SegmentRecord,
+	personaText string,
+	currentPayload *StoredFramePayload,
+	modelKey string,
+	toolTokens int,
+) (*AssembleResult, error) {
+	cfg := b.getConfig()
+	frames, err := b.store.ListFrames(ctx, seg.ID)
+	if err != nil {
+		return nil, err
+	}
+	hadHistory := len(frames) > 0
 
 	mult, imgReserve := b.CalibratedBudget(ctx, modelKey)
 
@@ -224,7 +292,7 @@ func (b *Builder) Assemble(
 	}
 
 	// Cap currentPayload images to maxImgs before evaluating batch trim.
-	maxImgs := maxInt(cfg.MaxImagesPerRequest, 6)
+	maxImgs := defaultIfNonPos(cfg.MaxImagesPerRequest, 6)
 	var curCopy StoredFramePayload
 	hasCur := currentPayload != nil
 	if hasCur {
@@ -234,20 +302,26 @@ func (b *Builder) Assemble(
 		}
 	}
 
+	trimUpToIdx := -1
+	trimmed := false
+
 	// 1. Whole-turn batch trim when total images exceed maxImgs.
 	// Drops oldest complete turns instead of mutating surviving FrozenFrames in-place (preserving KV cache!).
 	totalImgs := len(curCopy.Images)
 	for _, c := range frameImgCnt {
 		totalImgs += c
 	}
-	if totalImgs > maxImgs && len(frames) > 2 {
+	if totalImgs > maxImgs && len(frames) > 0 {
 		// Batch-trim down to <= maxImgs/2 (+ current turn) so the next several turns stay cache-stable.
 		targetDrop := totalImgs - maxImgs
 		if halfTarget := totalImgs - maxInt(maxImgs/2, len(curCopy.Images)); halfTarget > targetDrop {
 			targetDrop = halfTarget
 		}
 		if dropIdx := findImageTurnTrimCutoff(frames, frameImgCnt, targetDrop); dropIdx >= 0 && dropIdx < len(frames) {
-			_ = b.store.DeleteFramesUpToIndex(ctx, seg.ID, frames[dropIdx].FrameIndex)
+			if frames[dropIdx].FrameIndex > trimUpToIdx {
+				trimUpToIdx = frames[dropIdx].FrameIndex
+			}
+			trimmed = true
 			frames = frames[dropIdx+1:]
 			parsed = parsed[dropIdx+1:]
 			frameRawText = frameRawText[dropIdx+1:]
@@ -256,11 +330,11 @@ func (b *Builder) Assemble(
 	}
 
 	// 2. Check 80% -> 50% token batch trim threshold BEFORE assembling so prefix stabilizes for next 10-15 turns.
-	budget := maxInt(cfg.InputTokenBudget, 4096)
+	budget := defaultIfNonPos(cfg.InputTokenBudget, 32768)
 	highWater := int(float64(budget) * cfg.TrimHighWater)
 	lowWater := int(float64(budget) * cfg.TrimLowWater)
 
-	baseRawText := EstimateTextTokens(SystemPrompt(personaText)) + EstimateTextTokens(seg.PinnedSnapshot)
+	baseRawText := EstimateTextTokens(SystemPrompt(personaText)) + EstimateTextTokens(seg.PinnedSnapshot) + toolTokens
 	curRawText := 0
 	curImgs := 0
 	if hasCur {
@@ -279,14 +353,17 @@ func (b *Builder) Assemble(
 	if totalBudgetTok >= highWater && len(frames) > 2 {
 		dropIdx := findTurnTrimCutoff(frames, frameBudgetTok, totalBudgetTok-lowWater)
 		if dropIdx >= 0 && dropIdx < len(frames) {
-			_ = b.store.DeleteFramesUpToIndex(ctx, seg.ID, frames[dropIdx].FrameIndex)
+			if frames[dropIdx].FrameIndex > trimUpToIdx {
+				trimUpToIdx = frames[dropIdx].FrameIndex
+			}
+			trimmed = true
 			frames = frames[dropIdx+1:]
 			parsed = parsed[dropIdx+1:]
 			frameRawText = frameRawText[dropIdx+1:]
 		}
 	}
 
-	msgs = make([]infer.ChatMessage, 0, len(frames)+3)
+	msgs := make([]infer.ChatMessage, 0, len(frames)+3)
 	msgs = append(msgs, infer.ChatMessage{
 		Role:    "system",
 		Content: SystemPrompt(personaText),
@@ -296,7 +373,8 @@ func (b *Builder) Assemble(
 		Content: seg.PinnedSnapshot,
 	})
 
-	estTextTokens = baseRawText
+	estTextTokens := baseRawText
+	imageCount := 0
 	for i := range frames {
 		// Every surviving FrozenFrame renders identically with its frozen images intact.
 		cm, nImg := b.rehydratePayload(parsed[i], true)
@@ -308,21 +386,42 @@ func (b *Builder) Assemble(
 	// Prefix hash covers [msg 0..k] (everything strictly prior to the current turn).
 	prefixBytes, _ := json.Marshal(msgs)
 	sum := sha256.Sum256(prefixBytes)
-	prefixHash = hex.EncodeToString(sum[:])
+	prefixHash := hex.EncodeToString(sum[:])
 
+	var effUser *StoredFramePayload
 	if hasCur {
+		cp := curCopy
+		effUser = &cp
 		cm, nImg := b.rehydratePayload(curCopy, true)
 		msgs = append(msgs, cm)
 		imageCount += nImg
 		estTextTokens += curRawText
 	}
 
-	return msgs, prefixHash, estTextTokens, imageCount, nil
+	return &AssembleResult{
+		Messages:             msgs,
+		PrefixHash:           prefixHash,
+		EstTextTokens:        estTextTokens,
+		ImageCount:           imageCount,
+		TrimUpToIndex:        trimUpToIdx,
+		Trimmed:              trimmed,
+		HadHistory:           hadHistory,
+		EffectiveUserPayload: effUser,
+	}, nil
 }
 
 // AppendFrozenFrames persists one or more immutable turn frames (user / assistant / tool) to the segment.
 func (b *Builder) AppendFrozenFrames(ctx context.Context, seg *store.SegmentRecord, payloads ...StoredFramePayload) error {
+	return b.AppendFrozenFramesWithTrim(ctx, seg, -1, payloads...)
+}
+
+// AppendFrozenFramesWithTrim commits any deferred whole-turn trim (when trimUpToIdx >= 0) and
+// appends new immutable turn frames to the segment only after delivery succeeds.
+func (b *Builder) AppendFrozenFramesWithTrim(ctx context.Context, seg *store.SegmentRecord, trimUpToIdx int, payloads ...StoredFramePayload) error {
 	cfg := b.getConfig()
+	if trimUpToIdx >= 0 {
+		_ = b.store.DeleteFramesUpToIndex(ctx, seg.ID, trimUpToIdx)
+	}
 	existing, err := b.store.ListFrames(ctx, seg.ID)
 	if err != nil {
 		return err
@@ -331,12 +430,13 @@ func (b *Builder) AppendFrozenFrames(ctx context.Context, seg *store.SegmentReco
 	if len(existing) > 0 {
 		nextIdx = existing[len(existing)-1].FrameIndex + 1
 	}
+	imgReserve := defaultIfNonPos(cfg.ImageTokenReserve, 1600)
 	for _, p := range payloads {
 		raw, err := json.Marshal(p)
 		if err != nil {
 			return err
 		}
-		est := estimatePayloadTextTokens(p) + len(p.Images)*maxInt(cfg.ImageTokenReserve, 1600)
+		est := estimatePayloadTextTokens(p) + len(p.Images)*imgReserve
 		rec := &store.FrameRecord{
 			SegmentID:   seg.ID,
 			ChannelID:   seg.ChannelID,
@@ -513,16 +613,17 @@ func findTurnTrimCutoff(frames []store.FrameRecord, frameTokens []int, tokensToD
 	return lastDrop
 }
 
-// findImageTurnTrimCutoff drops oldest complete turns until >= imgsToDrop images are freed.
+// findImageTurnTrimCutoff drops oldest complete turns (including the final stored turn if needed)
+// until >= imgsToDrop images are freed, guaranteeing total images never exceed max_images_per_request.
 func findImageTurnTrimCutoff(frames []store.FrameRecord, frameImgs []int, imgsToDrop int) int {
 	if imgsToDrop <= 0 || len(frames) == 0 {
 		return -1
 	}
 	dropped := 0
 	lastDrop := -1
-	for i := 0; i < len(frames)-1; i++ {
+	for i := 0; i < len(frames); i++ {
 		dropped += frameImgs[i]
-		if frames[i+1].Role == "user" {
+		if i == len(frames)-1 || frames[i+1].Role == "user" {
 			lastDrop = i
 			if dropped >= imgsToDrop {
 				return lastDrop
@@ -551,7 +652,7 @@ func (b *Builder) RecordCalibratorSample(ctx context.Context, modelKey string, e
 // upward-only calibrated per-image token reserve from the rolling 96-sample window (SPEC §6.2).
 func (b *Builder) CalibratedBudget(ctx context.Context, modelKey string) (textMult float64, imgReserve int) {
 	cfg := b.getConfig()
-	baseReserve := maxInt(cfg.ImageTokenReserve, 1600)
+	baseReserve := defaultIfNonPos(cfg.ImageTokenReserve, 1600)
 	textMult = 1.20
 	imgReserve = baseReserve
 
@@ -635,6 +736,13 @@ func truncateToTokens(s string, maxTokens int) string {
 		}
 	}
 	return strings.TrimSpace(string(runes[:lo])) + "..."
+}
+
+func defaultIfNonPos(v, def int) int {
+	if v <= 0 {
+		return def
+	}
+	return v
 }
 
 func maxInt(a, b int) int {

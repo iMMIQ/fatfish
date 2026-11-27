@@ -173,6 +173,7 @@ func (b *MCPBridge) invoke(ctx context.Context, serverName, remoteName string, r
 		if err != nil {
 			return ToolResult{
 				TextForLLM: fmt.Sprintf("MCP server %q is temporarily unavailable (%v). Continue without this tool.", serverName, err),
+				SoftError:  fmt.Sprintf("connect %s: %v", serverName, err),
 			}, nil
 		}
 		conn.mu.Lock()
@@ -202,6 +203,7 @@ func (b *MCPBridge) invoke(ctx context.Context, serverName, remoteName string, r
 		conn.mu.Unlock()
 		return ToolResult{
 			TextForLLM: fmt.Sprintf("MCP tool %s.%s temporarily failed: %v", serverName, remoteName, err),
+			SoftError:  fmt.Sprintf("call %s.%s: %v", serverName, remoteName, err),
 		}, nil
 	}
 
@@ -215,7 +217,10 @@ func (b *MCPBridge) invoke(ctx context.Context, serverName, remoteName string, r
 	}
 	joined := strings.Join(texts, "\n")
 	if res.IsError {
-		return ToolResult{TextForLLM: fmt.Sprintf("MCP tool error: %s", joined)}, nil
+		return ToolResult{
+			TextForLLM: fmt.Sprintf("MCP tool error: %s", joined),
+			SoftError:  joined,
+		}, nil
 	}
 	return ToolResult{TextForLLM: netutil.WrapExternalData("mcp:"+serverName+":"+remoteName, joined)}, nil
 }

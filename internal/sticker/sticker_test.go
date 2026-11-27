@@ -2,9 +2,14 @@ package sticker
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/iMMIQ/fatfish/internal/config"
+	"github.com/iMMIQ/fatfish/internal/infer"
 	"github.com/iMMIQ/fatfish/internal/model"
 	"github.com/iMMIQ/fatfish/internal/store"
 	"github.com/iMMIQ/fatfish/internal/vec"
@@ -67,4 +72,46 @@ func TestStickerHybridSearchAndAntiRepeatDecay(t *testing.T) {
 	if hits[1].DecayFactor >= 0.5 {
 		t.Fatalf("expected strong decay penalty on recently-used stk_1, got %v", hits[1].DecayFactor)
 	}
+}
+
+func TestStickerPackFilterNoRWMutexDeadlock(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{{"index": 0, "embedding": []float32{1, 0, 0, 0}}},
+		})
+	}))
+	defer srv.Close()
+
+	st, err := store.Open(t.TempDir(), 512, 5)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	_ = st.UpsertSticker(ctx, model.Sticker{
+		StickerID: "stk_p1", PackID: "packA", SHA256: "h1", RelPath: "1.png", Status: "ready", IntentText: "ok",
+	}, vec.EncodeFloat16([]float32{1, 0, 0, 0}), vec.EncodeFloat16([]float32{1, 0, 0, 0}))
+
+	hub := infer.NewHub(config.ModelsConfig{
+		Embed: config.ModelEndpointConfig{BaseURL: srv.URL, Model: "e", Dim: 4, TimeoutSec: 5},
+	})
+	cfg := config.StickerConfig{Enabled: true, DocCenteringAlpha: 0.7, ReactionIntentWeight: 0.75, ExplicitIntentWeight: 0.25, RecentWindow: 30, MMRLambda: 0.7}
+	eng := NewEngine(st, hub, cfg, 4, nil)
+	_, _ = eng.LoadIndex(ctx)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			_, _ = eng.Search(ctx, SearchOptions{Query: "ok", PackID: "packA", TopK: 5})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			eng.UpdateConfig(cfg)
+		}
+	}()
+	wg.Wait()
 }

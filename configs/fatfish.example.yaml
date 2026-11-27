@@ -151,8 +151,8 @@ tools:
   chart_font_path: "./assets/fonts/NotoSansSC-Regular.ttf"
   starlark_max_steps: 500000
   starlark_timeout_sec: 3
-  ssrf_allow_hosts:
-    - "127.0.0.1"
+  ssrf_allow_hosts: []
+  # Add trusted internal hosts/IPs only if explicitly needed (never allow 127.0.0.1 for untrusted web fetchers).
 
 mcp:
   servers: []

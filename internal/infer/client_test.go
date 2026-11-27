@@ -189,3 +189,60 @@ func TestReasoningEffortAndThinkingTypeInjection(t *testing.T) {
 		t.Fatalf("expected thinking.type=disabled, got %q", gotThinkingType)
 	}
 }
+
+func TestCircuitBreakerAbortProbeAndTranslateFallback(t *testing.T) {
+	cb := NewCircuitBreaker("probe-test", 2, 30*time.Millisecond)
+	_ = cb.Allow()
+	cb.Record(errors.New("err1"))
+	_ = cb.Allow()
+	cb.Record(errors.New("err2"))
+	if err := cb.Allow(); !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("expected open circuit, got %v", err)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if err := cb.Allow(); err != nil {
+		t.Fatalf("expected half-open probe allowed, got %v", err)
+	}
+	// Pre-call AbortProbe must NOT close the circuit or clear failures.
+	cb.AbortProbe()
+	if snap := cb.Snapshot(); snap.State != StateHalfOpen || snap.Failures != 2 {
+		t.Fatalf("expected HalfOpen with failures=2 after AbortProbe, got %+v", snap)
+	}
+	// Another probe can now proceed and close the circuit on real success.
+	if err := cb.Allow(); err != nil {
+		t.Fatalf("expected next probe allowed after AbortProbe, got %v", err)
+	}
+	cb.Record(nil)
+	if snap := cb.Snapshot(); snap.State != StateClosed {
+		t.Fatalf("expected Closed after probe success, got %+v", snap)
+	}
+
+	// Translate must fall back to primary when local translate endpoint fails.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Model == "tr-model" {
+			http.Error(w, "translate down", http.StatusBadGateway)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"finish_reason": "stop",
+				"message":       map[string]any{"content": "你好"},
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	trEnabled := true
+	hub := NewHub(config.ModelsConfig{
+		Primary:   config.ModelEndpointConfig{BaseURL: srv.URL, Model: "primary-model", TimeoutSec: 5},
+		Translate: config.ModelEndpointConfig{Enabled: &trEnabled, BaseURL: srv.URL, Model: "tr-model", TimeoutSec: 5},
+	})
+	out, err := hub.Translate(context.Background(), "hello", "Simplified Chinese")
+	if err != nil || out != "你好" {
+		t.Fatalf("expected translate fallback to primary, got out=%q err=%v", out, err)
+	}
+}

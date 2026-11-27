@@ -10,9 +10,91 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
+
+// RateLimiter is a pure-Go token-bucket rate limiter for outbound HTTP requests.
+type RateLimiter struct {
+	mu       sync.Mutex
+	rate     float64
+	burst    float64
+	tokens   float64
+	lastTick time.Time
+}
+
+// NewRateLimiter creates a token-bucket limiter allowing rps requests/sec with the given burst.
+func NewRateLimiter(rps float64, burst int) *RateLimiter {
+	if rps <= 0 {
+		return nil
+	}
+	if burst < 1 {
+		burst = 1
+	}
+	return &RateLimiter{
+		rate:     rps,
+		burst:    float64(burst),
+		tokens:   float64(burst),
+		lastTick: time.Now(),
+	}
+}
+
+// Allow consumes one token immediately if available.
+func (l *RateLimiter) Allow() bool {
+	if l == nil {
+		return true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.refillLocked(time.Now())
+	if l.tokens >= 1 {
+		l.tokens--
+		return true
+	}
+	return false
+}
+
+// Wait blocks until a token is available or ctx is cancelled.
+func (l *RateLimiter) Wait(ctx context.Context) error {
+	if l == nil {
+		return nil
+	}
+	for {
+		l.mu.Lock()
+		now := time.Now()
+		l.refillLocked(now)
+		if l.tokens >= 1 {
+			l.tokens--
+			l.mu.Unlock()
+			return nil
+		}
+		need := 1 - l.tokens
+		waitDur := time.Duration(need / l.rate * float64(time.Second))
+		if waitDur < time.Millisecond {
+			waitDur = time.Millisecond
+		}
+		l.mu.Unlock()
+
+		timer := time.NewTimer(waitDur)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (l *RateLimiter) refillLocked(now time.Time) {
+	if elapsed := now.Sub(l.lastTick).Seconds(); elapsed > 0 {
+		l.tokens += elapsed * l.rate
+		if l.tokens > l.burst {
+			l.tokens = l.burst
+		}
+		l.lastTick = now
+	}
+}
 
 var (
 	// ErrBlockedIP is returned when a dial target resolves to a private/loopback/link-local IP.
@@ -56,9 +138,11 @@ func IsBlockedAddr(addr netip.Addr) bool {
 
 // SafeClientOptions configures an SSRF-protected HTTP client.
 type SafeClientOptions struct {
-	Timeout    time.Duration
-	AllowHosts []string // Explicitly permitted IPs or CIDRs (e.g. local inference host)
-	UserAgent  string
+	Timeout         time.Duration
+	AllowHosts      []string // Explicitly permitted IPs, CIDRs, or hostnames
+	UserAgent       string
+	RateLimitPerSec float64 // Optional token-bucket requests/sec cap
+	RateBurst       int     // Optional burst size (default 1 when RateLimitPerSec > 0)
 }
 
 type hostAllowlist struct {
@@ -171,6 +255,9 @@ func NewSafeHTTPClient(opts SafeClientOptions) *http.Client {
 	if strings.TrimSpace(opts.UserAgent) != "" {
 		rt = &uaRoundTripper{base: tr, userAgent: strings.TrimSpace(opts.UserAgent)}
 	}
+	if opts.RateLimitPerSec > 0 {
+		rt = &rateLimitRoundTripper{base: rt, limiter: NewRateLimiter(opts.RateLimitPerSec, opts.RateBurst)}
+	}
 	return &http.Client{
 		Transport: rt,
 		Timeout:   opts.Timeout,
@@ -195,6 +282,18 @@ func (u *uaRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 		return u.base.RoundTrip(clone)
 	}
 	return u.base.RoundTrip(req)
+}
+
+type rateLimitRoundTripper struct {
+	base    http.RoundTripper
+	limiter *RateLimiter
+}
+
+func (r *rateLimitRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := r.limiter.Wait(req.Context()); err != nil {
+		return nil, err
+	}
+	return r.base.RoundTrip(req)
 }
 
 // ValidateURL performs pre-flight scheme validation.

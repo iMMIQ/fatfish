@@ -23,6 +23,7 @@ const (
 	maxStarlarkRepeatMul = 10000
 	maxStarlarkRangeLen  = 20000
 	maxStarlarkOutputLen = 64 << 10 // 64 KiB
+	maxChartsPerCompute  = 4
 )
 
 // ErrStarlarkOOMBlocked is returned by the AST pre-validator when a script attempts an OOM DoS pattern.
@@ -73,8 +74,10 @@ func ValidateStarlarkAST(src string) (*syntax.File, error) {
 		return nil, fmt.Errorf("compute: syntax error: %w", err)
 	}
 
-	// Track known variable names holding sequence/string values (conservatively).
+	// Track known variable names holding sequence/string values (conservatively),
+	// and variables produced by sequence repetition to prevent chained OOM like `a = [0]*10000; b = a*10000`.
 	seqVars := make(map[string]bool)
+	seqRepeatVars := make(map[string]int64)
 	var blockErr error
 	var walkStmt func(n syntax.Node, inLoop bool)
 	walkStmt = func(n syntax.Node, inLoop bool) {
@@ -87,19 +90,24 @@ func ValidateStarlarkAST(src string) (*syntax.File, error) {
 			}
 			switch x := cur.(type) {
 			case *syntax.ForStmt:
+				walkStmt(x.X, inLoop)
 				for _, st := range x.Body {
 					walkStmt(st, true)
 				}
 				return false
 			case *syntax.WhileStmt:
+				walkStmt(x.Cond, inLoop)
 				for _, st := range x.Body {
 					walkStmt(st, true)
 				}
 				return false
 			case *syntax.AssignStmt:
 				if lhsID, ok := x.LHS.(*syntax.Ident); ok {
-					if isSequenceExpr(x.RHS) {
+					if isSequenceExpr(x.RHS, seqVars) {
 						seqVars[lhsID.Name] = true
+						if mult := estimateSeqMultiplier(x.RHS, seqVars, seqRepeatVars); mult > 1 {
+							seqRepeatVars[lhsID.Name] = mult
+						}
 					}
 					// Block exponential self-doubling inside loops: `x += x` or `x = x + x`.
 					if inLoop {
@@ -134,18 +142,20 @@ func ValidateStarlarkAST(src string) (*syntax.File, error) {
 				}
 			case *syntax.BinaryExpr:
 				if x.Op == syntax.STAR {
-					lhsSeq := isSequenceExpr(x.X) || isTrackedSeqIdent(x.X, seqVars)
-					rhsSeq := isSequenceExpr(x.Y) || isTrackedSeqIdent(x.Y, seqVars)
+					lhsSeq := isSequenceExpr(x.X, seqVars)
+					rhsSeq := isSequenceExpr(x.Y, seqVars)
 					if lhsSeq {
 						val, ok := evalConstInt(x.Y)
-						if !ok || val > maxStarlarkRepeatMul || val < 0 {
+						baseMul := estimateSeqMultiplier(x.X, seqVars, seqRepeatVars)
+						if !ok || val > maxStarlarkRepeatMul || val < 0 || (baseMul > 1 && val > maxStarlarkRepeatMul/baseMul) {
 							blockErr = fmt.Errorf("%w: sequence multiplication requires small constant <= %d", ErrStarlarkOOMBlocked, maxStarlarkRepeatMul)
 							return false
 						}
 					}
 					if rhsSeq {
 						val, ok := evalConstInt(x.X)
-						if !ok || val > maxStarlarkRepeatMul || val < 0 {
+						baseMul := estimateSeqMultiplier(x.Y, seqVars, seqRepeatVars)
+						if !ok || val > maxStarlarkRepeatMul || val < 0 || (baseMul > 1 && val > maxStarlarkRepeatMul/baseMul) {
 							blockErr = fmt.Errorf("%w: sequence multiplication requires small constant <= %d", ErrStarlarkOOMBlocked, maxStarlarkRepeatMul)
 							return false
 						}
@@ -173,26 +183,68 @@ func ValidateStarlarkAST(src string) (*syntax.File, error) {
 	return file, nil
 }
 
-func isTrackedSeqIdent(e syntax.Expr, seqVars map[string]bool) bool {
-	if id, ok := e.(*syntax.Ident); ok {
-		return seqVars[id.Name]
-	}
-	if p, ok := e.(*syntax.ParenExpr); ok {
-		return isTrackedSeqIdent(p.X, seqVars)
-	}
-	return false
-}
-
-func isSequenceExpr(e syntax.Expr) bool {
+func isSequenceExpr(e syntax.Expr, seqVars map[string]bool) bool {
 	switch x := e.(type) {
 	case *syntax.ListExpr, *syntax.TupleExpr, *syntax.Comprehension:
 		return true
 	case *syntax.Literal:
 		return x.Token == syntax.STRING
+	case *syntax.Ident:
+		return seqVars[x.Name]
 	case *syntax.ParenExpr:
-		return isSequenceExpr(x.X)
+		return isSequenceExpr(x.X, seqVars)
+	case *syntax.BinaryExpr:
+		if x.Op == syntax.STAR || x.Op == syntax.PLUS {
+			return isSequenceExpr(x.X, seqVars) || isSequenceExpr(x.Y, seqVars)
+		}
 	}
 	return false
+}
+
+func estimateSeqMultiplier(e syntax.Expr, seqVars map[string]bool, seqRepeatVars map[string]int64) int64 {
+	switch x := e.(type) {
+	case *syntax.ParenExpr:
+		return estimateSeqMultiplier(x.X, seqVars, seqRepeatVars)
+	case *syntax.Ident:
+		if m, ok := seqRepeatVars[x.Name]; ok && m > 1 {
+			return m
+		}
+		return 1
+	case *syntax.BinaryExpr:
+		if x.Op == syntax.STAR {
+			if isSequenceExpr(x.X, seqVars) {
+				base := estimateSeqMultiplier(x.X, seqVars, seqRepeatVars)
+				val, ok := evalConstInt(x.Y)
+				if !ok || val <= 0 {
+					return maxStarlarkRepeatMul + 1
+				}
+				if base > maxStarlarkRepeatMul/val {
+					return maxStarlarkRepeatMul + 1
+				}
+				return base * val
+			}
+			if isSequenceExpr(x.Y, seqVars) {
+				base := estimateSeqMultiplier(x.Y, seqVars, seqRepeatVars)
+				val, ok := evalConstInt(x.X)
+				if !ok || val <= 0 {
+					return maxStarlarkRepeatMul + 1
+				}
+				if base > maxStarlarkRepeatMul/val {
+					return maxStarlarkRepeatMul + 1
+				}
+				return base * val
+			}
+		}
+		if x.Op == syntax.PLUS {
+			lx := estimateSeqMultiplier(x.X, seqVars, seqRepeatVars)
+			ly := estimateSeqMultiplier(x.Y, seqVars, seqRepeatVars)
+			if lx+ly > maxStarlarkRepeatMul {
+				return maxStarlarkRepeatMul + 1
+			}
+			return lx + ly
+		}
+	}
+	return 1
 }
 
 func exceedsIntLiteral(e syntax.Expr, limit int64) bool {
@@ -668,8 +720,17 @@ func slFinDrawdown(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple,
 // --- Preloaded Go-native chart module ---
 
 func (t *ComputeTool) chartModule(charts *[]model.DirectMedia) *starlarkstruct.Module {
+	checkCap := func() error {
+		if len(*charts) >= maxChartsPerCompute {
+			return fmt.Errorf("chart: maximum of %d charts per compute call exceeded", maxChartsPerCompute)
+		}
+		return nil
+	}
 	makeSeriesFn := func(kind string) func(*starlark.Thread, *starlark.Builtin, starlark.Tuple, []starlark.Tuple) (starlark.Value, error) {
 		return func(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+			if err := checkCap(); err != nil {
+				return nil, err
+			}
 			var title string
 			var labelsVal, dataVal starlark.Value
 			if err := starlark.UnpackArgs("chart."+kind, args, kwargs, "title", &title, "labels", &labelsVal, "data", &dataVal); err != nil {
@@ -695,6 +756,9 @@ func (t *ComputeTool) chartModule(charts *[]model.DirectMedia) *starlarkstruct.M
 	}
 
 	pieFn := func(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+		if err := checkCap(); err != nil {
+			return nil, err
+		}
 		var title string
 		var labelsVal, valsVal starlark.Value
 		if err := starlark.UnpackArgs("chart.pie", args, kwargs, "title", &title, "labels", &labelsVal, "values", &valsVal); err != nil {
@@ -714,6 +778,9 @@ func (t *ComputeTool) chartModule(charts *[]model.DirectMedia) *starlarkstruct.M
 	}
 
 	klineFn := func(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+		if err := checkCap(); err != nil {
+			return nil, err
+		}
 		var title string
 		var candlesVal starlark.Value
 		if err := starlark.UnpackArgs("chart.kline", args, kwargs, "title", &title, "candles", &candlesVal); err != nil {

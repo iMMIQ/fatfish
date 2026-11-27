@@ -97,3 +97,18 @@ func TestSSRFBlocked(t *testing.T) {
 		t.Fatalf("expected ErrInvalidScheme for file://, got %v", err)
 	}
 }
+
+func TestRateLimiter(t *testing.T) {
+	rl := NewRateLimiter(50, 2)
+	if !rl.Allow() || !rl.Allow() {
+		t.Fatalf("expected initial burst of 2 to pass")
+	}
+	if rl.Allow() {
+		t.Fatalf("expected 3rd immediate token to be rejected")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := rl.Wait(ctx); err != nil {
+		t.Fatalf("expected Wait to succeed after refill, got %v", err)
+	}
+}

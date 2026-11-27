@@ -133,6 +133,9 @@ func (c *ChartRenderer) RenderLineOrBar(kind, title string, labels []string, ser
 			maxN = len(s.Values)
 		}
 		for _, v := range s.Values {
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				return nil, errors.New("chart: non-finite (NaN/Inf) value is not supported")
+			}
 			if v < minY {
 				minY = v
 			}
@@ -140,6 +143,9 @@ func (c *ChartRenderer) RenderLineOrBar(kind, title string, labels []string, ser
 				maxY = v
 			}
 		}
+	}
+	if maxN == 0 {
+		return nil, errors.New("chart: empty series values")
 	}
 	if kind == "bar" && minY > 0 {
 		minY = 0
@@ -253,6 +259,9 @@ func (c *ChartRenderer) RenderPie(title string, labels []string, values []float6
 	}
 	var total float64
 	for _, v := range values {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil, errors.New("chart: non-finite (NaN/Inf) pie value is not supported")
+		}
 		if v > 0 {
 			total += v
 		}
@@ -356,6 +365,11 @@ func (c *ChartRenderer) RenderKline(title string, candles []Candle) ([]byte, err
 
 	minY, maxY := math.Inf(1), math.Inf(-1)
 	for _, cd := range candles {
+		for _, v := range []float64{cd.Open, cd.High, cd.Low, cd.Close} {
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				return nil, errors.New("chart: non-finite (NaN/Inf) candle value is not supported")
+			}
+		}
 		if cd.Low < minY {
 			minY = cd.Low
 		}
@@ -462,6 +476,8 @@ func fillCircle(img *image.RGBA, cx, cy, r int, col color.RGBA) {
 }
 
 func drawLine(img *image.RGBA, x0, y0, x1, y1 int, col color.RGBA) {
+	b := img.Bounds()
+	maxSteps := (b.Dx()+b.Dy())*2 + 32
 	dx := absInt(x1 - x0)
 	dy := -absInt(y1 - y0)
 	sx := -1
@@ -473,7 +489,7 @@ func drawLine(img *image.RGBA, x0, y0, x1, y1 int, col color.RGBA) {
 		sy = 1
 	}
 	err := dx + dy
-	for {
+	for steps := 0; steps < maxSteps; steps++ {
 		img.SetRGBA(x0, y0, col)
 		if x0 == x1 && y0 == y1 {
 			break

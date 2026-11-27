@@ -51,6 +51,10 @@ type Manager struct {
 	rooms    map[model.ChannelID]*Room
 	draining atomic.Bool
 	wg       sync.WaitGroup
+
+	percSem        chan struct{} // Bounded async perception concurrency (SPEC §5.1)
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
 }
 
 type Dependencies struct {
@@ -71,24 +75,28 @@ func NewManager(deps Dependencies) *Manager {
 	if deps.Logger == nil {
 		deps.Logger = slog.Default()
 	}
-	allowHosts := []string{"127.0.0.1"}
+	var allowHosts []string
 	if deps.Config != nil && deps.Config.Get() != nil {
 		allowHosts = deps.Config.Get().Tools.SSRFAllowHosts
 	}
+	sdCtx, sdCancel := context.WithCancel(context.Background())
 	return &Manager{
-		cfgMgr:   deps.Config,
-		store:    deps.Store,
-		policy:   deps.Policy,
-		hub:      deps.Hub,
-		frames:   deps.Frames,
-		runner:   deps.Runner,
-		memory:   deps.Memory,
-		stickers: deps.Stickers,
-		registry: deps.Registry,
-		tr:       deps.Transport,
-		httpCli:  netutil.NewSafeHTTPClient(netutil.SafeClientOptions{Timeout: 10 * time.Second, AllowHosts: allowHosts}),
-		log:      deps.Logger,
-		rooms:    make(map[model.ChannelID]*Room),
+		cfgMgr:         deps.Config,
+		store:          deps.Store,
+		policy:         deps.Policy,
+		hub:            deps.Hub,
+		frames:         deps.Frames,
+		runner:         deps.Runner,
+		memory:         deps.Memory,
+		stickers:       deps.Stickers,
+		registry:       deps.Registry,
+		tr:             deps.Transport,
+		httpCli:        netutil.NewSafeHTTPClient(netutil.SafeClientOptions{Timeout: 10 * time.Second, AllowHosts: allowHosts}),
+		log:            deps.Logger,
+		rooms:          make(map[model.ChannelID]*Room),
+		percSem:        make(chan struct{}, 16),
+		shutdownCtx:    sdCtx,
+		shutdownCancel: sdCancel,
 	}
 }
 
@@ -128,11 +136,27 @@ func (m *Manager) DispatchSystem(ev model.SystemTriggerEvent) {
 	if m.draining.Load() {
 		return
 	}
+	if m.policy != nil && !m.policy.ChannelAllowed(ev.ChannelID) {
+		return
+	}
 	r := m.getOrCreate(ev.ChannelID)
 	select {
 	case r.mailbox <- model.InboundEvent{System: &ev}:
 	default:
 		m.log.Warn("room mailbox full, dropping system trigger", "channel", ev.ChannelID)
+	}
+}
+
+// DispatchCommand sends an administrative command (e.g. reset, status, tr) into the target Room Actor.
+func (m *Manager) DispatchCommand(cmd model.AdminCommand) {
+	if m.draining.Load() {
+		return
+	}
+	r := m.getOrCreate(cmd.ChannelID)
+	select {
+	case r.mailbox <- model.InboundEvent{Command: &cmd}:
+	default:
+		m.log.Warn("room mailbox full, dropping admin command", "channel", cmd.ChannelID, "cmd", cmd.Name)
 	}
 }
 
@@ -147,7 +171,8 @@ func (m *Manager) ActiveChannels() []model.ChannelID {
 	return out
 }
 
-// Drain stops accepting new events and waits up to timeout for in-flight turns & deliveries to finish.
+// Drain stops accepting new events and waits up to timeout for in-flight turns, deliveries,
+// and background room tasks to finish before cancelling remaining contexts.
 func (m *Manager) Drain(timeout time.Duration) {
 	m.draining.Store(true)
 	m.mu.RLock()
@@ -167,8 +192,14 @@ func (m *Manager) Drain(timeout time.Duration) {
 	}()
 	select {
 	case <-done:
+		m.shutdownCancel()
 	case <-time.After(timeout):
-		m.log.Warn("room drain timed out", "timeout", timeout)
+		m.log.Warn("room drain timed out, cancelling remaining workers", "timeout", timeout)
+		m.shutdownCancel()
+		select {
+		case <-done:
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 }
 
@@ -196,21 +227,31 @@ func (m *Manager) getOrCreate(ch model.ChannelID) *Room {
 
 // Room is a single-goroutine Per-Channel Actor serializing state, perception waits, policy checks,
 // debouncing, thread tracking, +1 repeater, and epoch-guarded delivery.
+// Blocking LLM inference and bubble delivery execute on a single managed turn worker so the actor
+// keeps draining mailbox events (/reset epoch cancellation, live msgCount for post-gen stale drop,
+// and background perception patches).
 type Room struct {
-	mgr     *Manager
-	ch      model.ChannelID
-	mailbox chan model.InboundEvent
-	stopCh  chan struct{}
-	stopOne sync.Once
+	mgr         *Manager
+	ch          model.ChannelID
+	mailbox     chan model.InboundEvent
+	percPatchCh chan perceptionPatch
+	turnDoneCh  chan turnOutcome
+	stopCh      chan struct{}
+	stopOne     sync.Once
 
 	epoch          atomic.Int64
-	muteUntil      time.Time
+	muteUntilNano  atomic.Int64 // UnixNano; atomic so actor & turn worker share safely
+	msgCount       atomic.Uint64
 	lastProactive  time.Time
 	lastPlusOne    time.Time
 	seenInSegment  map[string]bool // tracks members already introduced in active segment
 	lastSegID      int64
 	pendingMsgs    []model.Message // messages accumulated since last LLM turn
 	pendingTrigger *triggerState
+
+	// Managed single turn worker state (owned strictly by Room.run())
+	turnActive bool
+	turnCancel context.CancelFunc
 
 	// Thread continuation state
 	threadUserID string
@@ -223,9 +264,21 @@ type Room struct {
 
 	// Burst user tracking (rolling 30s window for PolicyEnv.BurstUsers)
 	recentSenders []senderStamp
+}
 
-	// Stale tracking
-	msgCount uint64
+type perceptionPatch struct {
+	seq   int64
+	parts []model.Part
+}
+
+type turnOutcome struct {
+	epoch            int64
+	trig             triggerState
+	committed        bool
+	proactiveActed   bool
+	uncommittedBatch []model.Message
+	segID            int64
+	seenMembers      []string
 }
 
 type senderStamp struct {
@@ -260,17 +313,30 @@ func newRoom(mgr *Manager, ch model.ChannelID) *Room {
 		mgr:           mgr,
 		ch:            ch,
 		mailbox:       make(chan model.InboundEvent, 256),
+		percPatchCh:   make(chan perceptionPatch, 64),
+		turnDoneCh:    make(chan turnOutcome, 1),
 		stopCh:        make(chan struct{}),
 		seenInSegment: make(map[string]bool),
 		plusOneUsers:  make(map[string]struct{}),
 	}
-	if st, err := mgr.store.EnsureChannel(context.Background(), ch); err == nil {
-		r.epoch.Store(st.Epoch)
-		r.muteUntil = st.MuteUntil
-	} else {
-		r.epoch.Store(1)
-	}
+	r.epoch.Store(1)
 	return r
+}
+
+func (r *Room) isMuted(now time.Time) bool {
+	until := r.muteUntilNano.Load()
+	return until > 0 && now.UnixNano() < until
+}
+
+func (r *Room) engageMute(ctx context.Context, cfg *config.Config) {
+	sec := cfg.Policy.MuteBackoffSec
+	if sec <= 0 {
+		sec = 1800
+	}
+	until := time.Now().Add(time.Duration(sec) * time.Second)
+	r.muteUntilNano.Store(until.UnixNano())
+	_ = r.mgr.store.SetChannelMuteUntil(ctx, r.ch, until)
+	r.mgr.log.Warn("risk/mute detected, engaging backoff", "channel", r.ch, "until", until)
 }
 
 func (r *Room) stop() {
@@ -278,6 +344,16 @@ func (r *Room) stop() {
 }
 
 func (r *Room) run() {
+	// Load persistent channel epoch & mute backoff inside the Room goroutine (never blocking WS reader Dispatch).
+	if r.mgr.store != nil {
+		if st, err := r.mgr.store.EnsureChannel(r.mgr.shutdownCtx, r.ch); err == nil {
+			r.epoch.Store(st.Epoch)
+			if !st.MuteUntil.IsZero() {
+				r.muteUntilNano.Store(st.MuteUntil.UnixNano())
+			}
+		}
+	}
+
 	var debounceTimer *time.Timer
 	var debounceCh <-chan time.Time
 
@@ -299,6 +375,15 @@ func (r *Room) run() {
 		}
 	}
 
+	launchPendingTurn := func() {
+		if r.turnActive || r.pendingTrigger == nil {
+			return
+		}
+		trig := *r.pendingTrigger
+		r.pendingTrigger = nil
+		r.startTurn(trig)
+	}
+
 	for {
 		select {
 		case <-r.stopCh:
@@ -314,25 +399,39 @@ func (r *Room) run() {
 					armDebounce(wait)
 				}
 			} else if ev.System != nil {
-				r.onSystemTrigger(*ev.System)
+				if r.onSystemTrigger(*ev.System) && !r.turnActive {
+					launchPendingTurn()
+				}
 			} else if ev.Command != nil {
 				r.onAdminCommand(*ev.Command)
+			}
+
+		case patch := <-r.percPatchCh:
+			for i := range r.pendingMsgs {
+				if r.pendingMsgs[i].Seq == patch.seq {
+					r.pendingMsgs[i].Parts = patch.parts
+					break
+				}
+			}
+
+		case out := <-r.turnDoneCh:
+			r.turnActive = false
+			r.turnCancel = nil
+			r.applyTurnOutcome(out)
+			if r.pendingTrigger != nil && debounceTimer == nil {
+				armDebounce(10 * time.Millisecond)
 			}
 
 		case <-debounceCh:
 			debounceCh = nil
 			debounceTimer = nil
-			if r.pendingTrigger != nil {
-				trig := r.pendingTrigger
-				r.pendingTrigger = nil
-				r.executeTurn(*trig)
-			}
+			launchPendingTurn()
 		}
 	}
 }
 
 func (r *Room) onAdminCommand(cmd model.AdminCommand) {
-	ctx := context.Background()
+	ctx := r.mgr.shutdownCtx
 	switch cmd.Name {
 	case "reset":
 		newEp, err := r.mgr.store.BumpChannelEpoch(ctx, r.ch)
@@ -340,6 +439,9 @@ func (r *Room) onAdminCommand(cmd model.AdminCommand) {
 			r.epoch.Store(newEp)
 		} else {
 			r.epoch.Add(1)
+		}
+		if r.turnCancel != nil {
+			r.turnCancel()
 		}
 		r.pendingMsgs = nil
 		r.pendingTrigger = nil
@@ -349,9 +451,20 @@ func (r *Room) onAdminCommand(cmd model.AdminCommand) {
 		if cmd.Reply != nil {
 			cmd.Reply <- fmt.Sprintf("已重置当前频道上下文 (epoch=%d)", r.epoch.Load())
 		}
+	case "status":
+		if cmd.Reply != nil {
+			cmd.Reply <- fmt.Sprintf("channel=%s epoch=%d active_turn=%v pending=%d muted=%v",
+				r.ch, r.epoch.Load(), r.turnActive, len(r.pendingMsgs), r.isMuted(time.Now()))
+		}
 	case "tr":
 		if cmd.Reply != nil {
-			out, err := r.mgr.hub.Translate(ctx, cmd.Args, "Simplified Chinese")
+			trCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			if r.mgr.hub == nil {
+				cmd.Reply <- "翻译失败: inference hub unavailable"
+				return
+			}
+			out, err := r.mgr.hub.Translate(trCtx, cmd.Args, "Simplified Chinese")
 			if err != nil {
 				cmd.Reply <- "翻译失败: " + err.Error()
 			} else {
@@ -362,9 +475,14 @@ func (r *Room) onAdminCommand(cmd model.AdminCommand) {
 }
 
 func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
-	ctx := context.Background()
+	ctx := r.mgr.shutdownCtx
 	cfg := r.mgr.cfgMgr.Get()
-	r.msgCount++
+	r.msgCount.Add(1)
+
+	// Ignore our own outbound echoes (message_sent) before persisting L0 since outbound paths already recorded them.
+	if msg.FromBot {
+		return 0, false
+	}
 
 	// Resolve RepliedToBot and bounded quote chain (depth <= 3) via local L0 + transport.GetMessage fallback.
 	if msg.ReplyToMsgID != "" {
@@ -383,8 +501,8 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 	// Persist L0 raw message immediately so seq is strictly monotonic.
 	_ = r.mgr.store.AppendMessage(ctx, msg)
 
-	// Ignore our own outbound echoes and configured ignored bots for trigger logic.
-	if msg.FromBot || r.mgr.policy.IsIgnoredBot(msg.SenderID) {
+	// Ignore configured ignored bots for trigger logic (after persisting to L0).
+	if r.mgr.policy.IsIgnoredBot(msg.SenderID) {
 		return 0, false
 	}
 
@@ -399,16 +517,28 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		replyCh := make(chan string, 1)
 		r.onAdminCommand(model.AdminCommand{ChannelID: r.ch, SenderID: msg.SenderID, Name: "reset", Reply: replyCh})
 		if r.mgr.tr != nil {
-			_, _ = r.mgr.tr.SendText(ctx, r.ch, <-replyCh, transport.SendOptions{})
+			if _, err := r.mgr.tr.SendText(ctx, r.ch, <-replyCh, transport.SendOptions{}); errors.Is(err, transport.ErrRiskMuted) {
+				r.engageMute(ctx, cfg)
+			}
 		}
 		return 0, false
 	}
 	if strings.HasPrefix(plain, "/tr ") {
+		if r.mgr.hub == nil || r.isMuted(now) {
+			return 0, false
+		}
 		arg := strings.TrimSpace(strings.TrimPrefix(plain, "/tr "))
+		replyTo := msg.PlatformMsgID
+		r.mgr.wg.Add(1)
 		go func() {
-			out, err := r.mgr.hub.Translate(context.Background(), arg, "Simplified Chinese")
+			defer r.mgr.wg.Done()
+			tctx, cancel := context.WithTimeout(r.mgr.shutdownCtx, 30*time.Second)
+			defer cancel()
+			out, err := r.mgr.hub.Translate(tctx, arg, "Simplified Chinese")
 			if err == nil && out != "" && r.mgr.tr != nil {
-				_, _ = r.mgr.tr.SendText(context.Background(), r.ch, out, transport.SendOptions{ReplyToMsgID: msg.PlatformMsgID})
+				if _, serr := r.mgr.tr.SendText(tctx, r.ch, out, transport.SendOptions{ReplyToMsgID: replyTo}); errors.Is(serr, transport.ErrRiskMuted) {
+					r.engageMute(tctx, cfg)
+				}
 			}
 		}()
 		return 0, false
@@ -428,18 +558,35 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		}
 	}
 	var perceptionCh chan perceptionResult
+	var deliveredInline atomic.Bool
 	if hasMedia || hasAudio || hasForward {
 		perceptionCh = make(chan perceptionResult, 1)
-		msgCopy := *msg
-		msgCopy.Parts = append([]model.Part(nil), msg.Parts...)
+		msgCopy := cloneMessage(*msg)
+		r.mgr.wg.Add(1)
 		go func() {
+			defer r.mgr.wg.Done()
+			select {
+			case r.mgr.percSem <- struct{}{}:
+				defer func() { <-r.mgr.percSem }()
+			case <-r.mgr.shutdownCtx.Done():
+				perceptionCh <- perceptionResult{}
+				return
+			}
 			res := r.runPerception(&msgCopy, cfg)
 			perceptionCh <- res
+			// If perception completed after onMessage moved on (silent msg or timeout),
+			// patch r.pendingMsgs via actor channel so subsequent turns see the image/transcript!
+			if res.changed && !deliveredInline.Load() {
+				select {
+				case r.percPatchCh <- perceptionPatch{seq: msgCopy.Seq, parts: res.parts}:
+				default:
+				}
+			}
 		}()
 	}
 
 	// Check mute backoff before deciding whether to respond.
-	if now.Before(r.muteUntil) {
+	if r.isMuted(now) {
 		r.pendingMsgs = append(r.pendingMsgs, cloneMessage(*msg))
 		return 0, false
 	}
@@ -457,8 +604,10 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 			pokedForPolicy = msg.PokedBot
 		}
 		if pokedForPolicy && cfg.Policy.Poke.ReverseProb > 0 && rand.Float64() < cfg.Policy.Poke.ReverseProb && r.mgr.tr != nil {
+			r.mgr.wg.Add(1)
 			go func(target string) {
-				pctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer r.mgr.wg.Done()
+				pctx, cancel := context.WithTimeout(r.mgr.shutdownCtx, 2*time.Second)
 				defer cancel()
 				_ = r.mgr.tr.SendPoke(pctx, r.ch, target)
 			}(msg.SenderID)
@@ -525,12 +674,13 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		}
 		select {
 		case res := <-perceptionCh:
+			deliveredInline.Store(true)
 			if res.changed {
 				msg.Parts = res.parts
 				plain = strings.TrimSpace(msg.PlainText())
 			}
 		case <-time.After(waitDur):
-			// Proceed with placeholder; background perception patches L0+FTS5 safely on its own copy.
+			// Proceed with placeholder; background perception patches L0+FTS5 & r.pendingMsgs on completion.
 		}
 	}
 
@@ -571,12 +721,21 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		proactive = false
 	}
 
+	// Enforce hard proactive cooldown in Go regardless of custom reply_gate expressions (SPEC §5.3).
+	if proactive && !cooldownOK {
+		return 0, false
+	}
+	// Never let a lower-priority proactive trigger overwrite a queued explicit trigger (e.g. pure @bot wait).
+	if proactive && r.pendingTrigger != nil && !r.pendingTrigger.proactive {
+		return 0, false
+	}
+
 	r.pendingTrigger = &triggerState{
 		msg:        cloneMessage(*msg),
 		kind:       trigKind,
 		proactive:  proactive,
 		enqueuedAt: time.Now(),
-		enqMsgCnt:  r.msgCount,
+		enqMsgCnt:  r.msgCount.Load(),
 	}
 
 	// Pure @mention with no text waits mention_wait_sec for follow-up message from same sender.
@@ -653,7 +812,7 @@ func cloneMessage(m model.Message) model.Message {
 }
 
 func (r *Room) runPerception(msg *model.Message, cfg *config.Config) perceptionResult {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(r.mgr.shutdownCtx, 20*time.Second)
 	defer cancel()
 
 	changed := false
@@ -706,10 +865,16 @@ func (r *Room) runPerception(msg *model.Message, cfg *config.Config) perceptionR
 
 			// Optional auto-collect candidate sticker when enabled and policy expr passes (SPEC §5.2).
 			if cfg.Sticker.AutoCollect && r.mgr.policy != nil {
+				nowLocal := time.Now().In(cfg.Location())
+				hour := nowLocal.Hour()
 				if ok, perr := r.mgr.policy.EvalAutoCollectSticker(r.ch, policy.PolicyEnv{
 					IsGroup: r.ch.IsGroup(),
 					FromBot: msg.FromBot,
+					IsAdmin: cfg.IsAdmin(msg.SenderID),
+					IsNight: hour < 7 || hour >= 23,
+					Hour:    hour,
 					ImageKB: kb,
+					Rand:    rand.Float64(),
 				}); perr == nil && ok {
 					r.autoCollectSticker(ctx, cfg, raw, blob.Ext)
 				}
@@ -805,12 +970,16 @@ func (r *Room) tryPlusOne(ctx context.Context, msg *model.Message, cfg *config.C
 		return plusOneNone
 	}
 	roll := rand.Float64()
+	// Reset tracking once the threshold is reached so 4th/5th identical messages don't re-roll repeatedly.
+	r.plusOnePhrase = ""
+	r.plusOneUsers = make(map[string]struct{})
 	if roll < cfg.Policy.PlusOne.RepeatProb {
 		r.lastPlusOne = time.Now()
-		r.plusOnePhrase = ""
-		r.plusOneUsers = make(map[string]struct{})
 		if r.mgr.tr != nil {
-			if pid, err := r.mgr.tr.SendText(ctx, r.ch, txt, transport.SendOptions{}); err == nil {
+			pid, err := r.mgr.tr.SendText(ctx, r.ch, txt, transport.SendOptions{})
+			if errors.Is(err, transport.ErrRiskMuted) {
+				r.engageMute(ctx, cfg)
+			} else if err == nil {
 				_ = r.mgr.store.AppendMessage(ctx, &model.Message{
 					ChannelID:     r.ch,
 					PlatformMsgID: pid,
@@ -826,14 +995,16 @@ func (r *Room) tryPlusOne(ctx context.Context, msg *model.Message, cfg *config.C
 	}
 	if cfg.Policy.PlusOne.BreakProb > 0 && roll < cfg.Policy.PlusOne.RepeatProb+cfg.Policy.PlusOne.BreakProb {
 		r.lastPlusOne = time.Now()
-		r.plusOnePhrase = ""
-		r.plusOneUsers = make(map[string]struct{})
 		return plusOneBreak
 	}
 	return plusOneNone
 }
 
-func (r *Room) onSystemTrigger(ev model.SystemTriggerEvent) {
+func (r *Room) onSystemTrigger(ev model.SystemTriggerEvent) bool {
+	if r.isMuted(time.Now()) {
+		r.mgr.log.Info("skipping scheduled trigger while muted", "channel", r.ch, "schedule_id", ev.ScheduleID)
+		return false
+	}
 	trigMsg := model.Message{
 		ChannelID:  r.ch,
 		SenderID:   "system",
@@ -842,48 +1013,130 @@ func (r *Room) onSystemTrigger(ev model.SystemTriggerEvent) {
 		CreatedAt:  ev.CreatedAt,
 	}
 	r.pendingMsgs = append(r.pendingMsgs, trigMsg)
-	r.executeTurn(triggerState{
+	r.pendingTrigger = &triggerState{
 		msg:        trigMsg,
 		kind:       "cron",
 		proactive:  false,
 		enqueuedAt: time.Now(),
-		enqMsgCnt:  r.msgCount,
-	})
+		enqMsgCnt:  r.msgCount.Load(),
+	}
+	return true
 }
 
-func (r *Room) executeTurn(trig triggerState) {
-	ctx := context.Background()
+// startTurn hands off blocking Gate/LLM/delivery execution to a single managed worker goroutine
+// so Room.run() continues draining r.mailbox (/reset, live msgCount, perception patches).
+func (r *Room) startTurn(trig triggerState) {
 	cfg := r.mgr.cfgMgr.Get()
 	startEpoch := r.epoch.Load()
+	batch := append([]model.Message(nil), r.pendingMsgs...)
+	if len(batch) == 0 {
+		batch = []model.Message{trig.msg}
+	}
+	r.pendingMsgs = nil
+
+	seenCopy := make(map[string]bool, len(r.seenInSegment))
+	for k, v := range r.seenInSegment {
+		seenCopy[k] = v
+	}
+	lastSegID := r.lastSegID
+
+	turnCtx, cancel := context.WithCancel(r.mgr.shutdownCtx)
+	r.turnActive = true
+	r.turnCancel = cancel
+
+	r.mgr.wg.Add(1)
+	go func() {
+		defer r.mgr.wg.Done()
+		defer cancel()
+		out := r.runTurnWorker(turnCtx, trig, batch, startEpoch, lastSegID, seenCopy, cfg)
+		select {
+		case r.turnDoneCh <- out:
+		case <-r.stopCh:
+		}
+	}()
+}
+
+func (r *Room) applyTurnOutcome(out turnOutcome) {
+	if out.proactiveActed {
+		r.lastProactive = time.Now()
+	}
+	if out.segID > 0 {
+		if out.segID != r.lastSegID {
+			r.lastSegID = out.segID
+			r.seenInSegment = make(map[string]bool)
+		}
+		for _, id := range out.seenMembers {
+			r.seenInSegment[id] = true
+		}
+	}
+	if out.committed {
+		if out.trig.proactive {
+			r.lastProactive = time.Now()
+		}
+		if out.trig.msg.SenderID != "" && out.trig.msg.SenderID != "system" {
+			// Reset threadTurns to 1 on a fresh explicit mention/reply/poke so a user is never permanently locked out.
+			if r.threadUserID == out.trig.msg.SenderID && out.trig.kind == "thread" {
+				r.threadTurns++
+			} else {
+				r.threadUserID = out.trig.msg.SenderID
+				r.threadTurns = 1
+			}
+			r.threadLastAt = time.Now()
+		}
+		return
+	}
+	// Restore uncommitted batch if epoch didn't change (e.g. LLM error / stale drop / 0 sent) so background context isn't lost.
+	if len(out.uncommittedBatch) > 0 && r.epoch.Load() == out.epoch {
+		merged := make([]model.Message, 0, len(out.uncommittedBatch)+len(r.pendingMsgs))
+		merged = append(merged, out.uncommittedBatch...)
+		merged = append(merged, r.pendingMsgs...)
+		if len(merged) > 60 {
+			merged = merged[len(merged)-60:]
+		}
+		r.pendingMsgs = merged
+	}
+}
+
+func (r *Room) runTurnWorker(
+	ctx context.Context,
+	trig triggerState,
+	batch []model.Message,
+	startEpoch int64,
+	lastSegID int64,
+	seenInSegment map[string]bool,
+	cfg *config.Config,
+) turnOutcome {
+	outcome := turnOutcome{
+		epoch:            startEpoch,
+		trig:             trig,
+		uncommittedBatch: batch,
+	}
 
 	// Stale-drop check #1 (before generation).
-	if r.isStale(trig, cfg) {
+	if r.epoch.Load() != startEpoch || r.isStale(trig, cfg) {
 		r.mgr.log.Info("turn dropped stale", "channel", r.ch, "trigger", trig.kind, "stage", "pre_gen")
-		return
+		return outcome
 	}
 
 	// Proactive fast-model JSON Gate (reply | react:<emoji> | ignore).
 	if trig.proactive && r.mgr.hub != nil {
 		decision := r.runProactiveGate(ctx, trig, cfg)
 		if decision == "ignore" {
-			return
+			return outcome
 		}
 		if strings.HasPrefix(decision, "react:") {
-			emoji := strings.TrimPrefix(decision, "react:")
+			emoji := strings.TrimSpace(strings.TrimPrefix(decision, "react:"))
 			if r.mgr.tr != nil && trig.msg.PlatformMsgID != "" && emoji != "" {
-				_ = r.mgr.tr.SendReaction(ctx, r.ch, trig.msg.PlatformMsgID, emoji)
+				if err := r.mgr.tr.SendReaction(ctx, r.ch, trig.msg.PlatformMsgID, emoji); errors.Is(err, transport.ErrRiskMuted) {
+					r.engageMute(ctx, cfg)
+				} else if err == nil {
+					outcome.proactiveActed = true
+					r.mgr.log.Info("proactive gate reacted", "channel", r.ch, "emoji", emoji)
+				}
 			}
-			r.lastProactive = time.Now()
-			r.mgr.log.Info("proactive gate reacted", "channel", r.ch, "emoji", emoji)
-			return
+			return outcome
 		}
 	}
-
-	batch := append([]model.Message(nil), r.pendingMsgs...)
-	if len(batch) == 0 {
-		batch = []model.Message{trig.msg}
-	}
-	r.pendingMsgs = nil
 
 	// Ensure active segment (with Segment-Pinned Memory Snapshot frozen ONCE at segment creation).
 	toolsHash := ""
@@ -893,39 +1146,55 @@ func (r *Room) executeTurn(trig triggerState) {
 	scopeHash := frame.ScopeHash(cfg.PersonaHash, toolsHash, cfg.Models.Primary.Model)
 
 	activeMembers := uniqueSenders(batch)
-	seg, closedSeg, err := r.mgr.frames.EnsureActiveSegment(ctx, r.ch, startEpoch, scopeHash, func(sctx context.Context) (frame.SnapshotInput, error) {
-		if r.mgr.memory == nil {
-			return frame.SnapshotInput{}, nil
-		}
-		return r.mgr.memory.BuildSnapshot(sctx, r.ch, activeMembers)
-	})
+	seg, closedSeg, err := r.mgr.frames.EnsureActiveSegmentWithClose(
+		ctx, r.ch, startEpoch, scopeHash,
+		func(sctx context.Context) (frame.SnapshotInput, error) {
+			if r.mgr.memory == nil {
+				return frame.SnapshotInput{}, nil
+			}
+			return r.mgr.memory.BuildSnapshot(sctx, r.ch, activeMembers)
+		},
+		func(sctx context.Context, closed *store.SegmentRecord) string {
+			// Summarize closed segment inline within a short 6s budget so Segment N+1 gets Segment N's summary immediately.
+			sumCtx, cancel := context.WithTimeout(sctx, 6*time.Second)
+			defer cancel()
+			return r.generateSegmentSummary(sumCtx, closed)
+		},
+	)
 	if err != nil {
 		r.mgr.log.Error("ensure segment failed", "channel", r.ch, "err", err)
-		return
+		return outcome
 	}
 	if closedSeg != nil {
-		go r.summarizeClosedSegment(closedSeg)
+		r.mgr.wg.Add(1)
+		go func(cseg *store.SegmentRecord) {
+			defer r.mgr.wg.Done()
+			r.summarizeClosedSegment(cseg)
+		}(closedSeg)
 	}
-	if seg.ID != r.lastSegID {
-		r.lastSegID = seg.ID
-		r.seenInSegment = make(map[string]bool)
+	outcome.segID = seg.ID
+	if seg.ID != lastSegID {
+		seenInSegment = make(map[string]bool)
 		for _, id := range activeMembers {
-			r.seenInSegment[id] = true
+			seenInSegment[id] = true
 		}
 	}
 
 	// Mid-segment new member compact one-time delta lines (keeps msg[1] byte-identical!).
 	var newMemberDelta []string
 	for _, m := range batch {
-		if m.FromBot || m.SenderID == "system" || r.seenInSegment[m.SenderID] {
+		if m.FromBot || m.SenderID == "system" || seenInSegment[m.SenderID] {
 			continue
 		}
-		r.seenInSegment[m.SenderID] = true
+		seenInSegment[m.SenderID] = true
 		if r.mgr.memory != nil {
 			if delta := r.mgr.memory.MemberCardDelta(ctx, r.ch, m.SenderID, m.SenderName); delta != "" {
 				newMemberDelta = append(newMemberDelta, delta)
 			}
 		}
+	}
+	for id := range seenInSegment {
+		outcome.seenMembers = append(outcome.seenMembers, id)
 	}
 
 	userPayload := frame.FormatUserTurnWithLimits(
@@ -948,19 +1217,23 @@ func (r *Room) executeTurn(trig triggerState) {
 		TriggerKind:  trig.kind,
 	})
 	if err != nil {
-		r.mgr.log.Error("agent turn failed", "channel", r.ch, "err", err)
-		return
+		if ctx.Err() == nil {
+			r.mgr.log.Error("agent turn failed", "channel", r.ch, "err", err)
+		}
+		return outcome
 	}
 
 	// Abort if /reset happened or channel moved on while LLM was thinking.
+	// Because Room.run() keeps draining mailbox concurrently, r.epoch and r.msgCount are LIVE here!
 	if r.epoch.Load() != startEpoch || r.isStale(trig, cfg) {
-		r.mgr.log.Info("turn dropped stale", "channel", r.ch, "trigger", trig.kind, "stage", "post_gen")
-		return
+		r.mgr.log.Info("turn dropped stale", "channel", r.ch, "trigger", trig.kind, "stage", "post_gen",
+			"new_msgs", int(r.msgCount.Load()-trig.enqMsgCnt))
+		return outcome
 	}
 
-	// Build TurnPlan with natural output formatting.
+	// Build TurnPlan with natural output formatting using LIVE message displacement count.
 	bubbles := FormatBubbles(out.Text, cfg.Policy)
-	replyTo, mentionUser := SmartReplyDecoration(trig, int(r.msgCount-trig.enqMsgCnt), cfg.Policy)
+	replyTo, mentionUser := SmartReplyDecoration(trig, int(r.msgCount.Load()-trig.enqMsgCnt), cfg.Policy)
 	pokeAfter := false
 	if cfg.Policy.Poke.Mode != "ignore" &&
 		cfg.Policy.Poke.AfterReplyProb > 0 &&
@@ -986,19 +1259,25 @@ func (r *Room) executeTurn(trig triggerState) {
 		PokeAfterReply: pokeAfter,
 	}
 
-	r.deliverPlan(ctx, seg, plan, out.NewFrames, out.Stats, trig, cfg)
+	committed := r.deliverPlan(ctx, seg, plan, out.NewFrames, out.TrimUpToIndex, out.Stats, trig, cfg)
+	if committed {
+		outcome.committed = true
+		outcome.uncommittedBatch = nil
+	}
+	return outcome
 }
 
-func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan model.TurnPlan, newFrames []frame.StoredFramePayload, stats agent.TurnStats, trig triggerState, cfg *config.Config) {
+func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan model.TurnPlan, newFrames []frame.StoredFramePayload, trimUpToIdx int, stats agent.TurnStats, trig triggerState, cfg *config.Config) bool {
 	delID, _ := r.mgr.store.CreateDelivery(ctx, plan)
 	var sent []model.SentItem
 	status := model.DeliverySent
+	stickerDispatched := false
 
 	if r.mgr.tr != nil {
 		// Transition ledger planned -> sending before outbound transport calls (SPEC §3).
 		_ = r.mgr.store.UpdateDelivery(ctx, delID, model.DeliverySending, nil)
 
-		// 1. Send text bubbles with natural pacing and epoch/risk guards.
+		// 1. Send text bubbles with natural pacing and live epoch/risk guards.
 	bubbleLoop:
 		for i, b := range plan.Bubbles {
 			if r.epoch.Load() != plan.Epoch {
@@ -1009,8 +1288,12 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 				delay := bubbleDelay(b, cfg.Policy.BubbleTypingDelayMax)
 				select {
 				case <-time.After(delay):
-				case <-r.stopCh:
-					status = model.DeliveryPartial
+				case <-ctx.Done():
+					if r.epoch.Load() != plan.Epoch {
+						status = model.DeliveryAbortedEpoch
+					} else {
+						status = model.DeliveryPartial
+					}
 					break bubbleLoop
 				}
 				if r.epoch.Load() != plan.Epoch {
@@ -1027,9 +1310,7 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 			if err != nil {
 				if errors.Is(err, transport.ErrRiskMuted) {
 					status = model.DeliveryAbortedRisk
-					r.muteUntil = time.Now().Add(time.Duration(cfg.Policy.MuteBackoffSec) * time.Second)
-					_ = r.mgr.store.SetChannelMuteUntil(ctx, r.ch, r.muteUntil)
-					r.mgr.log.Warn("risk/mute detected, engaging backoff", "channel", r.ch, "until", r.muteUntil)
+					r.engageMute(ctx, cfg)
 				} else if len(sent) > 0 {
 					status = model.DeliveryPartial
 				} else {
@@ -1067,8 +1348,7 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 				if err != nil {
 					if errors.Is(err, transport.ErrRiskMuted) {
 						status = model.DeliveryAbortedRisk
-						r.muteUntil = time.Now().Add(time.Duration(cfg.Policy.MuteBackoffSec) * time.Second)
-						_ = r.mgr.store.SetChannelMuteUntil(ctx, r.ch, r.muteUntil)
+						r.engageMute(ctx, cfg)
 					} else if len(sent) > 0 {
 						status = model.DeliveryPartial
 					} else {
@@ -1115,9 +1395,10 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 
 		// 3. Zero-latency post-ACK async reaction sticker (only if not muted/aborted).
 		if status == model.DeliverySent && plan.StickerIntent != "" && r.mgr.stickers != nil {
+			stickerDispatched = true
 			ctxQ := trig.msg.PlainText() + " -> " + plan.RawText
 			r.mgr.stickers.DispatchAsync(
-				context.Background(),
+				r.mgr.shutdownCtx,
 				r.ch,
 				plan.Epoch,
 				plan.StickerIntent,
@@ -1127,6 +1408,9 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 					mime := sticker.MimeTypeFor(st)
 					pid, err := r.mgr.tr.SendImage(sctx, r.ch, imgBytes, mime, transport.SendOptions{})
 					if err != nil {
+						if errors.Is(err, transport.ErrRiskMuted) {
+							r.engageMute(sctx, cfg)
+						}
 						return err
 					}
 					// Record sent reaction sticker into public L0 media timeline (SPEC §9).
@@ -1155,16 +1439,18 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 			if delay <= 0 {
 				delay = 500 * time.Millisecond
 			}
+			r.mgr.wg.Add(1)
 			go func(target string, expEpoch int64) {
+				defer r.mgr.wg.Done()
 				select {
 				case <-time.After(delay):
-				case <-r.stopCh:
+				case <-r.mgr.shutdownCtx.Done():
 					return
 				}
 				if r.epoch.Load() != expEpoch {
 					return
 				}
-				pctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				pctx, cancel := context.WithTimeout(r.mgr.shutdownCtx, 2*time.Second)
 				defer cancel()
 				_ = r.mgr.tr.SendPoke(pctx, r.ch, target)
 			}(plan.TriggerUserID, plan.Epoch)
@@ -1194,8 +1480,9 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 		"sticker", plan.StickerIntent != "",
 	)
 
-	// Invariant (SPEC Section 3): ONLY delivered turns enter the FrozenFrame timeline.
-	if len(sent) > 0 || r.mgr.tr == nil {
+	// Invariant (SPEC Section 3): ONLY delivered turns enter the FrozenFrame timeline
+	// and commit any deferred whole-turn frame trim!
+	if len(sent) > 0 || stickerDispatched || r.mgr.tr == nil {
 		// If partial delivery occurred, trim assistant frame text to what was actually sent.
 		if status != model.DeliverySent && len(newFrames) > 0 && newFrames[len(newFrames)-1].Role == "assistant" {
 			var parts []string
@@ -1206,31 +1493,24 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 			}
 			newFrames[len(newFrames)-1].Text = strings.Join(parts, "\n")
 		}
-		_ = r.mgr.frames.AppendFrozenFrames(ctx, seg, newFrames...)
-
-		// Update thread continuation & proactive cooldown timers.
-		if trig.proactive {
-			r.lastProactive = time.Now()
-		}
-		if trig.msg.SenderID != "" && trig.msg.SenderID != "system" {
-			if r.threadUserID == trig.msg.SenderID {
-				r.threadTurns++
-			} else {
-				r.threadUserID = trig.msg.SenderID
-				r.threadTurns = 1
-			}
-			r.threadLastAt = time.Now()
-		}
+		_ = r.mgr.frames.AppendFrozenFramesWithTrim(ctx, seg, trimUpToIdx, newFrames...)
+		return true
 	}
+	return false
 }
 
 func (r *Room) isStale(trig triggerState, cfg *config.Config) bool {
 	if !trig.proactive {
 		return false
 	}
+	nowLocal := time.Now().In(cfg.Location())
+	hour := nowLocal.Hour()
 	drop, err := r.mgr.policy.EvalDropStale(r.ch, policy.PolicyEnv{
+		IsGroup:   r.ch.IsGroup(),
+		IsNight:   hour < 7 || hour >= 23,
+		Hour:      hour,
 		Proactive: true,
-		NewMsgs:   int(r.msgCount - trig.enqMsgCnt),
+		NewMsgs:   int(r.msgCount.Load() - trig.enqMsgCnt),
 		WaitSec:   time.Since(trig.enqueuedAt).Seconds(),
 	})
 	return err == nil && drop
@@ -1273,25 +1553,40 @@ func (r *Room) runProactiveGate(ctx context.Context, trig triggerState, cfg *con
 		Action  string `json:"action"`
 		EmojiID string `json:"emoji_id"`
 	}
-	if err := json.Unmarshal([]byte(resp.Content), &res); err != nil {
+	raw := extractJSONBlock(resp.Content)
+	if err := json.Unmarshal([]byte(raw), &res); err != nil {
 		return "ignore"
 	}
 	switch strings.ToLower(strings.TrimSpace(res.Action)) {
 	case "reply":
 		return "reply"
 	case "react":
-		return "react:" + res.EmojiID
+		if strings.TrimSpace(res.EmojiID) == "" {
+			return "ignore"
+		}
+		return "react:" + strings.TrimSpace(res.EmojiID)
 	default:
 		return "ignore"
 	}
 }
 
-func (r *Room) summarizeClosedSegment(seg *store.SegmentRecord) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+func extractJSONBlock(s string) string {
+	s = strings.TrimSpace(s)
+	start := strings.IndexByte(s, '{')
+	end := strings.LastIndexByte(s, '}')
+	if start >= 0 && end > start {
+		return s[start : end+1]
+	}
+	return s
+}
+
+func (r *Room) generateSegmentSummary(ctx context.Context, seg *store.SegmentRecord) string {
+	if seg == nil || r.mgr.hub == nil || r.mgr.store == nil {
+		return ""
+	}
 	frames, err := r.mgr.store.ListFrames(ctx, seg.ID)
-	if err != nil || len(frames) == 0 || r.mgr.hub == nil {
-		return
+	if err != nil || len(frames) == 0 {
+		return ""
 	}
 	var lines []string
 	for _, f := range frames {
@@ -1300,19 +1595,33 @@ func (r *Room) summarizeClosedSegment(seg *store.SegmentRecord) {
 			lines = append(lines, f.Role+": "+p.Text)
 		}
 	}
-	if len(lines) > 0 {
-		resp, err := r.mgr.hub.Chat(ctx, "fast", infer.ChatRequest{
-			Messages: []infer.ChatMessage{
-				{Role: "system", Content: "Summarize this completed conversation segment in <=180 words for continuity in the next segment."},
-				{Role: "user", Content: strings.Join(lines, "\n")},
-			},
-		})
-		if err == nil && strings.TrimSpace(resp.Content) != "" {
-			_ = r.mgr.store.CloseSegment(ctx, seg.ID, strings.TrimSpace(resp.Content))
+	if len(lines) == 0 {
+		return ""
+	}
+	resp, err := r.mgr.hub.Chat(ctx, "fast", infer.ChatRequest{
+		Messages: []infer.ChatMessage{
+			{Role: "system", Content: "Summarize this completed conversation segment in <=180 words for continuity in the next segment."},
+			{Role: "user", Content: strings.Join(lines, "\n")},
+		},
+	})
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(resp.Content)
+}
+
+func (r *Room) summarizeClosedSegment(seg *store.SegmentRecord) {
+	ctx, cancel := context.WithTimeout(r.mgr.shutdownCtx, 60*time.Second)
+	defer cancel()
+	// Backfill segment summary if inline summarization timed out or was skipped.
+	if strings.TrimSpace(seg.SummaryText) == "" {
+		if summary := r.generateSegmentSummary(ctx, seg); summary != "" {
+			_ = r.mgr.store.CloseSegment(ctx, seg.ID, summary)
 		}
 	}
 
 	// Online L1 Episode & L2 Profile/Lore distillation on segment close (SPEC §6.2 & §8).
+	// Duplicate/overlapping windows are guarded by HasOverlappingEpisode inside DistillWindow.
 	if r.mgr.memory != nil {
 		endTS := seg.LastActiveAt
 		if endTS.Before(seg.CreatedAt) {
@@ -1347,7 +1656,7 @@ func FormatBubbles(text string, pol config.PolicyConfig) []string {
 		return s
 	}
 
-	if !pol.SplitNewlineBubbles || strings.Contains(text, "```") || strings.Contains(text, "|---") {
+	if !pol.SplitNewlineBubbles || strings.Contains(text, "```") || containsMarkdownTable(text) {
 		return []string{stripPeriod(text)}
 	}
 	rawLines := strings.Split(text, "\n")
@@ -1397,6 +1706,10 @@ func bubbleDelay(bubble string, maxSec float64) time.Duration {
 		sec = maxSec
 	}
 	return time.Duration(sec * float64(time.Second))
+}
+
+func containsMarkdownTable(s string) bool {
+	return strings.Contains(s, "|---") || strings.Contains(s, "| ---") || strings.Contains(s, "|:---")
 }
 
 func uniqueSenders(msgs []model.Message) []string {

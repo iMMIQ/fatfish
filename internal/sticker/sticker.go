@@ -26,11 +26,14 @@ import (
 
 // SearchHit provides full scoring breakdown (also shown on the Console Sticker Manager).
 type SearchHit struct {
-	Sticker     model.Sticker `json:"sticker"`
-	FinalScore  float64       `json:"final_score"`
-	RRFScore    float64       `json:"rrf_score"`
-	RerankScore float64       `json:"rerank_score"`
-	DecayFactor float64       `json:"decay_factor"`
+	Sticker      model.Sticker `json:"sticker"`
+	FinalScore   float64       `json:"final_score"`
+	IntentScore  float64       `json:"intent_score"`
+	ContentScore float64       `json:"content_score"`
+	FTSScore     float64       `json:"fts_score"`
+	RRFScore     float64       `json:"rrf_score"`
+	RerankScore  float64       `json:"rerank_score"`
+	DecayFactor  float64       `json:"decay_factor"`
 }
 
 // Engine implements dual-vector (v_intent + v_content) sticker retrieval with doc-only centering,
@@ -134,6 +137,12 @@ func (e *Engine) LoadIndex(ctx context.Context) (int, error) {
 			contentIdx.UpsertPreencoded(r.Sticker.StickerID, r.ContentF16)
 		}
 	}
+	if mean := e.loadMeanMeta(ctx, "sticker_mean_intent"); len(mean) == e.dim {
+		intentIdx.SetMean(mean, float32(cfg.DocCenteringAlpha))
+	}
+	if mean := e.loadMeanMeta(ctx, "sticker_mean_content"); len(mean) == e.dim {
+		contentIdx.SetMean(mean, float32(cfg.DocCenteringAlpha))
+	}
 
 	e.mu.Lock()
 	e.stickers = stMap
@@ -141,6 +150,29 @@ func (e *Engine) LoadIndex(ctx context.Context) (int, error) {
 	e.contentIdx = contentIdx
 	e.mu.Unlock()
 	return len(stMap), nil
+}
+
+func (e *Engine) saveMeanMeta(ctx context.Context, key string, mean []float32) {
+	if e.store == nil || len(mean) != e.dim {
+		return
+	}
+	raw := vec.EncodeFloat16(mean)
+	_ = e.store.SetMeta(ctx, key, base64.StdEncoding.EncodeToString(raw))
+}
+
+func (e *Engine) loadMeanMeta(ctx context.Context, key string) []float32 {
+	if e.store == nil {
+		return nil
+	}
+	b64, err := e.store.GetMeta(ctx, key)
+	if err != nil || b64 == "" {
+		return nil
+	}
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil || len(raw) != e.dim*2 {
+		return nil
+	}
+	return vec.DecodeFloat16(raw)
 }
 
 // SearchOptions configures dual-vector sticker retrieval.
@@ -188,20 +220,33 @@ func (e *Engine) Search(ctx context.Context, opts SearchOptions) ([]SearchHit, e
 	if e.hub != nil && hasVecs && strings.TrimSpace(opts.Query) != "" {
 		if embs, err := e.hub.Embed(ctx, []string{opts.Query}); err == nil && len(embs) == 1 && len(embs[0]) == e.dim {
 			q := embs[0]
+			e.mu.RLock()
+			// Note: caller already holds e.mu.RLock(); never re-lock inside filter to avoid RWMutex deadlock.
 			filter := func(id string) bool {
 				if opts.PackID == "" {
 					return true
 				}
-				e.mu.RLock()
 				st, ok := e.stickers[id]
-				e.mu.RUnlock()
 				return ok && st.PackID == opts.PackID
 			}
-			e.mu.RLock()
 			intentHits = e.intentIdx.Search(q, 30, filter)
 			contentHits = e.contentIdx.Search(q, 30, filter)
 			e.mu.RUnlock()
 		}
+	}
+
+	// Build score breakdown maps for console diagnostics.
+	ftsScoreMap := make(map[string]float64, len(ftsHits))
+	for _, h := range ftsHits {
+		ftsScoreMap[h.ID] = float64(h.Score)
+	}
+	intentScoreMap := make(map[string]float64, len(intentHits))
+	for _, h := range intentHits {
+		intentScoreMap[h.ID] = float64(h.Score)
+	}
+	contentScoreMap := make(map[string]float64, len(contentHits))
+	for _, h := range contentHits {
+		contentScoreMap[h.ID] = float64(h.Score)
 	}
 
 	// 3. Weighted RRF Top-25.
@@ -221,10 +266,13 @@ func (e *Engine) Search(ctx context.Context, opts SearchOptions) ([]SearchHit, e
 	for _, h := range fused {
 		if st, ok := e.stickers[h.ID]; ok {
 			cands = append(cands, SearchHit{
-				Sticker:     st,
-				RRFScore:    float64(h.Score),
-				FinalScore:  float64(h.Score),
-				DecayFactor: 1.0,
+				Sticker:      st,
+				IntentScore:  intentScoreMap[h.ID],
+				ContentScore: contentScoreMap[h.ID],
+				FTSScore:     ftsScoreMap[h.ID],
+				RRFScore:     float64(h.Score),
+				FinalScore:   float64(h.Score),
+				DecayFactor:  1.0,
 			})
 		}
 	}
@@ -314,8 +362,13 @@ func (e *Engine) PickOne(ctx context.Context, opts SearchOptions) (*SearchHit, e
 	if len(hits) == 1 {
 		return &hits[0], nil
 	}
-	const temp = 0.15
+	temp := 0.15
 	maxS := hits[0].FinalScore
+	minS := hits[len(hits)-1].FinalScore
+	if span := maxS - minS; span > 0 && span < 0.1 {
+		// Calibrate softmax temperature when rerank was skipped and RRF scores are compressed (~0.01-0.04).
+		temp = math.Max(span*0.4, 0.002)
+	}
 	weights := make([]float64, len(hits))
 	sum := 0.0
 	for i, h := range hits {
@@ -483,9 +536,22 @@ func (e *Engine) ReindexOne(ctx context.Context, stickerID string) error {
 			}
 			if it != "" {
 				if embs, err := e.hub.Embed(ctx, []string{it, ct}); err == nil && len(embs) == 2 && len(embs[0]) == e.dim && len(embs[1]) == e.dim {
-					vec.NormalizeInPlace(embs[0])
-					vec.NormalizeInPlace(embs[1])
-					_ = e.store.UpdateStickerVectors(ctx, stickerID, vec.EncodeFloat16(embs[0]), vec.EncodeFloat16(embs[1]))
+					alpha := float32(e.getConfig().DocCenteringAlpha)
+					iv := embs[0]
+					cv := embs[1]
+					if mean := e.loadMeanMeta(ctx, "sticker_mean_intent"); len(mean) == e.dim && alpha > 0 {
+						for j := range iv {
+							iv[j] -= alpha * mean[j]
+						}
+					}
+					if mean := e.loadMeanMeta(ctx, "sticker_mean_content"); len(mean) == e.dim && alpha > 0 {
+						for j := range cv {
+							cv[j] -= alpha * mean[j]
+						}
+					}
+					vec.NormalizeInPlace(iv)
+					vec.NormalizeInPlace(cv)
+					_ = e.store.UpdateStickerVectors(ctx, stickerID, vec.EncodeFloat16(iv), vec.EncodeFloat16(cv))
 				}
 			}
 			break
@@ -546,8 +612,10 @@ func (e *Engine) Reindex(ctx context.Context, alpha float64) (int, error) {
 
 	iIdx := vec.NewFlatF16Index(e.dim, float32(alpha))
 	cIdx := vec.NewFlatF16Index(e.dim, float32(alpha))
-	iIdx.RebuildCentering(rawIntent, float32(alpha))
-	cIdx.RebuildCentering(rawContent, float32(alpha))
+	intentMean := iIdx.RebuildCentering(rawIntent, float32(alpha))
+	contentMean := cIdx.RebuildCentering(rawContent, float32(alpha))
+	e.saveMeanMeta(ctx, "sticker_mean_intent", intentMean)
+	e.saveMeanMeta(ctx, "sticker_mean_content", contentMean)
 
 	for _, r := range rows {
 		var ib, cb []byte

@@ -2,17 +2,23 @@ package room
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/iMMIQ/fatfish/internal/agent"
 	"github.com/iMMIQ/fatfish/internal/config"
+	"github.com/iMMIQ/fatfish/internal/frame"
+	"github.com/iMMIQ/fatfish/internal/infer"
 	"github.com/iMMIQ/fatfish/internal/model"
 	"github.com/iMMIQ/fatfish/internal/policy"
 	"github.com/iMMIQ/fatfish/internal/store"
+	"github.com/iMMIQ/fatfish/internal/transport"
 )
 
 func TestFormatBubblesAndStripPeriod(t *testing.T) {
@@ -139,4 +145,143 @@ tools:
 	// Wait for background slow perception to finish (verifying zero data race under -race).
 	time.Sleep(180 * time.Millisecond)
 	_ = context.Background()
+}
+
+type mockTransport struct {
+	sentTexts atomic.Int32
+}
+
+func (m *mockTransport) Start(context.Context, func(*model.Message)) error             { return nil }
+func (m *mockTransport) StopInbound() error                                            { return nil }
+func (m *mockTransport) Stop() error                                                   { return nil }
+func (m *mockTransport) SelfID() string                                                { return "10001" }
+func (m *mockTransport) Probe(context.Context) error                                   { return nil }
+func (m *mockTransport) SendImage(context.Context, model.ChannelID, []byte, string, transport.SendOptions) (string, error) {
+	return "img1", nil
+}
+func (m *mockTransport) SendPoke(context.Context, model.ChannelID, string) error     { return nil }
+func (m *mockTransport) SendReaction(context.Context, model.ChannelID, string, string) error {
+	return nil
+}
+func (m *mockTransport) FetchAudio(context.Context, string, string) ([]byte, string, error) {
+	return nil, "", nil
+}
+func (m *mockTransport) GetMessage(context.Context, model.ChannelID, string) (*model.Message, error) {
+	return nil, nil
+}
+func (m *mockTransport) GetForward(context.Context, string, int) ([]model.Part, error) {
+	return nil, nil
+}
+func (m *mockTransport) SendText(_ context.Context, _ model.ChannelID, _ string, _ transport.SendOptions) (string, error) {
+	m.sentTexts.Add(1)
+	return "p1", nil
+}
+
+// TestRoomNonBlockingResetDuringInFlightLLM verifies that /reset arriving while the LLM is generating
+// immediately bumps epoch and cancels the in-flight turn so zero stale bubbles are delivered.
+func TestRoomNonBlockingResetDuringInFlightLLM(t *testing.T) {
+	llmStarted := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case llmStarted <- struct{}{}:
+		default:
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"finish_reason": "stop",
+				"message":       map[string]any{"content": "stale reply"},
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "fatfish.yaml")
+	yamlCfg := `data_dir: "` + filepath.ToSlash(dir) + `"
+timezone: "UTC"
+transport:
+  onebot:
+    admin_ids: ["admin1"]
+models:
+  primary:
+    base_url: "` + srv.URL + `"
+    model: "test-m"
+    timeout_sec: 5
+policy:
+  rules:
+    reply_gate: "mentioned"
+`
+	if err := os.WriteFile(cfgPath, []byte(yamlCfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfgMgr, err := config.NewManager(cfgPath, policy.ValidateConfig)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	st, err := store.Open(dir, 512, 5)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+	pol, _ := policy.NewEngine(cfgMgr.Get().Policy)
+	hub := infer.NewHub(cfgMgr.Get().Models)
+	fb := frame.NewBuilder(st, cfgMgr.Get().Frame)
+	runner := agent.NewRunner(hub, st, fb, nil, nil)
+	tr := &mockTransport{}
+
+	mgr := NewManager(Dependencies{
+		Config:    cfgMgr,
+		Store:     st,
+		Policy:    pol,
+		Hub:       hub,
+		Frames:    fb,
+		Runner:    runner,
+		Transport: tr,
+	})
+	defer mgr.Drain(2 * time.Second)
+
+	ch := model.MakeChannelID("onebot", "10001", model.ChannelGroup, "99999")
+	mgr.Dispatch(&model.Message{
+		ChannelID:     ch,
+		PlatformMsgID: "m1",
+		SenderID:      "u1",
+		SenderName:    "Alice",
+		MentionedBot:  true,
+		Parts:         []model.Part{{Kind: model.PartText, Text: "think slowly"}},
+		CreatedAt:     time.Now(),
+	})
+
+	// Wait until the slow LLM call is in-flight.
+	select {
+	case <-llmStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for LLM call to start")
+	}
+
+	// Send /reset via DispatchCommand while LLM is blocked: must return promptly (<300ms)!
+	replyCh := make(chan string, 1)
+	mgr.DispatchCommand(model.AdminCommand{
+		ChannelID: ch,
+		SenderID:  "admin1",
+		Name:      "reset",
+		Reply:     replyCh,
+	})
+	select {
+	case rep := <-replyCh:
+		if rep == "" {
+			t.Fatal("expected reset ack")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("/reset was blocked by in-flight LLM turn (actor starvation regression)")
+	}
+
+	time.Sleep(150 * time.Millisecond)
+	if got := tr.sentTexts.Load(); got != 0 {
+		t.Fatalf("expected 0 stale bubbles after mid-turn /reset, got %d", got)
+	}
 }

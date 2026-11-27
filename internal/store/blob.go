@@ -143,22 +143,19 @@ func (b *BlobStore) PutImage(raw []byte) (CanonicalBlob, error) {
 	}
 	dstPath := filepath.Join(subDir, hash+ext)
 	if _, err := os.Stat(dstPath); os.IsNotExist(err) {
-		tmp := dstPath + ".tmp"
-		if err := os.WriteFile(tmp, encoded, 0o644); err != nil {
-			return CanonicalBlob{}, err
-		}
-		if err := os.Rename(tmp, dstPath); err != nil {
-			_ = os.Remove(tmp)
+		if err := writeFileAtomic(subDir, dstPath, encoded); err != nil {
 			return CanonicalBlob{}, err
 		}
 	}
+	totalSize := int64(len(encoded))
 	if isAnimatedGIF {
 		rawGifPath := filepath.Join(subDir, hash+".raw.gif")
 		if _, err := os.Stat(rawGifPath); os.IsNotExist(err) {
-			tmp := rawGifPath + ".tmp"
-			if err := os.WriteFile(tmp, raw, 0o644); err == nil {
-				_ = os.Rename(tmp, rawGifPath)
+			if err := writeFileAtomic(subDir, rawGifPath, raw); err == nil {
+				totalSize += int64(len(raw))
 			}
+		} else if st, err := os.Stat(rawGifPath); err == nil {
+			totalSize += st.Size()
 		}
 	}
 
@@ -168,9 +165,36 @@ func (b *BlobStore) PutImage(raw []byte) (CanonicalBlob, error) {
 		Ext:      ext,
 		Width:    w,
 		Height:   h,
-		ByteSize: int64(len(encoded)),
+		ByteSize: totalSize,
 		Path:     dstPath,
 	}, nil
+}
+
+func writeFileAtomic(dir, dstPath string, data []byte) error {
+	f, err := os.CreateTemp(dir, ".blob-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := f.Name()
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := f.Chmod(0o644); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, dstPath); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 // PathFor resolves the canonical file path for a sha256 + mimeType pair.

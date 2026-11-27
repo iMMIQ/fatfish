@@ -165,3 +165,44 @@ func TestPartitionWindowsFiltersMediaSpamAndRecallFallback(t *testing.T) {
 		t.Fatalf("expected cold-start L0 raw fallback for sender, got %q", res.Summary)
 	}
 }
+
+func TestFactDecayHalfLifeAndOverlappingEpisodeDedup(t *testing.T) {
+	now := time.Now().UnixMilli()
+	f := model.ProfileFact{
+		Text:       "likes tea",
+		Confidence: 0.8,
+		UpdatedAt:  now - int64(90*24*time.Hour/time.Millisecond),
+	}
+	got := decayedFactScore(f, now)
+	if got < 0.39 || got > 0.41 {
+		t.Fatalf("expected 90d half-life decay to ~0.40 (50%% of 0.8), got %v", got)
+	}
+
+	st, err := store.Open(t.TempDir(), 512, 5)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	ch := model.MakeChannelID("onebot", "1", model.ChannelGroup, "77")
+
+	ep := &model.Episode{
+		ChannelID: ch,
+		StartSeq:  10,
+		EndSeq:    20,
+		StartTS:   time.Now().Add(-time.Hour),
+		EndTS:     time.Now(),
+		Topic:     "test",
+		Summary:   "summary",
+	}
+	if err := st.SaveEpisode(ctx, ep, nil); err != nil {
+		t.Fatalf("SaveEpisode: %v", err)
+	}
+	svc := NewService(st, nil, 4, nil)
+	dupWin := []model.Message{{Seq: 12}, {Seq: 18}}
+	// DistillWindow must skip overlapping seq range without calling hub or creating a duplicate episode.
+	outEp, err := svc.DistillWindow(ctx, ch, dupWin, "distill")
+	if err != nil || outEp != nil {
+		t.Fatalf("expected overlapping window to be skipped (nil, nil), got ep=%+v err=%v", outEp, err)
+	}
+}

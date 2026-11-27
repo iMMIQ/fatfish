@@ -120,12 +120,15 @@ func (c *Client) startReverseServer(ctx context.Context, onMessage func(*model.M
 		c.readLoop(ctx, conn, onMessage)
 
 		c.connMu.Lock()
-		if c.conn == conn {
+		isCurrent := c.conn == conn
+		if isCurrent {
 			c.conn = nil
 		}
 		c.connMu.Unlock()
 		_ = conn.Close()
-		c.failAllPending()
+		if isCurrent {
+			c.failAllPending()
+		}
 	})
 	srv := &http.Server{
 		Addr:              c.cfg.WSListen,
@@ -244,12 +247,15 @@ func (c *Client) runLoop(ctx context.Context, onMessage func(*model.Message)) {
 		c.readLoop(ctx, conn, onMessage)
 
 		c.connMu.Lock()
-		if c.conn == conn {
+		isCurrent := c.conn == conn
+		if isCurrent {
 			c.conn = nil
 		}
 		c.connMu.Unlock()
 		_ = conn.Close()
-		c.failAllPending()
+		if isCurrent {
+			c.failAllPending()
+		}
 	}
 }
 
@@ -473,7 +479,7 @@ func ParseEvent(raw []byte, fallbackSelfID string) *model.Message {
 		msg.Parts = append(msg.Parts, model.Part{Kind: model.PartText, Text: ev.RawMessage})
 	}
 
-	if len(msg.Parts) == 0 {
+	if len(msg.Parts) == 0 && !msg.MentionedBot {
 		return nil
 	}
 	return msg
@@ -711,6 +717,9 @@ func (c *Client) FetchAudio(ctx context.Context, fileID, outFormat string) ([]by
 			return nil, "", err
 		}
 		defer hresp.Body.Close()
+		if hresp.StatusCode < 200 || hresp.StatusCode >= 300 {
+			return nil, "", fmt.Errorf("onebot: fetch audio HTTP %d", hresp.StatusCode)
+		}
 		raw, err := io.ReadAll(io.LimitReader(hresp.Body, 16<<20))
 		return raw, "voice." + outFormat, err
 	}

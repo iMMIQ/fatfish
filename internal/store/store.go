@@ -613,14 +613,28 @@ func (s *Store) RecentMessages(ctx context.Context, ch model.ChannelID, limit in
 }
 
 func (s *Store) MessagesAfterSeq(ctx context.Context, ch model.ChannelID, afterSeq int64, limit int) ([]model.Message, error) {
+	return s.MessagesAfterSeqSince(ctx, ch, afterSeq, 0, limit)
+}
+
+func (s *Store) MessagesAfterSeqSince(ctx context.Context, ch model.ChannelID, afterSeq int64, sinceMs int64, limit int) ([]model.Message, error) {
 	if limit <= 0 {
 		limit = 500
 	}
-	rows, err := s.readDB.QueryContext(ctx,
-		`SELECT id, channel_id, seq, platform_msg_id, sender_id, sender_name, from_bot, parts_json, created_at
-		 FROM messages WHERE channel_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`,
-		string(ch), afterSeq, limit,
-	)
+	var rows *sql.Rows
+	var err error
+	if sinceMs > 0 {
+		rows, err = s.readDB.QueryContext(ctx,
+			`SELECT id, channel_id, seq, platform_msg_id, sender_id, sender_name, from_bot, parts_json, created_at
+			 FROM messages WHERE channel_id = ? AND seq > ? AND created_at >= ? ORDER BY seq ASC LIMIT ?`,
+			string(ch), afterSeq, sinceMs, limit,
+		)
+	} else {
+		rows, err = s.readDB.QueryContext(ctx,
+			`SELECT id, channel_id, seq, platform_msg_id, sender_id, sender_name, from_bot, parts_json, created_at
+			 FROM messages WHERE channel_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`,
+			string(ch), afterSeq, limit,
+		)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -732,6 +746,14 @@ func scanMessages(rows *sql.Rows) ([]model.Message, error) {
 		m.FromBot = fromBot != 0
 		m.CreatedAt = time.UnixMilli(tsMs)
 		_ = json.Unmarshal([]byte(partsJSON), &m.Parts)
+		if m.ReplyToMsgID == "" {
+			for _, p := range m.Parts {
+				if p.Kind == model.PartQuote && p.RefMsgID != "" {
+					m.ReplyToMsgID = p.RefMsgID
+					break
+				}
+			}
+		}
 		out = append(out, m)
 	}
 	return out, rows.Err()
@@ -1149,6 +1171,21 @@ func (s *Store) RecentKVMetrics(ctx context.Context, limit int) ([]model.KVMetri
 }
 
 // --- L1 Episodes & L2 Profiles / Lore / Notes ---
+
+// HasOverlappingEpisode reports whether an episode already covers any portion of [startSeq, endSeq]
+// in channel ch, preventing duplicate episodes and anti-sarcasm double-counting between online
+// segment-close distillation and hourly incremental distillation.
+func (s *Store) HasOverlappingEpisode(ctx context.Context, ch model.ChannelID, startSeq, endSeq int64) (bool, error) {
+	if startSeq <= 0 || endSeq <= 0 {
+		return false, nil
+	}
+	var cnt int
+	err := s.readDB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM episodes WHERE channel_id = ? AND start_seq <= ? AND end_seq >= ?`,
+		string(ch), endSeq, startSeq,
+	).Scan(&cnt)
+	return cnt > 0, err
+}
 
 func (s *Store) SaveEpisode(ctx context.Context, ep *model.Episode, embedF16 []byte) error {
 	if ep.CreatedAt.IsZero() {

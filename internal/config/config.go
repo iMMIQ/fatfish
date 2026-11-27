@@ -406,10 +406,10 @@ func applyDefaults(cfg *Config) {
 	if cfg.Frame.InputTokenBudget <= 0 {
 		cfg.Frame.InputTokenBudget = 32768
 	}
-	if cfg.Frame.TrimHighWater <= 0 || cfg.Frame.TrimHighWater >= 1 {
+	if cfg.Frame.TrimHighWater <= 0 {
 		cfg.Frame.TrimHighWater = 0.80
 	}
-	if cfg.Frame.TrimLowWater <= 0 || cfg.Frame.TrimLowWater >= cfg.Frame.TrimHighWater {
+	if cfg.Frame.TrimLowWater <= 0 {
 		cfg.Frame.TrimLowWater = 0.50
 	}
 	if cfg.Frame.ImageMaxDim <= 0 {
@@ -490,6 +490,9 @@ func validateBasic(cfg *Config) error {
 	if _, err := time.LoadLocation(cfg.Timezone); err != nil {
 		return fmt.Errorf("config: invalid timezone %q: %w", cfg.Timezone, err)
 	}
+	if cfg.Frame.TrimHighWater <= 0 || cfg.Frame.TrimHighWater >= 1 {
+		return errors.New("config: frame.trim_high_water must be in (0, 1)")
+	}
 	if cfg.Frame.TrimLowWater >= cfg.Frame.TrimHighWater {
 		return errors.New("config: frame.trim_low_water must be less than trim_high_water")
 	}
@@ -554,6 +557,7 @@ type Manager struct {
 	cur       atomic.Pointer[Config]
 	validator Validator
 
+	reloadMu  sync.Mutex // Serializes Reload / SaveAndReload / SavePersona
 	mu        sync.Mutex
 	listeners []func(*Config)
 }
@@ -591,6 +595,12 @@ func (m *Manager) OnReload(fn func(*Config)) {
 
 // Reload parses, validates, and atomically swaps the live configuration.
 func (m *Manager) Reload() (*Config, error) {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	return m.reloadLocked()
+}
+
+func (m *Manager) reloadLocked() (*Config, error) {
 	cfg, err := Load(m.path)
 	if err != nil {
 		return nil, err
@@ -618,6 +628,9 @@ func (m *Manager) Reload() (*Config, error) {
 
 // SaveAndReload validates raw YAML bytes, atomically writes to disk, and swaps live config.
 func (m *Manager) SaveAndReload(raw []byte) (*Config, error) {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+
 	cfg, err := ParseBytes(raw, filepath.Dir(m.path))
 	if err != nil {
 		return nil, err
@@ -653,6 +666,9 @@ func (m *Manager) SaveAndReload(raw []byte) (*Config, error) {
 
 // SavePersona atomically updates the active persona markdown file and hot-reloads config (rotating PersonaHash).
 func (m *Manager) SavePersona(text string) (*Config, error) {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+
 	cur := m.cur.Load()
 	if cur == nil || strings.TrimSpace(cur.PersonaPath) == "" {
 		return nil, errors.New("config: persona.file is not configured")
@@ -665,7 +681,7 @@ func (m *Manager) SavePersona(text string) (*Config, error) {
 		_ = os.Remove(tmp)
 		return nil, fmt.Errorf("config: rename persona file: %w", err)
 	}
-	return m.Reload()
+	return m.reloadLocked()
 }
 
 // Watch monitors the config file's parent directory (and persona.file directory if separate) via fsnotify and reloads on edits.

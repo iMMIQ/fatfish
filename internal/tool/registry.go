@@ -36,6 +36,7 @@ type ToolResult struct {
 	TextForLLM  string
 	DirectMedia []model.DirectMedia
 	SideEffect  string
+	SoftError   string // Optional non-fatal degradation reason recorded in tool error metrics
 }
 
 // Tool is the strongly-typed generic interface implemented by all built-in tools.
@@ -212,13 +213,26 @@ func (r *Registry) Lookup(name string) (Entry, bool) {
 	return e, ok
 }
 
+// UpdateDefaultTimeout hot-reloads the default per-tool execution timeout.
+func (r *Registry) UpdateDefaultTimeout(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	r.mu.Lock()
+	r.defaultTO = d
+	r.mu.Unlock()
+}
+
 // Execute invokes a tool with timeout enforcement and records latency/error metrics.
 func (r *Registry) Execute(ctx context.Context, tc ToolContext, name string, rawArgs string) (ToolResult, error) {
 	entry, ok := r.Lookup(name)
 	if !ok {
 		return ToolResult{}, fmt.Errorf("unknown tool %q", name)
 	}
-	runCtx, cancel := context.WithTimeout(ctx, r.defaultTO)
+	r.mu.RLock()
+	timeout := r.defaultTO
+	r.mu.RUnlock()
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	start := time.Now()
@@ -239,6 +253,9 @@ func (r *Registry) Execute(ctx context.Context, tc ToolContext, name string, raw
 		if err != nil {
 			st.Errors++
 			st.LastErrStr = err.Error()
+		} else if res.SoftError != "" {
+			st.Errors++
+			st.LastErrStr = res.SoftError
 		}
 	}
 	r.mu.Unlock()
@@ -272,11 +289,22 @@ func FlattenedSchema(v any) (json.RawMessage, error) {
 	return StripSchemaMeta(raw)
 }
 
-// StripSchemaMeta removes top-level $schema, $id, $defs, and definitions keys for provider compatibility.
+// StripSchemaMeta inlines local $defs/definitions references and removes $schema, $id, $defs, and definitions keys.
 func StripSchemaMeta(raw json.RawMessage) (json.RawMessage, error) {
 	var m map[string]any
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, err
+	}
+	defs := make(map[string]any)
+	for _, key := range []string{"$defs", "definitions"} {
+		if d, ok := m[key].(map[string]any); ok {
+			for name, val := range d {
+				defs[name] = val
+			}
+		}
+	}
+	if len(defs) > 0 {
+		m, _ = inlineSchemaRefs(m, defs, 0).(map[string]any)
 	}
 	delete(m, "$schema")
 	delete(m, "$id")
@@ -290,4 +318,46 @@ func StripSchemaMeta(raw json.RawMessage) (json.RawMessage, error) {
 	}
 	out, err := json.Marshal(m)
 	return json.RawMessage(out), err
+}
+
+func inlineSchemaRefs(v any, defs map[string]any, depth int) any {
+	if depth > 8 {
+		return map[string]any{"type": "object"}
+	}
+	switch x := v.(type) {
+	case map[string]any:
+		if ref, ok := x["$ref"].(string); ok {
+			for _, prefix := range []string{"#/$defs/", "#/definitions/"} {
+				if strings.HasPrefix(ref, prefix) {
+					if target, exists := defs[strings.TrimPrefix(ref, prefix)]; exists {
+						return inlineSchemaRefs(target, defs, depth+1)
+					}
+				}
+			}
+			// Drop dangling $ref safely rather than leaving broken pointers.
+			out := make(map[string]any, len(x))
+			for k, val := range x {
+				if k != "$ref" {
+					out[k] = inlineSchemaRefs(val, defs, depth+1)
+				}
+			}
+			if _, hasType := out["type"]; !hasType {
+				out["type"] = "object"
+			}
+			return out
+		}
+		out := make(map[string]any, len(x))
+		for k, val := range x {
+			out[k] = inlineSchemaRefs(val, defs, depth+1)
+		}
+		return out
+	case []any:
+		out := make([]any, len(x))
+		for i, item := range x {
+			out[i] = inlineSchemaRefs(item, defs, depth+1)
+		}
+		return out
+	default:
+		return v
+	}
 }

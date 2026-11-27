@@ -176,6 +176,8 @@ func New(configPath string, enableTransport bool) (*App, error) {
 		fb.UpdateConfig(newCfg.Frame)
 		stkEng.UpdateConfig(newCfg.Sticker)
 		sched.SetMediaQuotas(newCfg.Frame.RoomMediaMiB, newCfg.Frame.TotalMediaMiB)
+		sched.UpdateConfig(newCfg.Location(), newCfg.Tools.MaxSchedulesPerChannel, newCfg.Tools.MinCronIntervalMinutes)
+		reg.UpdateDefaultTimeout(time.Duration(newCfg.Tools.DefaultTimeoutSec) * time.Second)
 		roomDisp.UpdateHTTPClient(newCfg.Tools.SSRFAllowHosts)
 		webSearchTool.UpdateAllowHosts(newCfg.Tools.SSRFAllowHosts)
 		readSourceTool.UpdateAllowHosts(newCfg.Tools.SSRFAllowHosts)
@@ -271,8 +273,13 @@ func (a *App) Serve(ctx context.Context) error {
 		a.Logger.Warn("config fsnotify watch disabled", "err", err)
 	}
 
-	// Start scheduler.
-	go a.Sched.Start(ctx)
+	// Start scheduler and track exit so Store.Close() never races active maintenance/distill queries.
+	var schedWG sync.WaitGroup
+	schedWG.Add(1)
+	go func() {
+		defer schedWG.Done()
+		a.Sched.Start(ctx)
+	}()
 
 	// Start embedded HTMX console.
 	if a.Console != nil {
@@ -301,21 +308,29 @@ func (a *App) Serve(ctx context.Context) error {
 	if a.Trans != nil {
 		_ = a.Trans.StopInbound()
 	}
-	// 2. Wait up to 15s concurrently for in-flight LLM turns, bubble deliveries, and pending async sticker tasks.
-	var drainWG sync.WaitGroup
-	drainWG.Add(2)
-	go func() {
-		defer drainWG.Done()
-		a.Rooms.Drain(15 * time.Second)
-	}()
-	go func() {
-		defer drainWG.Done()
-		if a.Stickers != nil {
-			a.Stickers.Drain(15 * time.Second)
+	// 2. Drain Rooms first (up to 12s), then drain any post-ACK async stickers spawned by those turns
+	//    within the remaining 15s total drain budget.
+	drainDeadline := time.Now().Add(15 * time.Second)
+	a.Rooms.Drain(12 * time.Second)
+	if a.Stickers != nil {
+		rem := time.Until(drainDeadline)
+		if rem < 2*time.Second {
+			rem = 2 * time.Second
 		}
+		a.Stickers.Drain(rem)
+	}
+	// 3. Wait for Scheduler goroutines (cancelled via ctx) to exit before closing SQLite pools.
+	schedDone := make(chan struct{})
+	go func() {
+		schedWG.Wait()
+		close(schedDone)
 	}()
-	drainWG.Wait()
-	// 3. Close transport socket, shutdown console, close MCP, flush WAL PASSIVE & close SQLite pools.
+	select {
+	case <-schedDone:
+	case <-time.After(3 * time.Second):
+		a.Logger.Warn("scheduler shutdown wait timed out")
+	}
+	// 4. Close transport socket, shutdown console, close MCP, flush WAL PASSIVE & close SQLite pools.
 	if a.Trans != nil {
 		_ = a.Trans.Stop()
 	}

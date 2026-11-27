@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	robfigcron "github.com/robfig/cron/v3"
@@ -54,6 +55,10 @@ type Scheduler struct {
 	mu            sync.RWMutex
 	roomMediaMiB  int
 	totalMediaMiB int
+
+	distillBusy atomic.Bool
+	digestBusy  atomic.Bool
+	maintBusy   atomic.Bool
 }
 
 // SetMemoryHooks attaches optional in-process incremental memory distillation and channel filtering.
@@ -104,20 +109,62 @@ func (s *Scheduler) SetMediaQuotas(roomMiB, totalMiB int) {
 	s.mu.Unlock()
 }
 
+// UpdateConfig hot-reloads scheduler timezone and schedule quota/interval settings.
+func (s *Scheduler) UpdateConfig(loc *time.Location, maxPerChannel, minIntervalMin int) {
+	s.mu.Lock()
+	if loc != nil {
+		s.loc = loc
+	}
+	if maxPerChannel > 0 {
+		s.maxPerChannel = maxPerChannel
+	}
+	if minIntervalMin > 0 {
+		s.minIntervalMin = minIntervalMin
+	}
+	s.mu.Unlock()
+}
+
+func (s *Scheduler) location() *time.Location {
+	s.mu.RLock()
+	loc := s.loc
+	s.mu.RUnlock()
+	if loc == nil {
+		return time.UTC
+	}
+	return loc
+}
+
 var cronParser = robfigcron.NewParser(robfigcron.Minute | robfigcron.Hour | robfigcron.Dom | robfigcron.Month | robfigcron.Dow)
 
-// ValidateCron validates a standard 5-field cron expression and enforces the minimum interval policy (>=5m).
+// ValidateCron validates a standard 5-field cron expression and enforces the minimum interval policy (>=5m)
+// across multiple upcoming occurrences (closing uneven-schedule bypasses such as "0,1 12 * * *").
 func (s *Scheduler) ValidateCron(expr string) (robfigcron.Schedule, error) {
 	sched, err := cronParser.Parse(strings.TrimSpace(expr))
 	if err != nil {
 		return nil, fmt.Errorf("cron: invalid 5-field expression %q: %w", expr, err)
 	}
-	now := time.Now().In(s.loc)
-	t1 := sched.Next(now)
-	t2 := sched.Next(t1)
+	s.mu.RLock()
 	minGap := time.Duration(s.minIntervalMin) * time.Minute
-	if t2.Sub(t1) < minGap {
-		return nil, fmt.Errorf("cron: interval %v is shorter than minimum allowed %v", t2.Sub(t1), minGap)
+	loc := s.loc
+	s.mu.RUnlock()
+	if loc == nil {
+		loc = time.UTC
+	}
+	now := time.Now().In(loc)
+	prev := sched.Next(now)
+	horizon := now.Add(48 * time.Hour)
+	for i := 0; i < 64; i++ {
+		next := sched.Next(prev)
+		if next.IsZero() {
+			break
+		}
+		if gap := next.Sub(prev); gap < minGap {
+			return nil, fmt.Errorf("cron: interval %v is shorter than minimum allowed %v", gap, minGap)
+		}
+		if next.After(horizon) {
+			break
+		}
+		prev = next
 	}
 	return sched, nil
 }
@@ -171,7 +218,8 @@ func (s *Scheduler) CreateSchedule(ctx context.Context, ch model.ChannelID, crea
 }
 
 // Start runs the background scheduler loop (user schedules, hourly incremental distill,
-// daily digest, WAL & media quota maintenance) until ctx is cancelled.
+// daily digest, WAL & media quota maintenance) until ctx is cancelled, waiting for any active
+// background jobs to finish before returning.
 func (s *Scheduler) Start(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
 	distillTicker := time.NewTicker(1 * time.Hour)
@@ -180,17 +228,41 @@ func (s *Scheduler) Start(ctx context.Context) {
 	defer distillTicker.Stop()
 	defer maintTicker.Stop()
 
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
 			s.tick(ctx, now)
-			s.maybeRunDailyDigests(ctx, now)
+			if s.digestBusy.CompareAndSwap(false, true) {
+				wg.Add(1)
+				go func(ts time.Time) {
+					defer wg.Done()
+					defer s.digestBusy.Store(false)
+					s.maybeRunDailyDigests(ctx, ts)
+				}(now)
+			}
 		case <-distillTicker.C:
-			s.RunIncrementalDistill(ctx)
+			if s.distillBusy.CompareAndSwap(false, true) {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					defer s.distillBusy.Store(false)
+					s.RunIncrementalDistill(ctx)
+				}()
+			}
 		case now := <-maintTicker.C:
-			s.runMaintenance(ctx, now)
+			if s.maintBusy.CompareAndSwap(false, true) {
+				wg.Add(1)
+				go func(ts time.Time) {
+					defer wg.Done()
+					defer s.maintBusy.Store(false)
+					s.runMaintenance(ctx, ts)
+				}(now)
+			}
 		}
 	}
 }
@@ -228,10 +300,11 @@ func (s *Scheduler) RunIncrementalDistill(ctx context.Context) {
 	}
 }
 
-// maybeRunDailyDigests generates yesterday's channel digests once per day after 00:15 local time.
+// maybeRunDailyDigests generates yesterday's channel digests once per day after 00:15 local time,
+// catching up later in the day if the service was offline across 00:15-00:59.
 func (s *Scheduler) maybeRunDailyDigests(ctx context.Context, now time.Time) {
-	local := now.In(s.loc)
-	if local.Hour() != 0 || local.Minute() < 15 {
+	local := now.In(s.location())
+	if local.Hour() == 0 && local.Minute() < 15 {
 		return
 	}
 	yesterday := local.AddDate(0, 0, -1)
@@ -240,7 +313,6 @@ func (s *Scheduler) maybeRunDailyDigests(ctx context.Context, now time.Time) {
 	if done, err := s.store.GetMeta(ctx, metaKey); err == nil && done == "1" {
 		return
 	}
-	_ = s.store.SetMeta(ctx, metaKey, "1")
 
 	chs, err := s.store.ListChannels(ctx)
 	if err != nil {
@@ -258,6 +330,9 @@ func (s *Scheduler) maybeRunDailyDigests(ctx context.Context, now time.Time) {
 			generated++
 		}
 	}
+	if ctx.Err() == nil {
+		_ = s.store.SetMeta(ctx, metaKey, "1")
+	}
 	if generated > 0 {
 		s.log.Info("generated daily digests", "day", dayKey, "channels", generated)
 	}
@@ -269,6 +344,7 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 		s.log.Warn("cron poll failed", "err", err)
 		return
 	}
+	loc := s.location()
 	for _, sc := range due {
 		if sc.Kind == "once" {
 			_ = s.store.UpdateScheduleNextRun(ctx, sc.ID, sc.NextRunAt, false)
@@ -278,10 +354,13 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 				_ = s.store.UpdateScheduleNextRun(ctx, sc.ID, sc.NextRunAt, false)
 				continue
 			}
-			next := sched.Next(now.In(s.loc))
+			next := sched.Next(now.In(loc))
 			_ = s.store.UpdateScheduleNextRun(ctx, sc.ID, next, true)
 		}
 
+		if s.chanFilter != nil && !s.chanFilter.ChannelAllowed(sc.ChannelID) {
+			continue
+		}
 		if s.dispatcher != nil {
 			s.dispatcher.DispatchSystem(model.SystemTriggerEvent{
 				ChannelID:  sc.ChannelID,

@@ -89,6 +89,14 @@ func (cb *CircuitBreaker) Allow() error {
 	return nil
 }
 
+// AbortProbe releases a half-open probe slot without altering breaker state or failure counts.
+// Use when a call fails/cancels before contacting upstream.
+func (cb *CircuitBreaker) AbortProbe() {
+	cb.mu.Lock()
+	cb.probeInFlight = false
+	cb.mu.Unlock()
+}
+
 // Record records the outcome of a call that passed Allow().
 func (cb *CircuitBreaker) Record(err error) {
 	cb.mu.Lock()

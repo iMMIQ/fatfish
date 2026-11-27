@@ -25,6 +25,10 @@ func TestStarlarkOOMBlocked(t *testing.T) {
 		"n = 100000000\nx = range(n)",
 		"n = 100000000\nx = [0]\nx *= n",
 		"x = [0]\nfor i in range(30):\n    x = x + x",
+		"for i in [0] * 100000000:\n    pass",
+		"while len([0] * 100000000):\n    break",
+		"x = ([0] * 10000) * 10000",
+		"a = [0] * 10000\nb = a * 10000",
 	}
 	for _, code := range attacks {
 		_, err := ct.Execute(context.Background(), ToolContext{}, ComputeArgs{Code: code})
@@ -91,5 +95,21 @@ chart.line(
 	}
 	if nonWhiteTitlePixels < 200 {
 		t.Fatalf("Chinese title glyphs did not render properly (non-white title pixels=%d)", nonWhiteTitlePixels)
+	}
+
+	// Non-finite values (NaN/Inf) must fail cleanly rather than hanging Bresenham drawLine.
+	if _, err := ct.Execute(context.Background(), ToolContext{}, ComputeArgs{
+		Code: `chart.line(title="bad", labels=["a","b"], data=[1.0, float("nan")])`,
+	}); err == nil {
+		t.Fatalf("expected error for NaN chart data")
+	}
+	// Chart count per compute call must be capped.
+	if _, err := ct.Execute(context.Background(), ToolContext{}, ComputeArgs{
+		Code: `
+for i in range(6):
+    chart.line(title="t", labels=["a"], data=[1])
+`,
+	}); err == nil {
+		t.Fatalf("expected error when exceeding max charts per compute call")
 	}
 }

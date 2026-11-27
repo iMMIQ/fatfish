@@ -536,15 +536,18 @@ func (t *ReadSourceTool) readGenericOrDoc(ctx context.Context, rawURL string) (s
 	if code >= 400 {
 		return "", fmt.Errorf("HTTP %d", code)
 	}
-	lowURL := strings.ToLower(rawURL)
+	lowPath := strings.ToLower(rawURL)
+	if parsed, perr := url.Parse(rawURL); perr == nil && parsed.Path != "" {
+		lowPath = strings.ToLower(parsed.Path)
+	}
 	lowCT := strings.ToLower(ct)
 
 	switch {
-	case strings.Contains(lowCT, "application/pdf") || strings.HasSuffix(lowURL, ".pdf"):
+	case strings.Contains(lowCT, "application/pdf") || strings.HasSuffix(lowPath, ".pdf"):
 		return extractPDFText(ctx, data)
-	case strings.Contains(lowCT, "spreadsheetml") || strings.HasSuffix(lowURL, ".xlsx"):
+	case strings.Contains(lowCT, "spreadsheetml") || strings.HasSuffix(lowPath, ".xlsx"):
 		return extractXLSXText(data)
-	case strings.Contains(lowCT, "wordprocessingml") || strings.HasSuffix(lowURL, ".docx"):
+	case strings.Contains(lowCT, "wordprocessingml") || strings.HasSuffix(lowPath, ".docx"):
 		return extractDOCXText(data)
 	case strings.Contains(lowCT, "text/html"):
 		doc, err := goquery.NewDocumentFromReader(bytes.NewReader(data))
@@ -595,8 +598,17 @@ func extractPDFPages(ctx context.Context, pdfBytes []byte, firstPage, lastPage i
 	return strings.TrimSpace(string(out)), nil
 }
 
+const (
+	maxDocUnzipBytes  = 32 << 20  // 32 MiB decompressed cap (zip-bomb guard)
+	maxDocXMLBytes    = 16 << 20  // 16 MiB XML cap
+	maxDocOutputBytes = 256 << 10 // 256 KiB extracted text cap
+)
+
 func extractXLSXText(xlsxBytes []byte) (string, error) {
-	f, err := excelize.OpenReader(bytes.NewReader(xlsxBytes))
+	f, err := excelize.OpenReader(bytes.NewReader(xlsxBytes), excelize.Options{
+		UnzipSizeLimit:    maxDocUnzipBytes,
+		UnzipXMLSizeLimit: maxDocXMLBytes,
+	})
 	if err != nil {
 		return "", err
 	}
@@ -609,7 +621,7 @@ func extractXLSXText(xlsxBytes []byte) (string, error) {
 			continue
 		}
 		for i, row := range rows {
-			if i >= 120 {
+			if i >= 120 || b.Len() >= maxDocOutputBytes {
 				b.WriteString("...(truncated rows)\n")
 				break
 			}
@@ -628,12 +640,15 @@ func extractDOCXText(docxBytes []byte) (string, error) {
 		if f.Name != "word/document.xml" {
 			continue
 		}
+		if f.UncompressedSize64 > maxDocXMLBytes {
+			return "", fmt.Errorf("docx: word/document.xml exceeds %d MiB limit", maxDocXMLBytes>>20)
+		}
 		rc, err := f.Open()
 		if err != nil {
 			return "", err
 		}
 		defer rc.Close()
-		dec := xml.NewDecoder(rc)
+		dec := xml.NewDecoder(io.LimitReader(rc, maxDocXMLBytes))
 		var out strings.Builder
 		for {
 			tok, err := dec.Token()
@@ -650,6 +665,10 @@ func extractDOCXText(docxBytes []byte) (string, error) {
 				if x.Name.Local == "p" {
 					out.WriteByte('\n')
 				}
+			}
+			if out.Len() >= maxDocOutputBytes {
+				out.WriteString("\n...(truncated)")
+				break
 			}
 		}
 		return strings.TrimSpace(out.String()), nil

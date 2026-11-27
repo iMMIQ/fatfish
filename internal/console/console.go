@@ -108,7 +108,9 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("POST /api/memory/note/delete", s.auth(http.HandlerFunc(s.handleNoteDelete)))
 	mux.Handle("GET /stickers", s.auth(http.HandlerFunc(s.handleStickersPage)))
 	mux.Handle("GET /api/stickers/search", s.auth(http.HandlerFunc(s.handleStickerSearch)))
+	mux.Handle("GET /api/stickers/image", s.auth(http.HandlerFunc(s.handleStickerImage)))
 	mux.Handle("POST /api/stickers/approve", s.auth(http.HandlerFunc(s.handleStickerApprove)))
+	mux.Handle("POST /api/stickers/reject", s.auth(http.HandlerFunc(s.handleStickerReject)))
 	mux.Handle("GET /logs", s.auth(http.HandlerFunc(s.handleLogsPage)))
 	mux.Handle("GET /api/logs/stream", s.auth(http.HandlerFunc(s.handleLogsStream)))
 
@@ -334,6 +336,10 @@ func (s *Server) handleMemoryPage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleNoteSave(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Store == nil {
+		http.Error(w, "store unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	ch := model.ChannelID(strings.TrimSpace(r.FormValue("channel")))
 	key := strings.TrimSpace(r.FormValue("key"))
 	content := strings.TrimSpace(r.FormValue("content"))
@@ -353,6 +359,10 @@ func (s *Server) handleNoteSave(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleNoteDelete(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Store == nil {
+		http.Error(w, "store unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	ch := model.ChannelID(strings.TrimSpace(r.FormValue("channel")))
 	key := strings.TrimSpace(r.FormValue("key"))
 	_, _ = s.deps.Store.DeleteNote(r.Context(), ch, key)
@@ -379,24 +389,65 @@ func (s *Server) handleStickerSearch(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`<p class="muted">No results.</p>`))
 		return
 	}
-	hits, err := s.deps.Stickers.Search(r.Context(), sticker.SearchOptions{Query: q, TopK: 10})
+	explicit := r.URL.Query().Get("explicit") == "1"
+	hits, err := s.deps.Stickers.Search(r.Context(), sticker.SearchOptions{
+		Query:          q,
+		ExplicitLookup: explicit,
+		TopK:           10,
+	})
 	if err != nil {
 		_, _ = fmt.Fprintf(w, `<span class="badge err">%s</span>`, html.EscapeString(err.Error()))
 		return
 	}
 	var b strings.Builder
-	b.WriteString(`<table><thead><tr><th>ID</th><th>Pack</th><th>Final</th><th>RRF</th><th>Rerank</th><th>Intent / Content</th></tr></thead><tbody>`)
+	b.WriteString(`<table><thead><tr><th>ID</th><th>Pack</th><th>Final</th><th>v_intent</th><th>v_content</th><th>FTS</th><th>RRF</th><th>Rerank</th><th>Decay</th><th>Intent / Content</th></tr></thead><tbody>`)
 	for _, h := range hits {
-		fmt.Fprintf(&b, `<tr><td>%s</td><td>%s</td><td>%.3f</td><td>%.3f</td><td>%.3f</td><td>%s | %s</td></tr>`,
+		fmt.Fprintf(&b, `<tr><td>%s</td><td>%s</td><td>%.3f</td><td>%.3f</td><td>%.3f</td><td>%.1f</td><td>%.3f</td><td>%.3f</td><td>%.2f</td><td>%s | %s</td></tr>`,
 			html.EscapeString(h.Sticker.StickerID), html.EscapeString(h.Sticker.PackID),
-			h.FinalScore, h.RRFScore, h.RerankScore,
+			h.FinalScore, h.IntentScore, h.ContentScore, h.FTSScore, h.RRFScore, h.RerankScore, h.DecayFactor,
 			html.EscapeString(h.Sticker.IntentText), html.EscapeString(h.Sticker.ContentText))
 	}
 	b.WriteString(`</tbody></table>`)
 	_, _ = w.Write([]byte(b.String()))
 }
 
+func (s *Server) handleStickerImage(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Store == nil || s.deps.Stickers == nil {
+		http.NotFound(w, r)
+		return
+	}
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	for _, status := range []string{"needs_review", "ready"} {
+		rows, err := s.deps.Store.ListStickers(r.Context(), status)
+		if err != nil {
+			continue
+		}
+		for _, row := range rows {
+			if row.Sticker.StickerID == id {
+				raw, rerr := s.deps.Stickers.ReadStickerFile(row.Sticker)
+				if rerr != nil {
+					http.NotFound(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", sticker.MimeTypeFor(row.Sticker))
+				w.Header().Set("Cache-Control", "private, max-age=300")
+				_, _ = w.Write(raw)
+				return
+			}
+		}
+	}
+	http.NotFound(w, r)
+}
+
 func (s *Server) handleStickerApprove(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Store == nil {
+		http.Error(w, "store unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	id := strings.TrimSpace(r.FormValue("id"))
 	ocr := strings.TrimSpace(r.FormValue("ocr"))
 	intent := strings.TrimSpace(r.FormValue("intent"))
@@ -411,6 +462,20 @@ func (s *Server) handleStickerApprove(w http.ResponseWriter, r *http.Request) {
 		_ = s.deps.Stickers.ReindexOne(r.Context(), id)
 	}
 	_, _ = w.Write([]byte(`<span class="badge ok">Approved & Indexed</span>`))
+}
+
+func (s *Server) handleStickerReject(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Store == nil {
+		http.Error(w, "store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	id := strings.TrimSpace(r.FormValue("id"))
+	if err := s.deps.Store.UpdateStickerStatus(r.Context(), id, "disabled", "", "", ""); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(html.EscapeString(err.Error())))
+		return
+	}
+	_, _ = w.Write([]byte(`<span class="muted">Rejected</span>`))
 }
 
 func (s *Server) handleLogsPage(w http.ResponseWriter, _ *http.Request) {

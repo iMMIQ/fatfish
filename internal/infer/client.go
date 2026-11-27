@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"strings"
@@ -218,10 +219,12 @@ func (h *Hub) Chat(ctx context.Context, role string, req ChatRequest) (*ChatResp
 		if _, _, fbErr := h.endpoint("primary_fallback"); fbErr == nil {
 			fbReq := req
 			fbReq.Model = "" // Use primary_fallback's configured model ID
-			if fbResp, err2 := h.chatOnce(ctx, "primary_fallback", fbReq); err2 == nil {
+			fbResp, err2 := h.chatOnce(ctx, "primary_fallback", fbReq)
+			if err2 == nil {
 				fbResp.FallbackUsed = true
 				return fbResp, nil
 			}
+			return nil, fmt.Errorf("primary failed (%v); fallback failed: %w", err, err2)
 		}
 	}
 	return resp, err
@@ -232,19 +235,18 @@ func (h *Hub) chatOnce(ctx context.Context, role string, req ChatRequest) (*Chat
 	if err != nil {
 		return nil, err
 	}
-	if err := cb.Allow(); err != nil {
-		return nil, err
-	}
 
-	// Enforce heavy local GPU semaphore on distill role to prevent VRAM thrashing.
+	// Enforce heavy local GPU semaphore on distill role before acquiring a breaker probe slot.
 	if role == "distill" {
 		select {
 		case h.heavySem <- struct{}{}:
 			defer func() { <-h.heavySem }()
 		case <-ctx.Done():
-			cb.Record(nil) // Context cancellation before call is not an upstream fault.
 			return nil, ctx.Err()
 		}
+	}
+	if err := cb.Allow(); err != nil {
+		return nil, err
 	}
 
 	if req.Model == "" {
@@ -258,7 +260,7 @@ func (h *Hub) chatOnce(ctx context.Context, role string, req ChatRequest) (*Chat
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
-		cb.Record(nil)
+		cb.AbortProbe()
 		return nil, err
 	}
 
@@ -273,7 +275,7 @@ func (h *Hub) chatOnce(ctx context.Context, role string, req ChatRequest) (*Chat
 	start := time.Now()
 	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		cb.Record(err)
+		cb.AbortProbe()
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -283,7 +285,11 @@ func (h *Hub) chatOnce(ctx context.Context, role string, req ChatRequest) (*Chat
 
 	resp, err := h.client.Do(httpReq)
 	if err != nil {
-		cb.Record(err)
+		if errors.Is(ctx.Err(), context.Canceled) {
+			cb.AbortProbe()
+		} else {
+			cb.Record(err)
+		}
 		return nil, fmt.Errorf("infer: chat %s: %w", role, err)
 	}
 	defer resp.Body.Close()
@@ -432,10 +438,19 @@ func (h *Hub) embedChunk(ctx context.Context, ep config.ModelEndpointConfig, cb 
 		return nil, err
 	}
 	out := make([][]float32, len(texts))
+	filled := 0
 	for _, d := range parsed.Data {
-		if d.Index >= 0 && d.Index < len(out) {
+		if d.Index >= 0 && d.Index < len(out) && len(d.Embedding) > 0 {
+			if out[d.Index] == nil {
+				filled++
+			}
 			out[d.Index] = d.Embedding
 		}
+	}
+	if filled != len(texts) {
+		err := fmt.Errorf("infer: embed returned %d/%d embeddings", filled, len(texts))
+		cb.Record(err)
+		return nil, err
 	}
 	cb.Record(nil)
 	return out, nil
@@ -524,12 +539,21 @@ func (h *Hub) rerankChunk(ctx context.Context, ep config.ModelEndpointConfig, cb
 		return nil, err
 	}
 	out := make([]RerankResult, 0, len(parsed.Results))
+	needsSigmoid := false
 	for _, r := range parsed.Results {
 		sc := r.RelevanceScore
 		if sc == 0 && r.Score != 0 {
 			sc = r.Score
 		}
+		if sc < 0 || sc > 1 {
+			needsSigmoid = true
+		}
 		out = append(out, RerankResult{Index: offset + r.Index, Score: sc})
+	}
+	if needsSigmoid {
+		for i := range out {
+			out[i].Score = 1.0 / (1.0 + math.Exp(-out[i].Score))
+		}
 	}
 	cb.Record(nil)
 	return out, nil
@@ -555,16 +579,16 @@ func (h *Hub) Transcribe(ctx context.Context, filename string, audioBytes []byte
 	}
 	fw, err := mw.CreateFormFile("file", filename)
 	if err != nil {
-		cb.Record(nil)
+		cb.AbortProbe()
 		return "", err
 	}
 	if _, err := fw.Write(audioBytes); err != nil {
-		cb.Record(nil)
+		cb.AbortProbe()
 		return "", err
 	}
 	_ = mw.WriteField("model", ep.Model)
 	if err := mw.Close(); err != nil {
-		cb.Record(nil)
+		cb.AbortProbe()
 		return "", err
 	}
 
@@ -615,7 +639,8 @@ func (h *Hub) Transcribe(ctx context.Context, filename string, audioBytes []byte
 	return strings.TrimSpace(parsed.Text), nil
 }
 
-// Translate translates text into targetLang using the optional local translate model (internal helper).
+// Translate translates text into targetLang using the optional local translate model (internal helper),
+// falling back to the primary LLM when translate is disabled, fails, or its circuit is open (SPEC §7).
 func (h *Hub) Translate(ctx context.Context, text, targetLang string) (string, error) {
 	if strings.TrimSpace(text) == "" {
 		return "", nil
@@ -623,16 +648,18 @@ func (h *Hub) Translate(ctx context.Context, text, targetLang string) (string, e
 	if targetLang == "" {
 		targetLang = "Simplified Chinese"
 	}
-	role := "translate"
-	if _, _, err := h.endpoint("translate"); err != nil {
-		role = "fast"
-	}
-	resp, err := h.Chat(ctx, role, ChatRequest{
+	req := ChatRequest{
 		Messages: []ChatMessage{
 			{Role: "system", Content: "Translate the following content accurately into " + targetLang + ". Output only the translation."},
 			{Role: "user", Content: text},
 		},
-	})
+	}
+	if _, _, err := h.endpoint("translate"); err == nil {
+		if resp, err := h.Chat(ctx, "translate", req); err == nil {
+			return strings.TrimSpace(resp.Content), nil
+		}
+	}
+	resp, err := h.Chat(ctx, "primary", req)
 	if err != nil {
 		return "", err
 	}
