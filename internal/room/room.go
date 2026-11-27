@@ -2,12 +2,16 @@ package room
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,6 +43,7 @@ type Manager struct {
 	stickers *sticker.Engine
 	registry *tool.Registry
 	tr       transport.Transport
+	httpMu   sync.RWMutex
 	httpCli  *http.Client
 	log      *slog.Logger
 
@@ -85,6 +90,21 @@ func NewManager(deps Dependencies) *Manager {
 		log:      deps.Logger,
 		rooms:    make(map[model.ChannelID]*Room),
 	}
+}
+
+// UpdateHTTPClient hot-reloads the SSRF-safe HTTP client when ssrf_allow_hosts changes.
+func (m *Manager) UpdateHTTPClient(allowHosts []string) {
+	cli := netutil.NewSafeHTTPClient(netutil.SafeClientOptions{Timeout: 10 * time.Second, AllowHosts: allowHosts})
+	m.httpMu.Lock()
+	m.httpCli = cli
+	m.httpMu.Unlock()
+}
+
+func (m *Manager) httpClient() *http.Client {
+	m.httpMu.RLock()
+	cli := m.httpCli
+	m.httpMu.RUnlock()
+	return cli
 }
 
 // Dispatch routes an inbound message into the target channel's mailbox without blocking the WS reader.
@@ -201,9 +221,31 @@ type Room struct {
 	plusOnePhrase string
 	plusOneUsers  map[string]struct{}
 
+	// Burst user tracking (rolling 30s window for PolicyEnv.BurstUsers)
+	recentSenders []senderStamp
+
 	// Stale tracking
 	msgCount uint64
 }
+
+type senderStamp struct {
+	userID string
+	at     time.Time
+}
+
+type perceptionResult struct {
+	parts   []model.Part
+	changed bool
+	imageKB int
+}
+
+type plusOneAction int
+
+const (
+	plusOneNone plusOneAction = iota
+	plusOneEcho
+	plusOneBreak
+)
 
 type triggerState struct {
 	msg        model.Message
@@ -241,7 +283,7 @@ func (r *Room) run() {
 
 	armDebounce := func(d time.Duration) {
 		if d <= 0 {
-			d = 50 * time.Millisecond
+			d = 10 * time.Millisecond
 		}
 		if debounceTimer == nil {
 			debounceTimer = time.NewTimer(d)
@@ -267,8 +309,8 @@ func (r *Room) run() {
 
 		case ev := <-r.mailbox:
 			if ev.Message != nil {
-				wait := r.onMessage(ev.Message)
-				if r.pendingTrigger != nil {
+				wait, arm := r.onMessage(ev.Message)
+				if arm && r.pendingTrigger != nil {
 					armDebounce(wait)
 				}
 			} else if ev.System != nil {
@@ -319,30 +361,22 @@ func (r *Room) onAdminCommand(cmd model.AdminCommand) {
 	}
 }
 
-func (r *Room) onMessage(msg *model.Message) time.Duration {
+func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 	ctx := context.Background()
 	cfg := r.mgr.cfgMgr.Get()
 	r.msgCount++
 
-	// Resolve RepliedToBot from local L0 timeline if message quotes a previous bot message.
-	if msg.ReplyToMsgID != "" && !msg.RepliedToBot {
-		if prev, err := r.mgr.store.GetMessageByPlatformID(ctx, r.ch, msg.ReplyToMsgID); err == nil && prev != nil {
-			if prev.FromBot {
-				msg.RepliedToBot = true
-			}
-			for i := range msg.Parts {
-				if msg.Parts[i].Kind == model.PartQuote && msg.Parts[i].Text == "" {
-					msg.Parts[i].Text = fmt.Sprintf("%s: %s", prev.SenderName, prev.PlainText())
-				}
-			}
-		}
+	// Resolve RepliedToBot and bounded quote chain (depth <= 3) via local L0 + transport.GetMessage fallback.
+	if msg.ReplyToMsgID != "" {
+		r.resolveQuoteChain(ctx, msg, 3)
 	}
 
-	// Update immutable member identity & alias ledger.
+	// Update immutable member identity & alias ledger (preserving platform role).
 	_ = r.mgr.store.UpsertMember(ctx, model.Member{
 		ChannelID:   r.ch,
 		MemberID:    msg.SenderID,
 		DisplayName: msg.SenderName,
+		Role:        msg.SenderRole,
 		UpdatedAt:   msg.CreatedAt,
 	})
 
@@ -351,8 +385,13 @@ func (r *Room) onMessage(msg *model.Message) time.Duration {
 
 	// Ignore our own outbound echoes and configured ignored bots for trigger logic.
 	if msg.FromBot || r.mgr.policy.IsIgnoredBot(msg.SenderID) {
-		return 0
+		return 0, false
 	}
+
+	// Track distinct senders in a rolling 30s window for PolicyEnv.BurstUsers.
+	now := time.Now()
+	r.recentSenders = append(r.recentSenders, senderStamp{userID: msg.SenderID, at: now})
+	burstUsers := r.countBurstUsers(now, 30*time.Second)
 
 	// Built-in slash commands: /reset, /tr
 	plain := strings.TrimSpace(msg.PlainText())
@@ -362,7 +401,7 @@ func (r *Room) onMessage(msg *model.Message) time.Duration {
 		if r.mgr.tr != nil {
 			_, _ = r.mgr.tr.SendText(ctx, r.ch, <-replyCh, transport.SendOptions{})
 		}
-		return 0
+		return 0, false
 	}
 	if strings.HasPrefix(plain, "/tr ") {
 		arg := strings.TrimSpace(strings.TrimPrefix(plain, "/tr "))
@@ -372,50 +411,83 @@ func (r *Room) onMessage(msg *model.Message) time.Duration {
 				_, _ = r.mgr.tr.SendText(context.Background(), r.ch, out, transport.SendOptions{ReplyToMsgID: msg.PlatformMsgID})
 			}
 		}()
-		return 0
+		return 0, false
 	}
 
-	// Launch bounded async perception tasks (image canonicalization + voice ASR).
-	hasMedia, hasAudio := false, false
+	// Launch bounded async perception tasks (image canonicalization + voice ASR + forward nodes)
+	// on a DEEP COPY of msg so the Room Actor goroutine never races with background perception!
+	hasMedia, hasAudio, hasForward := false, false, false
 	for _, p := range msg.Parts {
-		if p.Kind == model.PartImage {
+		switch p.Kind {
+		case model.PartImage:
 			hasMedia = true
-		}
-		if p.Kind == model.PartAudio {
+		case model.PartAudio:
 			hasAudio = true
+		case model.PartForward:
+			hasForward = true
 		}
 	}
-	var perceptionDone chan struct{}
-	if hasMedia || hasAudio {
-		perceptionDone = make(chan struct{})
+	var perceptionCh chan perceptionResult
+	if hasMedia || hasAudio || hasForward {
+		perceptionCh = make(chan perceptionResult, 1)
+		msgCopy := *msg
+		msgCopy.Parts = append([]model.Part(nil), msg.Parts...)
 		go func() {
-			defer close(perceptionDone)
-			r.runPerception(msg, cfg)
+			res := r.runPerception(&msgCopy, cfg)
+			perceptionCh <- res
 		}()
 	}
 
 	// Check mute backoff before deciding whether to respond.
-	if time.Now().Before(r.muteUntil) {
-		r.pendingMsgs = append(r.pendingMsgs, *msg)
-		return 0
+	if now.Before(r.muteUntil) {
+		r.pendingMsgs = append(r.pendingMsgs, cloneMessage(*msg))
+		return 0, false
 	}
 
-	// Zero-latency +1 repeater (group only, short identical text by >= min_users distinct users).
-	if r.ch.IsGroup() && cfg.Policy.PlusOne.Enabled && !msg.MentionedBot && !msg.RepliedToBot && !msg.PokedBot {
-		if r.tryPlusOne(ctx, msg, cfg) {
-			r.pendingMsgs = append(r.pendingMsgs, *msg)
-			return 0
+	// Poke mode filtering & optional reverse poke (SPEC §5.3 / PokeConfig).
+	isPokeOnly := len(msg.Parts) == 1 && msg.Parts[0].Kind == model.PartPoke
+	pokedForPolicy := msg.PokedBot
+	if isPokeOnly {
+		switch strings.ToLower(strings.TrimSpace(cfg.Policy.Poke.Mode)) {
+		case "ignore":
+			pokedForPolicy = false
+		case "all":
+			pokedForPolicy = true
+		default: // "bot_only"
+			pokedForPolicy = msg.PokedBot
+		}
+		if pokedForPolicy && cfg.Policy.Poke.ReverseProb > 0 && rand.Float64() < cfg.Policy.Poke.ReverseProb && r.mgr.tr != nil {
+			go func(target string) {
+				pctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				_ = r.mgr.tr.SendPoke(pctx, r.ch, target)
+			}(msg.SenderID)
 		}
 	}
 
-	// Evaluate policy rules.
-	nowLocal := time.Now().In(cfg.Location())
+	// Zero-latency +1 repeater & playful chain break (group only, >= min_users distinct users).
+	plusOneBreakTriggered := false
+	if r.ch.IsGroup() && cfg.Policy.PlusOne.Enabled && !msg.MentionedBot && !msg.RepliedToBot && !pokedForPolicy {
+		switch r.tryPlusOne(ctx, msg, cfg) {
+		case plusOneEcho:
+			r.pendingMsgs = append(r.pendingMsgs, cloneMessage(*msg))
+			return 0, false
+		case plusOneBreak:
+			plusOneBreakTriggered = true
+		}
+	}
+
+	// Evaluate policy rules using per-channel overrides for cooldown & thread_max_turns.
+	nowLocal := now.In(cfg.Location())
 	hour := nowLocal.Hour()
 	isNight := hour < 7 || hour >= 23
+	threadMax := r.mgr.policy.ThreadMaxTurns(r.ch)
 	inThread := r.threadUserID == msg.SenderID &&
+		r.threadTurns < threadMax &&
 		time.Since(r.threadLastAt) <= time.Duration(cfg.Policy.ThreadContinuationSec)*time.Second &&
 		time.Since(r.threadLastAt) >= time.Duration(cfg.Policy.ThreadMinIntervalSec*float64(time.Second))
-	cooldownOK := time.Since(r.lastProactive) >= time.Duration(cfg.Policy.ProactiveCooldownSec)*time.Second
+	cooldownSec := r.mgr.policy.ProactiveCooldownSec(r.ch)
+	cooldownOK := time.Since(r.lastProactive) >= time.Duration(cooldownSec)*time.Second
 
 	env := policy.PolicyEnv{
 		IsGroup:      r.ch.IsGroup(),
@@ -423,26 +495,27 @@ func (r *Room) onMessage(msg *model.Message) time.Duration {
 		IsAdmin:      cfg.IsAdmin(msg.SenderID),
 		Mentioned:    msg.MentionedBot,
 		RepliedToBot: msg.RepliedToBot,
-		Poked:        msg.PokedBot,
+		Poked:        pokedForPolicy,
 		HitNickname:  r.mgr.policy.HitNickname(plain),
 		InThread:     inThread,
 		ThreadTurns:  r.threadTurns,
 		CooldownOK:   cooldownOK,
 		IsNight:      isNight,
 		Hour:         hour,
+		BurstUsers:   burstUsers,
 		TextLen:      len([]rune(plain)),
 		Rand:         rand.Float64(),
 	}
 
-	shouldReply := !r.ch.IsGroup() // Always reply in DMs
-	if r.ch.IsGroup() {
+	shouldReply := !r.ch.IsGroup() || plusOneBreakTriggered // Always reply in DMs or +1 chain break
+	if r.ch.IsGroup() && !plusOneBreakTriggered {
 		if ok, err := r.mgr.policy.EvalReplyGate(r.ch, env); err == nil {
 			shouldReply = ok
 		}
 	}
 
 	// Wait bounded for perception if this message triggers or joins an active turn.
-	if perceptionDone != nil && (shouldReply || r.pendingTrigger != nil) {
+	if perceptionCh != nil && (shouldReply || r.pendingTrigger != nil) {
 		waitDur := time.Duration(cfg.Policy.MediaWaitSec * float64(time.Second))
 		if hasAudio {
 			waitDur = time.Duration(cfg.Policy.ASRWaitSec * float64(time.Second))
@@ -451,19 +524,28 @@ func (r *Room) onMessage(msg *model.Message) time.Duration {
 			waitDur = 3 * time.Second
 		}
 		select {
-		case <-perceptionDone:
+		case res := <-perceptionCh:
+			if res.changed {
+				msg.Parts = res.parts
+				plain = strings.TrimSpace(msg.PlainText())
+			}
 		case <-time.After(waitDur):
-			// Proceed with placeholder; background perception will patch L0+FTS5 on completion.
+			// Proceed with placeholder; background perception patches L0+FTS5 safely on its own copy.
 		}
 	}
 
-	r.pendingMsgs = append(r.pendingMsgs, *msg)
+	r.pendingMsgs = append(r.pendingMsgs, cloneMessage(*msg))
 	if len(r.pendingMsgs) > 60 {
 		r.pendingMsgs = r.pendingMsgs[len(r.pendingMsgs)-60:]
 	}
 
 	if !shouldReply {
-		return 0
+		// Same-sender burst follow-up coalesces into an active pending trigger (e.g. pure @bot followed by text).
+		if r.pendingTrigger != nil && r.pendingTrigger.msg.SenderID == msg.SenderID {
+			return time.Duration(cfg.Policy.InputDebounceSec * float64(time.Second)), true
+		}
+		// Unrelated user message must NEVER disturb or shorten an active debounce timer.
+		return 0, false
 	}
 
 	trigKind := "proactive"
@@ -472,13 +554,16 @@ func (r *Room) onMessage(msg *model.Message) time.Duration {
 	case !r.ch.IsGroup():
 		trigKind = "dm"
 		proactive = false
+	case plusOneBreakTriggered:
+		trigKind = "plus_one_break"
+		proactive = false
 	case msg.MentionedBot:
 		trigKind = "mention"
 		proactive = false
 	case msg.RepliedToBot:
 		trigKind = "reply"
 		proactive = false
-	case msg.PokedBot:
+	case pokedForPolicy:
 		trigKind = "poke"
 		proactive = false
 	case inThread:
@@ -487,7 +572,7 @@ func (r *Room) onMessage(msg *model.Message) time.Duration {
 	}
 
 	r.pendingTrigger = &triggerState{
-		msg:        *msg,
+		msg:        cloneMessage(*msg),
 		kind:       trigKind,
 		proactive:  proactive,
 		enqueuedAt: time.Now(),
@@ -496,31 +581,113 @@ func (r *Room) onMessage(msg *model.Message) time.Duration {
 
 	// Pure @mention with no text waits mention_wait_sec for follow-up message from same sender.
 	if msg.MentionedBot && plain == "" {
-		return time.Duration(cfg.Policy.MentionWaitSec * float64(time.Second))
+		return time.Duration(cfg.Policy.MentionWaitSec * float64(time.Second)), true
 	}
-	if !proactive {
-		return time.Duration(cfg.Policy.InputDebounceSec * float64(time.Second))
+	// Explicit @mention (with content) / reply / poke / +1 break wakes immediately (SPEC §5.3).
+	if msg.MentionedBot || msg.RepliedToBot || pokedForPolicy || plusOneBreakTriggered {
+		return 0, true
 	}
-	return time.Duration(cfg.Policy.InputDebounceSec * float64(time.Second))
+	// DMs, thread continuations, and proactive triggers debounce over input_debounce_sec.
+	return time.Duration(cfg.Policy.InputDebounceSec * float64(time.Second)), true
 }
 
-func (r *Room) runPerception(msg *model.Message, cfg *config.Config) {
+func (r *Room) resolveQuoteChain(ctx context.Context, msg *model.Message, maxDepth int) {
+	if maxDepth <= 0 {
+		maxDepth = 3
+	}
+	curID := msg.ReplyToMsgID
+	var chain []string
+	for depth := 0; depth < maxDepth && curID != ""; depth++ {
+		prev, err := r.mgr.store.GetMessageByPlatformID(ctx, r.ch, curID)
+		if (err != nil || prev == nil) && r.mgr.tr != nil {
+			gctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			prev, err = r.mgr.tr.GetMessage(gctx, r.ch, curID)
+			cancel()
+		}
+		if err != nil || prev == nil {
+			break
+		}
+		if depth == 0 && prev.FromBot {
+			msg.RepliedToBot = true
+		}
+		txt := strings.TrimSpace(prev.PlainText())
+		if txt != "" {
+			chain = append(chain, fmt.Sprintf("%s: %s", prev.SenderName, txt))
+		}
+		if prev.ReplyToMsgID == "" || prev.ReplyToMsgID == curID {
+			break
+		}
+		curID = prev.ReplyToMsgID
+	}
+	if len(chain) > 0 {
+		joined := strings.Join(chain, " <- ")
+		for i := range msg.Parts {
+			if msg.Parts[i].Kind == model.PartQuote && msg.Parts[i].Text == "" {
+				msg.Parts[i].Text = joined
+			}
+		}
+	}
+}
+
+func (r *Room) countBurstUsers(now time.Time, window time.Duration) int {
+	cutoff := now.Add(-window)
+	kept := r.recentSenders[:0]
+	seen := make(map[string]struct{})
+	for _, s := range r.recentSenders {
+		if s.at.After(cutoff) {
+			kept = append(kept, s)
+			seen[s.userID] = struct{}{}
+		}
+	}
+	r.recentSenders = kept
+	return len(seen)
+}
+
+func cloneMessage(m model.Message) model.Message {
+	cp := m
+	if len(m.Parts) > 0 {
+		cp.Parts = make([]model.Part, len(m.Parts))
+		copy(cp.Parts, m.Parts)
+	}
+	return cp
+}
+
+func (r *Room) runPerception(msg *model.Message, cfg *config.Config) perceptionResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
 	changed := false
+	maxImageKB := 0
 	retention := time.Duration(cfg.Frame.MediaRetentionHours) * time.Hour
 
 	for i := range msg.Parts {
 		p := &msg.Parts[i]
 		switch p.Kind {
 		case model.PartImage:
-			if p.SHA256 != "" || p.URL == "" {
+			if p.SHA256 != "" {
 				continue
 			}
-			raw, _, code, err := netutil.FetchLimited(ctx, r.mgr.httpCli, p.URL, int64(cfg.Frame.MaxImageMiB)<<20, nil)
-			if err != nil || code >= 400 {
+			var raw []byte
+			var err error
+			if strings.HasPrefix(p.URL, "http://") || strings.HasPrefix(p.URL, "https://") {
+				var code int
+				raw, _, code, err = netutil.FetchLimited(ctx, r.mgr.httpClient(), p.URL, int64(cfg.Frame.MaxImageMiB)<<20, nil)
+				if err != nil || code >= 400 {
+					raw = nil
+				}
+			}
+			// Fallback to NapCat local file path when configured locally.
+			if len(raw) == 0 && p.FileID != "" && filepath.IsAbs(p.FileID) {
+				if data, rerr := os.ReadFile(p.FileID); rerr == nil && int64(len(data)) <= int64(cfg.Frame.MaxImageMiB)<<20 {
+					raw = data
+				}
+			}
+			if len(raw) == 0 {
 				continue
+			}
+			kb := len(raw) / 1024
+			if kb > maxImageKB {
+				maxImageKB = kb
 			}
 			blob, err := r.mgr.store.Blobs().PutImage(raw)
 			if err != nil {
@@ -536,6 +703,17 @@ func (r *Room) runPerception(msg *model.Message, cfg *config.Config) {
 			p.Width = asset.Width
 			p.Height = asset.Height
 			changed = true
+
+			// Optional auto-collect candidate sticker when enabled and policy expr passes (SPEC §5.2).
+			if cfg.Sticker.AutoCollect && r.mgr.policy != nil {
+				if ok, perr := r.mgr.policy.EvalAutoCollectSticker(r.ch, policy.PolicyEnv{
+					IsGroup: r.ch.IsGroup(),
+					FromBot: msg.FromBot,
+					ImageKB: kb,
+				}); perr == nil && ok {
+					r.autoCollectSticker(ctx, cfg, raw, blob.Ext)
+				}
+			}
 
 		case model.PartAudio:
 			if p.Transcript != "" || p.FileID == "" || r.mgr.tr == nil {
@@ -556,32 +734,75 @@ func (r *Room) runPerception(msg *model.Message, cfg *config.Config) {
 			p.Transcript = text
 			p.ASRStatus = "ok"
 			changed = true
+
+		case model.PartForward:
+			if len(p.Nodes) > 0 || p.FileID == "" || r.mgr.tr == nil {
+				continue
+			}
+			if nodes, ferr := r.mgr.tr.GetForward(ctx, p.FileID, 20); ferr == nil && len(nodes) > 0 {
+				p.Nodes = nodes
+				changed = true
+			}
 		}
 	}
 
 	if changed {
 		_ = r.mgr.store.PatchMessageParts(ctx, msg)
 	}
+	partsOut := append([]model.Part(nil), msg.Parts...)
+	return perceptionResult{parts: partsOut, changed: changed, imageKB: maxImageKB}
 }
 
-func (r *Room) tryPlusOne(ctx context.Context, msg *model.Message, cfg *config.Config) bool {
+func (r *Room) autoCollectSticker(ctx context.Context, cfg *config.Config, raw []byte, fallbackExt string) {
+	sum := sha256.Sum256(raw)
+	hash := hex.EncodeToString(sum[:])
+	pack := cfg.Sticker.DefaultPack
+	if pack == "" {
+		pack = "default"
+	}
+	ext := fallbackExt
+	if len(raw) >= 4 && string(raw[:4]) == "GIF8" {
+		ext = ".gif"
+	} else if ext == "" {
+		ext = ".png"
+	}
+	targetDir := filepath.Join(cfg.Sticker.PackDir, pack)
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		return
+	}
+	name := hash[:16] + ext
+	dst := filepath.Join(targetDir, name)
+	if _, err := os.Stat(dst); os.IsNotExist(err) {
+		_ = os.WriteFile(dst, raw, 0o644)
+	}
+	_ = r.mgr.store.UpsertSticker(ctx, model.Sticker{
+		StickerID: "stk_" + hash[:12],
+		PackID:    pack,
+		SHA256:    hash,
+		RelPath:   filepath.Join(pack, name),
+		Status:    "needs_review",
+		CreatedAt: time.Now(),
+	}, nil, nil)
+}
+
+func (r *Room) tryPlusOne(ctx context.Context, msg *model.Message, cfg *config.Config) plusOneAction {
 	txt := strings.TrimSpace(msg.PlainText())
 	if txt == "" || len([]rune(txt)) > 24 || strings.Contains(txt, "\n") {
 		r.plusOnePhrase = ""
 		r.plusOneUsers = make(map[string]struct{})
-		return false
+		return plusOneNone
 	}
 	if txt != r.plusOnePhrase {
 		r.plusOnePhrase = txt
 		r.plusOneUsers = map[string]struct{}{msg.SenderID: {}}
-		return false
+		return plusOneNone
 	}
 	r.plusOneUsers[msg.SenderID] = struct{}{}
 	if len(r.plusOneUsers) < cfg.Policy.PlusOne.MinUsers {
-		return false
+		return plusOneNone
 	}
 	if time.Since(r.lastPlusOne) < time.Duration(cfg.Policy.PlusOne.CooldownSec)*time.Second {
-		return false
+		return plusOneNone
 	}
 	roll := rand.Float64()
 	if roll < cfg.Policy.PlusOne.RepeatProb {
@@ -589,11 +810,27 @@ func (r *Room) tryPlusOne(ctx context.Context, msg *model.Message, cfg *config.C
 		r.plusOnePhrase = ""
 		r.plusOneUsers = make(map[string]struct{})
 		if r.mgr.tr != nil {
-			_, _ = r.mgr.tr.SendText(ctx, r.ch, txt, transport.SendOptions{})
+			if pid, err := r.mgr.tr.SendText(ctx, r.ch, txt, transport.SendOptions{}); err == nil {
+				_ = r.mgr.store.AppendMessage(ctx, &model.Message{
+					ChannelID:     r.ch,
+					PlatformMsgID: pid,
+					SenderID:      r.mgr.tr.SelfID(),
+					SenderName:    "fatfish",
+					FromBot:       true,
+					Parts:         []model.Part{{Kind: model.PartText, Text: txt}},
+					CreatedAt:     time.Now(),
+				})
+			}
 		}
-		return true
+		return plusOneEcho
 	}
-	return false
+	if cfg.Policy.PlusOne.BreakProb > 0 && roll < cfg.Policy.PlusOne.RepeatProb+cfg.Policy.PlusOne.BreakProb {
+		r.lastPlusOne = time.Now()
+		r.plusOnePhrase = ""
+		r.plusOneUsers = make(map[string]struct{})
+		return plusOneBreak
+	}
+	return plusOneNone
 }
 
 func (r *Room) onSystemTrigger(ev model.SystemTriggerEvent) {
@@ -626,7 +863,7 @@ func (r *Room) executeTurn(trig triggerState) {
 
 	// Proactive fast-model JSON Gate (reply | react:<emoji> | ignore).
 	if trig.proactive && r.mgr.hub != nil {
-		decision := r.runProactiveGate(ctx, trig)
+		decision := r.runProactiveGate(ctx, trig, cfg)
 		if decision == "ignore" {
 			return
 		}
@@ -689,7 +926,13 @@ func (r *Room) executeTurn(trig triggerState) {
 		}
 	}
 
-	userPayload := frame.FormatUserTurn(batch, cfg.Location(), newMemberDelta)
+	userPayload := frame.FormatUserTurnWithLimits(
+		batch, cfg.Location(), newMemberDelta, trig.msg.PlatformMsgID,
+		cfg.Frame.MaxBackgroundImages, cfg.Frame.MaxImagesPerRequest,
+	)
+	if trig.kind == "plus_one_break" {
+		userPayload.Text += "\n[Hint: Multiple members repeated the same phrase; playfully break the chain in one brief casual line.]"
+	}
 	out, err := r.mgr.runner.Run(ctx, agent.TurnInput{
 		ChannelID:    r.ch,
 		Epoch:        startEpoch,
@@ -715,19 +958,29 @@ func (r *Room) executeTurn(trig triggerState) {
 	// Build TurnPlan with natural output formatting.
 	bubbles := FormatBubbles(out.Text, cfg.Policy)
 	replyTo, mentionUser := SmartReplyDecoration(trig, int(r.msgCount-trig.enqMsgCnt), cfg.Policy)
+	pokeAfter := false
+	if cfg.Policy.Poke.Mode != "ignore" &&
+		cfg.Policy.Poke.AfterReplyProb > 0 &&
+		trig.msg.SenderID != "" && trig.msg.SenderID != "system" &&
+		len([]rune(out.Text)) > 0 &&
+		(cfg.Policy.Poke.AfterReplyMaxChars <= 0 || len([]rune(out.Text)) <= cfg.Policy.Poke.AfterReplyMaxChars) &&
+		rand.Float64() < cfg.Policy.Poke.AfterReplyProb {
+		pokeAfter = true
+	}
 	plan := model.TurnPlan{
-		ChannelID:     r.ch,
-		Epoch:         startEpoch,
-		SegmentID:     seg.ID,
-		TriggerMsgID:  trig.msg.PlatformMsgID,
-		TriggerUserID: trig.msg.SenderID,
-		TriggerKind:   trig.kind,
-		RawText:       out.Text,
-		Bubbles:       bubbles,
-		DirectMedia:   out.DirectMedia,
-		StickerIntent: out.StickerIntent,
-		ReplyToMsgID:  replyTo,
-		MentionUserID: mentionUser,
+		ChannelID:      r.ch,
+		Epoch:          startEpoch,
+		SegmentID:      seg.ID,
+		TriggerMsgID:   trig.msg.PlatformMsgID,
+		TriggerUserID:  trig.msg.SenderID,
+		TriggerKind:    trig.kind,
+		RawText:        out.Text,
+		Bubbles:        bubbles,
+		DirectMedia:    out.DirectMedia,
+		StickerIntent:  out.StickerIntent,
+		ReplyToMsgID:   replyTo,
+		MentionUserID:  mentionUser,
+		PokeAfterReply: pokeAfter,
 	}
 
 	r.deliverPlan(ctx, seg, plan, out.NewFrames, trig, cfg)
@@ -739,11 +992,15 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 	status := model.DeliverySent
 
 	if r.mgr.tr != nil {
+		// Transition ledger planned -> sending before outbound transport calls (SPEC §3).
+		_ = r.mgr.store.UpdateDelivery(ctx, delID, model.DeliverySending, nil)
+
 		// 1. Send text bubbles with natural pacing and epoch/risk guards.
+	bubbleLoop:
 		for i, b := range plan.Bubbles {
 			if r.epoch.Load() != plan.Epoch {
 				status = model.DeliveryAbortedEpoch
-				break
+				break bubbleLoop
 			}
 			if i > 0 {
 				delay := bubbleDelay(b, cfg.Policy.BubbleTypingDelayMax)
@@ -751,11 +1008,11 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 				case <-time.After(delay):
 				case <-r.stopCh:
 					status = model.DeliveryPartial
-					break
+					break bubbleLoop
 				}
 				if r.epoch.Load() != plan.Epoch {
 					status = model.DeliveryAbortedEpoch
-					break
+					break bubbleLoop
 				}
 			}
 			opts := transport.SendOptions{}
@@ -775,7 +1032,7 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 				} else {
 					status = model.DeliveryFailed
 				}
-				break
+				break bubbleLoop
 			}
 			sent = append(sent, model.SentItem{
 				Kind:          "text",
@@ -797,6 +1054,7 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 
 		// 2. Send DirectMedia (e.g. PNG charts from compute) if text succeeded.
 		if status == model.DeliverySent {
+			retention := time.Duration(cfg.Frame.MediaRetentionHours) * time.Hour
 			for _, dm := range plan.DirectMedia {
 				if r.epoch.Load() != plan.Epoch {
 					status = model.DeliveryAbortedEpoch
@@ -808,14 +1066,46 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 						status = model.DeliveryAbortedRisk
 						r.muteUntil = time.Now().Add(time.Duration(cfg.Policy.MuteBackoffSec) * time.Second)
 						_ = r.mgr.store.SetChannelMuteUntil(ctx, r.ch, r.muteUntil)
+					} else if len(sent) > 0 {
+						status = model.DeliveryPartial
+					} else {
+						status = model.DeliveryFailed
 					}
 					break
+				}
+				mediaID := dm.MediaID
+				sha := dm.SHA256
+				mime := dm.MimeType
+				if mediaID == "" && len(dm.Data) > 0 {
+					if blob, berr := r.mgr.store.Blobs().PutImage(dm.Data); berr == nil {
+						if asset, aerr := r.mgr.store.RegisterMediaAsset(ctx, r.ch, r.mgr.tr.SelfID(), blob, retention); aerr == nil {
+							mediaID = asset.MediaID
+							sha = asset.SHA256
+							mime = asset.MimeType
+						}
+					}
 				}
 				sent = append(sent, model.SentItem{
 					Kind:          "image",
 					PlatformMsgID: pid,
-					MediaID:       dm.MediaID,
+					MediaID:       mediaID,
 					SentAt:        time.Now().UnixMilli(),
+				})
+				// Record delivered media into public L0 timeline (SPEC §3).
+				_ = r.mgr.store.AppendMessage(ctx, &model.Message{
+					ChannelID:     r.ch,
+					PlatformMsgID: pid,
+					SenderID:      r.mgr.tr.SelfID(),
+					SenderName:    "fatfish",
+					FromBot:       true,
+					Parts: []model.Part{{
+						Kind:     model.PartImage,
+						MediaID:  mediaID,
+						SHA256:   sha,
+						MimeType: mime,
+						Text:     dm.Caption,
+					}},
+					CreatedAt: time.Now(),
 				})
 			}
 		}
@@ -831,10 +1121,50 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 				ctxQ,
 				func() int64 { return r.epoch.Load() },
 				func(sctx context.Context, st model.Sticker, imgBytes []byte) error {
-					_, err := r.mgr.tr.SendImage(sctx, r.ch, imgBytes, "image/png", transport.SendOptions{})
-					return err
+					mime := sticker.MimeTypeFor(st)
+					pid, err := r.mgr.tr.SendImage(sctx, r.ch, imgBytes, mime, transport.SendOptions{})
+					if err != nil {
+						return err
+					}
+					// Record sent reaction sticker into public L0 media timeline (SPEC §9).
+					_ = r.mgr.store.AppendMessage(sctx, &model.Message{
+						ChannelID:     r.ch,
+						PlatformMsgID: pid,
+						SenderID:      r.mgr.tr.SelfID(),
+						SenderName:    "fatfish",
+						FromBot:       true,
+						Parts: []model.Part{{
+							Kind:     model.PartImage,
+							SHA256:   st.SHA256,
+							MimeType: mime,
+							Text:     "[sticker:" + st.StickerID + "]",
+						}},
+						CreatedAt: time.Now(),
+					})
+					return nil
 				},
 			)
+		}
+
+		// 4. Optional playful poke after concise reply (SPEC §5.3 / PokeConfig).
+		if status == model.DeliverySent && plan.PokeAfterReply && plan.TriggerUserID != "" {
+			delay := time.Duration(cfg.Policy.Poke.AfterReplyDelaySec * float64(time.Second))
+			if delay <= 0 {
+				delay = 500 * time.Millisecond
+			}
+			go func(target string, expEpoch int64) {
+				select {
+				case <-time.After(delay):
+				case <-r.stopCh:
+					return
+				}
+				if r.epoch.Load() != expEpoch {
+					return
+				}
+				pctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				_ = r.mgr.tr.SendPoke(pctx, r.ch, target)
+			}(plan.TriggerUserID, plan.Epoch)
 		}
 	}
 
@@ -882,11 +1212,26 @@ func (r *Room) isStale(trig triggerState, cfg *config.Config) bool {
 	return err == nil && drop
 }
 
-func (r *Room) runProactiveGate(ctx context.Context, trig triggerState) string {
-	recent, _ := r.mgr.store.RecentMessages(ctx, r.ch, 10)
+func (r *Room) runProactiveGate(ctx context.Context, trig triggerState, cfg *config.Config) string {
+	recent, _ := r.mgr.store.RecentMessages(ctx, r.ch, 20)
+	budget := cfg.Policy.GateTokenBudget
+	if budget <= 0 {
+		budget = 4096
+	}
 	var lines []string
-	for _, m := range recent {
-		lines = append(lines, fmt.Sprintf("%s: %s", m.SenderName, m.PlainText()))
+	usedTok := 0
+	for i := len(recent) - 1; i >= 0; i-- {
+		m := recent[i]
+		line := fmt.Sprintf("%s: %s", m.SenderName, m.PlainText())
+		tok := frame.EstimateTextTokens(line)
+		if usedTok+tok > budget && len(lines) > 0 {
+			break
+		}
+		lines = append(lines, line)
+		usedTok += tok
+	}
+	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
+		lines[i], lines[j] = lines[j], lines[i]
 	}
 	resp, err := r.mgr.hub.Chat(ctx, "fast", infer.ChatRequest{
 		Messages: []infer.ChatMessage{
@@ -918,7 +1263,7 @@ func (r *Room) runProactiveGate(ctx context.Context, trig triggerState) string {
 }
 
 func (r *Room) summarizeClosedSegment(seg *store.SegmentRecord) {
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	frames, err := r.mgr.store.ListFrames(ctx, seg.ID)
 	if err != nil || len(frames) == 0 || r.mgr.hub == nil {
@@ -931,17 +1276,30 @@ func (r *Room) summarizeClosedSegment(seg *store.SegmentRecord) {
 			lines = append(lines, f.Role+": "+p.Text)
 		}
 	}
-	if len(lines) == 0 {
-		return
+	if len(lines) > 0 {
+		resp, err := r.mgr.hub.Chat(ctx, "fast", infer.ChatRequest{
+			Messages: []infer.ChatMessage{
+				{Role: "system", Content: "Summarize this completed conversation segment in <=180 words for continuity in the next segment."},
+				{Role: "user", Content: strings.Join(lines, "\n")},
+			},
+		})
+		if err == nil && strings.TrimSpace(resp.Content) != "" {
+			_ = r.mgr.store.CloseSegment(ctx, seg.ID, strings.TrimSpace(resp.Content))
+		}
 	}
-	resp, err := r.mgr.hub.Chat(ctx, "fast", infer.ChatRequest{
-		Messages: []infer.ChatMessage{
-			{Role: "system", Content: "Summarize this completed conversation segment in <=180 words for continuity in the next segment."},
-			{Role: "user", Content: strings.Join(lines, "\n")},
-		},
-	})
-	if err == nil && strings.TrimSpace(resp.Content) != "" {
-		_ = r.mgr.store.CloseSegment(ctx, seg.ID, strings.TrimSpace(resp.Content))
+
+	// Online L1 Episode & L2 Profile/Lore distillation on segment close (SPEC §6.2 & §8).
+	if r.mgr.memory != nil {
+		endTS := seg.LastActiveAt
+		if endTS.Before(seg.CreatedAt) {
+			endTS = time.Now()
+		}
+		segMsgs, merr := r.mgr.store.MessagesInRange(ctx, seg.ChannelID, seg.CreatedAt.Add(-time.Minute), endTS.Add(time.Minute), 200)
+		if merr == nil && len(segMsgs) >= 3 {
+			if _, derr := r.mgr.memory.DistillWindow(ctx, seg.ChannelID, segMsgs, "fast"); derr != nil {
+				r.mgr.log.Warn("online segment distill failed", "channel", seg.ChannelID, "segment", seg.ID, "err", derr)
+			}
+		}
 	}
 }
 

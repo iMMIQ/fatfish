@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/invopop/jsonschema"
@@ -27,6 +28,7 @@ type ToolContext struct {
 	TriggerMsgID  string
 	Epoch         int64
 	SegmentID     int64
+	PokedThisTurn *atomic.Bool // Enforces SPEC §10.2 interact.poke max once/turn
 }
 
 // ToolResult separates text digested by the LLM from binary media delivered directly to the channel.

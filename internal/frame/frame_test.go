@@ -176,3 +176,93 @@ func TestKVCacheInvariants(t *testing.T) {
 		t.Fatalf("expected Segment-Pinned Snapshot to build exactly ONCE, got %d", snapshotCalls)
 	}
 }
+
+func TestKVCacheMultiImageTrimAndCalibratorNoCompounding(t *testing.T) {
+	st, err := store.Open(t.TempDir(), 512, 5)
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	defer st.Close()
+
+	cfg := config.FrameConfig{
+		InputTokenBudget:    32768,
+		TrimHighWater:       0.80,
+		TrimLowWater:        0.50,
+		SegmentIdleMinutes:  30,
+		SummaryTokenBudget:  512,
+		MaxImagesPerRequest: 6,
+		ImageTokenReserve:   1600,
+	}
+	builder := NewBuilder(st, cfg)
+	ctx := context.Background()
+	ch := model.MakeChannelID("onebot", "10001", model.ChannelGroup, "77777")
+
+	img := image.NewRGBA(image.Rect(0, 0, 32, 32))
+	var imgBuf bytes.Buffer
+	_ = png.Encode(&imgBuf, img)
+	blob, err := st.Blobs().PutImage(imgBuf.Bytes())
+	if err != nil {
+		t.Fatalf("PutImage: %v", err)
+	}
+	asset, err := st.RegisterMediaAsset(ctx, ch, "u1", blob, time.Hour)
+	if err != nil {
+		t.Fatalf("RegisterMediaAsset: %v", err)
+	}
+
+	seg, _, err := builder.EnsureActiveSegment(ctx, ch, 1, ScopeHash("p", "t", "m"), nil)
+	if err != nil {
+		t.Fatalf("EnsureActiveSegment: %v", err)
+	}
+
+	// Add 7 turns each with 1 image -> turn 7 must batch-trim oldest complete turns
+	// rather than mutating surviving FrozenFrames into text-only!
+	for turn := 1; turn <= 7; turn++ {
+		up := FormatUserTurn([]model.Message{{
+			ChannelID:  ch,
+			SenderID:   "u1",
+			SenderName: "Alice",
+			Parts: []model.Part{
+				{Kind: model.PartText, Text: fmt.Sprintf("img turn %d", turn)},
+				{Kind: model.PartImage, MediaID: asset.MediaID, SHA256: asset.SHA256, MimeType: asset.MimeType},
+			},
+			CreatedAt: time.Unix(1760000000+int64(turn*60), 0),
+		}}, time.UTC, nil)
+
+		msgs, _, _, imgCount, err := builder.Assemble(ctx, seg, "persona", &up, "primary|t|m")
+		if err != nil {
+			t.Fatalf("turn %d Assemble: %v", turn, err)
+		}
+		if imgCount > cfg.MaxImagesPerRequest {
+			t.Fatalf("turn %d exceeded max images: got %d > %d", turn, imgCount, cfg.MaxImagesPerRequest)
+		}
+		// Every surviving user frame [2..] must still carry its multimodal ContentPart slice intact!
+		for i := 2; i < len(msgs); i++ {
+			if msgs[i].Role == "user" {
+				if _, ok := msgs[i].Content.([]infer.ContentPart); !ok {
+					t.Fatalf("turn %d msg[%d] mutated from multimodal to plain text!", turn, i)
+				}
+			}
+		}
+		if err := builder.AppendFrozenFrames(ctx, seg, up, StoredFramePayload{Role: "assistant", Text: "ok"}); err != nil {
+			t.Fatalf("AppendFrozenFrames: %v", err)
+		}
+	}
+
+	// Verify calibrator does not compound multiplier and adjusts image reserve strictly upward.
+	for i := 0; i < 5; i++ {
+		builder.RecordCalibratorSample(ctx, "primary|t|m", 1000, 1000, 0)
+	}
+	mult, imgRes := builder.CalibratedBudget(ctx, "primary|t|m")
+	if mult < 1.19 || mult > 1.21 {
+		t.Fatalf("expected stable 1.20x multiplier for 1:1 text ratio, got %v", mult)
+	}
+	if imgRes != 1600 {
+		t.Fatalf("expected baseline 1600 image reserve, got %d", imgRes)
+	}
+	// Record multimodal sample consuming 3000 tokens for 1 image -> imgReserve must adjust upward!
+	builder.RecordCalibratorSample(ctx, "primary|t|m", 1000, 4000, 1)
+	_, imgRes2 := builder.CalibratedBudget(ctx, "primary|t|m")
+	if imgRes2 <= 1600 {
+		t.Fatalf("expected image reserve to adjust upward from 1600, got %d", imgRes2)
+	}
+}

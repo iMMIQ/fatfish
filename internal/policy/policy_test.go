@@ -8,8 +8,12 @@ import (
 )
 
 func TestPolicyEngineDeterministicAndOverrides(t *testing.T) {
+	cdOverride := 15
+	tmOverride := 5
 	cfg := config.PolicyConfig{
-		Nicknames: []string{"fatfish"},
+		Nicknames:            []string{"fatfish"},
+		ProactiveCooldownSec: 60,
+		ThreadMaxTurns:       3,
 		Rules: config.PolicyRulesConfig{
 			ReplyGate:          "mentioned || replied_to_bot || poked || (!is_night && cooldown_ok && (hit_nickname ? rand < 0.70 : rand < 0.03))",
 			DropStale:          "proactive && (new_msgs >= 4 || wait_sec >= 20)",
@@ -17,6 +21,8 @@ func TestPolicyEngineDeterministicAndOverrides(t *testing.T) {
 		},
 		Overrides: map[string]config.PolicyOverrideBlock{
 			"group:12345": {
+				ProactiveCooldownSec: &cdOverride,
+				ThreadMaxTurns:       &tmOverride,
 				Rules: config.PolicyRulesConfig{
 					ReplyGate: "mentioned || (cooldown_ok && rand < 0.50)",
 				},
@@ -44,10 +50,16 @@ func TestPolicyEngineDeterministicAndOverrides(t *testing.T) {
 		t.Fatalf("expected rand=0.25 to fail base 0.03 threshold")
 	}
 
-	// Override rule allows rand=0.25 < 0.50.
+	// Override rule allows rand=0.25 < 0.50 and overrides numeric fields.
 	ok, _ = eng.EvalReplyGate(chOverride, PolicyEnv{CooldownOK: true, Rand: 0.25})
 	if !ok {
 		t.Fatalf("expected rand=0.25 to pass override 0.50 threshold")
+	}
+	if eng.ProactiveCooldownSec(chDefault) != 60 || eng.ProactiveCooldownSec(chOverride) != 15 {
+		t.Fatalf("unexpected proactive cooldown overrides: default=%d override=%d", eng.ProactiveCooldownSec(chDefault), eng.ProactiveCooldownSec(chOverride))
+	}
+	if eng.ThreadMaxTurns(chDefault) != 3 || eng.ThreadMaxTurns(chOverride) != 5 {
+		t.Fatalf("unexpected thread_max_turns overrides: default=%d override=%d", eng.ThreadMaxTurns(chDefault), eng.ThreadMaxTurns(chOverride))
 	}
 
 	// Stale drop checks.

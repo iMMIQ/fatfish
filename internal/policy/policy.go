@@ -155,6 +155,46 @@ func compileBool(name, src string) (*vm.Program, error) {
 	return prog, nil
 }
 
+func (e *Engine) overrideBlockFor(ch model.ChannelID) (config.PolicyOverrideBlock, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if blk, ok := e.cfg.Overrides[string(ch)]; ok {
+		return blk, true
+	}
+	if _, _, kind, nativeID, ok := model.ParseChannelID(ch); ok {
+		shortKey := string(kind) + ":" + nativeID
+		if blk, ok := e.cfg.Overrides[shortKey]; ok {
+			return blk, true
+		}
+	}
+	return config.PolicyOverrideBlock{}, false
+}
+
+// ProactiveCooldownSec returns the effective proactive cooldown for ch (honoring per-channel overrides).
+func (e *Engine) ProactiveCooldownSec(ch model.ChannelID) int {
+	if blk, ok := e.overrideBlockFor(ch); ok && blk.ProactiveCooldownSec != nil {
+		return *blk.ProactiveCooldownSec
+	}
+	e.mu.RLock()
+	v := e.cfg.ProactiveCooldownSec
+	e.mu.RUnlock()
+	return v
+}
+
+// ThreadMaxTurns returns the effective thread_max_turns for ch (honoring per-channel overrides).
+func (e *Engine) ThreadMaxTurns(ch model.ChannelID) int {
+	if blk, ok := e.overrideBlockFor(ch); ok && blk.ThreadMaxTurns != nil {
+		return *blk.ThreadMaxTurns
+	}
+	e.mu.RLock()
+	v := e.cfg.ThreadMaxTurns
+	e.mu.RUnlock()
+	if v <= 0 {
+		return 3
+	}
+	return v
+}
+
 func (e *Engine) rulesFor(ch model.ChannelID) *CompiledRules {
 	e.mu.RLock()
 	defer e.mu.RUnlock()

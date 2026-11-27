@@ -19,7 +19,11 @@ type SendOptions struct {
 // Transport abstracts a messaging platform adapter (OneBot v11, Telegram, Discord, etc.).
 type Transport interface {
 	Start(ctx context.Context, onMessage func(*model.Message)) error
+	// StopInbound stops accepting/dispatching new inbound events while keeping outbound
+	// API calls functional during graceful shutdown drain (SPEC §11.3).
+	StopInbound() error
 	Stop() error
+	Probe(ctx context.Context) error
 	SelfID() string
 
 	SendText(ctx context.Context, ch model.ChannelID, text string, opts SendOptions) (platformMsgID string, err error)
@@ -28,4 +32,5 @@ type Transport interface {
 	SendReaction(ctx context.Context, ch model.ChannelID, platformMsgID string, emojiID string) error
 	FetchAudio(ctx context.Context, fileID, outFormat string) (audioBytes []byte, filename string, err error)
 	GetMessage(ctx context.Context, ch model.ChannelID, platformMsgID string) (*model.Message, error)
+	GetForward(ctx context.Context, forwardID string, maxNodes int) ([]model.Part, error)
 }

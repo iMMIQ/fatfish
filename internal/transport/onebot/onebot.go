@@ -39,8 +39,9 @@ type Client struct {
 	pendingMu sync.Mutex
 	pending   map[string]chan apiResponse
 
-	stopOnce sync.Once
-	stopCh   chan struct{}
+	inboundStopped atomic.Bool
+	stopOnce       sync.Once
+	stopCh         chan struct{}
 }
 
 type apiResponse struct {
@@ -144,7 +145,15 @@ func (c *Client) startReverseServer(ctx context.Context, onMessage func(*model.M
 	return nil
 }
 
+// StopInbound stops dispatching new inbound platform events while keeping the active
+// WebSocket connection open for outbound graceful drain replies (SPEC §11.3).
+func (c *Client) StopInbound() error {
+	c.inboundStopped.Store(true)
+	return nil
+}
+
 func (c *Client) Stop() error {
+	c.inboundStopped.Store(true)
 	c.stopOnce.Do(func() {
 		close(c.stopCh)
 		c.connMu.Lock()
@@ -158,6 +167,32 @@ func (c *Client) Stop() error {
 		}
 		c.connMu.Unlock()
 	})
+	return nil
+}
+
+// Probe verifies transport configuration / endpoint reachability for `fatfish check`.
+func (c *Client) Probe(ctx context.Context) error {
+	if strings.TrimSpace(c.cfg.WSListen) != "" {
+		return nil // Reverse WS server mode: validated by listen address config.
+	}
+	if strings.TrimSpace(c.cfg.WSURL) == "" {
+		return errors.New("onebot: neither ws_listen nor ws_url is configured")
+	}
+	headers := http.Header{}
+	if c.cfg.Token != "" {
+		headers.Set("Authorization", "Bearer "+c.cfg.Token)
+	}
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 5 * time.Second,
+		Proxy:            nil,
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	conn, _, err := dialer.DialContext(probeCtx, c.cfg.WSURL, headers)
+	if err != nil {
+		return err
+	}
+	_ = conn.Close()
 	return nil
 }
 
@@ -258,7 +293,10 @@ func (c *Client) handleFrame(raw []byte, onMessage func(*model.Message)) {
 		return
 	}
 
-	// Non-blocking event decode & dispatch.
+	// Non-blocking event decode & dispatch (skip new inbound events when draining).
+	if c.inboundStopped.Load() {
+		return
+	}
 	if msg := ParseEvent(raw, c.SelfID()); msg != nil && onMessage != nil {
 		onMessage(msg)
 	}
@@ -353,6 +391,7 @@ func ParseEvent(raw []byte, fallbackSelfID string) *model.Message {
 		PlatformMsgID: anyToString(ev.MessageID),
 		SenderID:      userID,
 		SenderName:    senderName,
+		SenderRole:    strings.TrimSpace(ev.Sender.Role),
 		FromBot:       userID == selfID || ev.PostType == "message_sent",
 		CreatedAt:     ts,
 	}
@@ -393,11 +432,16 @@ func ParseEvent(raw []byte, fallbackSelfID string) *model.Message {
 					FileID: anyToString(seg.Data["file"]),
 				})
 			case "record":
+				durSec, _ := strconv.Atoi(anyToString(seg.Data["duration"]))
+				if durSec <= 0 {
+					durSec, _ = strconv.Atoi(anyToString(seg.Data["time"]))
+				}
 				msg.Parts = append(msg.Parts, model.Part{
-					Kind:      model.PartAudio,
-					URL:       anyToString(seg.Data["url"]),
-					FileID:    anyToString(seg.Data["file"]),
-					ASRStatus: "pending",
+					Kind:       model.PartAudio,
+					URL:        anyToString(seg.Data["url"]),
+					FileID:     anyToString(seg.Data["file"]),
+					DurationMs: durSec * 1000,
+					ASRStatus:  "pending",
 				})
 			case "video":
 				msg.Parts = append(msg.Parts, model.Part{
@@ -658,7 +702,11 @@ func (c *Client) FetchAudio(ctx context.Context, fileID, outFormat string) ([]by
 		if err != nil {
 			return nil, "", err
 		}
-		hresp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+		hcli := &http.Client{
+			Timeout:   10 * time.Second,
+			Transport: &http.Transport{Proxy: nil},
+		}
+		hresp, err := hcli.Do(req)
 		if err != nil {
 			return nil, "", err
 		}
@@ -667,6 +715,76 @@ func (c *Client) FetchAudio(ctx context.Context, fileID, outFormat string) ([]by
 		return raw, "voice." + outFormat, err
 	}
 	return nil, "", errors.New("onebot: get_record returned no readable audio data")
+}
+
+// GetForward fetches bounded forward message nodes (<=maxNodes, default 20) via OneBot `get_forward_msg`.
+func (c *Client) GetForward(ctx context.Context, forwardID string, maxNodes int) ([]model.Part, error) {
+	if strings.TrimSpace(forwardID) == "" {
+		return nil, nil
+	}
+	if maxNodes <= 0 || maxNodes > 20 {
+		maxNodes = 20
+	}
+	resp, err := c.callAPI(ctx, "get_forward_msg", map[string]any{"id": forwardID})
+	if err != nil {
+		return nil, err
+	}
+	var data struct {
+		Messages []struct {
+			Sender struct {
+				Nickname string `json:"nickname"`
+				UserID   any    `json:"user_id"`
+			} `json:"sender"`
+			Content json.RawMessage `json:"content"`
+			Message json.RawMessage `json:"message"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(resp.Data, &data); err != nil {
+		return nil, err
+	}
+	nodes := make([]model.Part, 0, min(len(data.Messages), maxNodes))
+	for _, m := range data.Messages {
+		if len(nodes) >= maxNodes {
+			break
+		}
+		rawMsg := m.Message
+		if len(rawMsg) == 0 {
+			rawMsg = m.Content
+		}
+		var txt string
+		var segs []struct {
+			Type string         `json:"type"`
+			Data map[string]any `json:"data"`
+		}
+		if json.Unmarshal(rawMsg, &segs) == nil && len(segs) > 0 {
+			var parts []string
+			for _, s := range segs {
+				if s.Type == "text" {
+					if t := strings.TrimSpace(anyToString(s.Data["text"])); t != "" {
+						parts = append(parts, t)
+					}
+				} else if s.Type == "image" {
+					parts = append(parts, "[图片]")
+				}
+			}
+			txt = strings.Join(parts, " ")
+		} else {
+			_ = json.Unmarshal(rawMsg, &txt)
+		}
+		txt = strings.TrimSpace(txt)
+		if txt == "" {
+			continue
+		}
+		sender := strings.TrimSpace(m.Sender.Nickname)
+		if sender == "" {
+			sender = anyToString(m.Sender.UserID)
+		}
+		nodes = append(nodes, model.Part{
+			Kind: model.PartText,
+			Text: fmt.Sprintf("%s: %s", sender, txt),
+		})
+	}
+	return nodes, nil
 }
 
 func (c *Client) GetMessage(ctx context.Context, ch model.ChannelID, platformMsgID string) (*model.Message, error) {

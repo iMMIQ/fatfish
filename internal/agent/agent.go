@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -87,13 +88,14 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 	var directMedia []model.DirectMedia
 
 	tc := tool.ToolContext{
-		ChannelID:    in.ChannelID,
-		SenderID:     in.SenderID,
-		SenderName:   in.SenderName,
-		IsAdmin:      in.IsAdmin,
-		TriggerMsgID: in.TriggerMsgID,
-		Epoch:        in.Epoch,
-		SegmentID:    in.Segment.ID,
+		ChannelID:     in.ChannelID,
+		SenderID:      in.SenderID,
+		SenderName:    in.SenderName,
+		IsAdmin:       in.IsAdmin,
+		TriggerMsgID:  in.TriggerMsgID,
+		Epoch:         in.Epoch,
+		SegmentID:     in.Segment.ID,
+		PokedThisTurn: &atomic.Bool{},
 	}
 
 	var finalText string

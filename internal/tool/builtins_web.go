@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -36,6 +37,7 @@ type WebSearchArgs struct {
 }
 
 type WebSearchTool struct {
+	mu     sync.RWMutex
 	client *http.Client
 }
 
@@ -46,6 +48,20 @@ func NewWebSearchTool(allowHosts []string) *WebSearchTool {
 			AllowHosts: allowHosts,
 		}),
 	}
+}
+
+func (t *WebSearchTool) UpdateAllowHosts(allowHosts []string) {
+	cli := netutil.NewSafeHTTPClient(netutil.SafeClientOptions{Timeout: 15 * time.Second, AllowHosts: allowHosts})
+	t.mu.Lock()
+	t.client = cli
+	t.mu.Unlock()
+}
+
+func (t *WebSearchTool) httpClient() *http.Client {
+	t.mu.RLock()
+	c := t.client
+	t.mu.RUnlock()
+	return c
 }
 
 func (t *WebSearchTool) Name() string   { return "web_search" }
@@ -90,7 +106,7 @@ func (t *WebSearchTool) Execute(ctx context.Context, _ ToolContext, args WebSear
 
 func (t *WebSearchTool) searchBing(ctx context.Context, q string, limit int) (string, error) {
 	u := "https://www.bing.com/search?q=" + url.QueryEscape(q)
-	body, _, _, err := netutil.FetchLimited(ctx, t.client, u, 2<<20, map[string]string{"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"})
+	body, _, _, err := netutil.FetchLimited(ctx, t.httpClient(), u, 2<<20, map[string]string{"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"})
 	if err != nil {
 		return "", err
 	}
@@ -117,7 +133,7 @@ func (t *WebSearchTool) searchBing(ctx context.Context, q string, limit int) (st
 
 func (t *WebSearchTool) searchBaidu(ctx context.Context, q string, limit int) (string, error) {
 	u := "https://www.baidu.com/s?wd=" + url.QueryEscape(q)
-	body, _, _, err := netutil.FetchLimited(ctx, t.client, u, 2<<20, nil)
+	body, _, _, err := netutil.FetchLimited(ctx, t.httpClient(), u, 2<<20, nil)
 	if err != nil {
 		return "", err
 	}
@@ -147,7 +163,7 @@ func (t *WebSearchTool) searchBaidu(ctx context.Context, q string, limit int) (s
 
 func (t *WebSearchTool) searchGitHub(ctx context.Context, q string, limit int) (string, error) {
 	u := fmt.Sprintf("https://api.github.com/search/repositories?q=%s&per_page=%d", url.QueryEscape(q), limit)
-	body, _, _, err := netutil.FetchLimited(ctx, t.client, u, 2<<20, map[string]string{"Accept": "application/vnd.github+json"})
+	body, _, _, err := netutil.FetchLimited(ctx, t.httpClient(), u, 2<<20, map[string]string{"Accept": "application/vnd.github+json"})
 	if err != nil {
 		return "", err
 	}
@@ -175,7 +191,7 @@ func (t *WebSearchTool) searchGitHub(ctx context.Context, q string, limit int) (
 
 func (t *WebSearchTool) searchHFMirror(ctx context.Context, q string, limit int) (string, error) {
 	u := fmt.Sprintf("https://hf-mirror.com/api/models?search=%s&limit=%d", url.QueryEscape(q), limit)
-	body, _, _, err := netutil.FetchLimited(ctx, t.client, u, 2<<20, nil)
+	body, _, _, err := netutil.FetchLimited(ctx, t.httpClient(), u, 2<<20, nil)
 	if err != nil {
 		return "", err
 	}
@@ -200,7 +216,7 @@ func (t *WebSearchTool) searchHFMirror(ctx context.Context, q string, limit int)
 
 func (t *WebSearchTool) searchArxiv(ctx context.Context, q string, limit int) (string, error) {
 	u := fmt.Sprintf("https://export.arxiv.org/api/query?search_query=all:%s&start=0&max_results=%d", url.QueryEscape(q), limit)
-	body, _, _, err := netutil.FetchLimited(ctx, t.client, u, 2<<20, nil)
+	body, _, _, err := netutil.FetchLimited(ctx, t.httpClient(), u, 2<<20, nil)
 	if err != nil {
 		return "", err
 	}
@@ -237,6 +253,7 @@ type ReadSourceArgs struct {
 }
 
 type ReadSourceTool struct {
+	mu     sync.RWMutex
 	client *http.Client
 	hub    *infer.Hub
 }
@@ -249,6 +266,20 @@ func NewReadSourceTool(hub *infer.Hub, allowHosts []string) *ReadSourceTool {
 		}),
 		hub: hub,
 	}
+}
+
+func (t *ReadSourceTool) UpdateAllowHosts(allowHosts []string) {
+	cli := netutil.NewSafeHTTPClient(netutil.SafeClientOptions{Timeout: 25 * time.Second, AllowHosts: allowHosts})
+	t.mu.Lock()
+	t.client = cli
+	t.mu.Unlock()
+}
+
+func (t *ReadSourceTool) httpClient() *http.Client {
+	t.mu.RLock()
+	c := t.client
+	t.mu.RUnlock()
+	return c
 }
 
 func (t *ReadSourceTool) Name() string   { return "read_source" }
@@ -299,7 +330,7 @@ func (t *ReadSourceTool) readBilibili(ctx context.Context, rawURL string) (strin
 	if bvid == "" {
 		// Resolve b23.tv short link via SSRF-safe client.
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-		resp, err := t.client.Do(req)
+		resp, err := t.httpClient().Do(req)
 		if err != nil {
 			return "", err
 		}
@@ -313,7 +344,7 @@ func (t *ReadSourceTool) readBilibili(ctx context.Context, rawURL string) (strin
 	}
 
 	apiURL := "https://api.bilibili.com/x/web-interface/view?bvid=" + bvid
-	body, _, _, err := netutil.FetchLimited(ctx, t.client, apiURL, 2<<20, map[string]string{"Referer": "https://www.bilibili.com/"})
+	body, _, _, err := netutil.FetchLimited(ctx, t.httpClient(), apiURL, 2<<20, map[string]string{"Referer": "https://www.bilibili.com/"})
 	if err != nil {
 		return "", err
 	}
@@ -321,6 +352,7 @@ func (t *ReadSourceTool) readBilibili(ctx context.Context, rawURL string) (strin
 		Code int `json:"code"`
 		Data struct {
 			Aid      int64  `json:"aid"`
+			Cid      int64  `json:"cid"`
 			Bvid     string `json:"bvid"`
 			Title    string `json:"title"`
 			Desc     string `json:"desc"`
@@ -335,6 +367,7 @@ func (t *ReadSourceTool) readBilibili(ctx context.Context, rawURL string) (strin
 				Reply int `json:"reply"`
 			} `json:"stat"`
 			Pages []struct {
+				Cid  int64  `json:"cid"`
 				Page int    `json:"page"`
 				Part string `json:"part"`
 			} `json:"pages"`
@@ -356,10 +389,55 @@ func (t *ReadSourceTool) readBilibili(ctx context.Context, rawURL string) (strin
 			fmt.Fprintf(&b, "  P%d: %s\n", p.Page, p.Part)
 		}
 	}
+	// Best-effort subtitle fetch via player endpoint (SPEC §10.2).
+	cid := view.Data.Cid
+	if cid == 0 && len(view.Data.Pages) > 0 {
+		cid = view.Data.Pages[0].Cid
+	}
+	if cid > 0 {
+		pURL := fmt.Sprintf("https://api.bilibili.com/x/player/v2?bvid=%s&cid=%d", bvid, cid)
+		if pBody, _, _, perr := netutil.FetchLimited(ctx, t.httpClient(), pURL, 1<<20, map[string]string{"Referer": "https://www.bilibili.com/"}); perr == nil {
+			var pl struct {
+				Data struct {
+					Subtitle struct {
+						Subtitles []struct {
+							SubtitleURL string `json:"subtitle_url"`
+						} `json:"subtitles"`
+					} `json:"subtitle"`
+				} `json:"data"`
+			}
+			if json.Unmarshal(pBody, &pl) == nil && len(pl.Data.Subtitle.Subtitles) > 0 {
+				subURL := strings.TrimSpace(pl.Data.Subtitle.Subtitles[0].SubtitleURL)
+				if strings.HasPrefix(subURL, "//") {
+					subURL = "https:" + subURL
+				}
+				if strings.HasPrefix(subURL, "http") {
+					if sBody, _, _, serr := netutil.FetchLimited(ctx, t.httpClient(), subURL, 2<<20, nil); serr == nil {
+						var sj struct {
+							Body []struct {
+								Content string `json:"content"`
+							} `json:"body"`
+						}
+						if json.Unmarshal(sBody, &sj) == nil && len(sj.Body) > 0 {
+							var lines []string
+							for _, seg := range sj.Body {
+								if s := strings.TrimSpace(seg.Content); s != "" {
+									lines = append(lines, s)
+								}
+							}
+							if len(lines) > 0 {
+								b.WriteString("Subtitles:\n  " + clipRunes(strings.Join(lines, " "), 2500) + "\n")
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 	// Fetch top comments if aid available.
 	if view.Data.Aid > 0 {
 		cURL := fmt.Sprintf("https://api.bilibili.com/x/v2/reply?type=1&oid=%d&sort=2&ps=5", view.Data.Aid)
-		if cBody, _, _, cerr := netutil.FetchLimited(ctx, t.client, cURL, 1<<20, nil); cerr == nil {
+		if cBody, _, _, cerr := netutil.FetchLimited(ctx, t.httpClient(), cURL, 1<<20, nil); cerr == nil {
 			var cr struct {
 				Data struct {
 					Replies []struct {
@@ -387,7 +465,7 @@ func (t *ReadSourceTool) readArxiv(ctx context.Context, rawURL string) (string, 
 	}
 	id := m[1]
 	atomURL := "https://export.arxiv.org/api/query?id_list=" + id
-	body, _, _, err := netutil.FetchLimited(ctx, t.client, atomURL, 2<<20, nil)
+	body, _, _, err := netutil.FetchLimited(ctx, t.httpClient(), atomURL, 2<<20, nil)
 	if err != nil {
 		return "", err
 	}
@@ -409,8 +487,21 @@ func (t *ReadSourceTool) readArxiv(ctx context.Context, rawURL string) (string, 
 	for _, a := range e.Authors {
 		authors = append(authors, a.Name)
 	}
-	return fmt.Sprintf("arXiv:%s (%s)\nTitle: %s\nAuthors: %s\nAbstract: %s",
-		id, e.Published, strings.Join(strings.Fields(e.Title), " "), strings.Join(authors, ", "), strings.Join(strings.Fields(e.Summary), " ")), nil
+	var out strings.Builder
+	fmt.Fprintf(&out, "arXiv:%s (%s)\nTitle: %s\nAuthors: %s\nAbstract: %s",
+		id, e.Published, strings.Join(strings.Fields(e.Title), " "), strings.Join(authors, ", "), strings.Join(strings.Fields(e.Summary), " "))
+
+	// Extract first pages of the PDF via pdftotext when available (SPEC §10.2 Atom + PDF pages).
+	if _, lerr := exec.LookPath("pdftotext"); lerr == nil {
+		pdfURL := "https://arxiv.org/pdf/" + id + ".pdf"
+		if pdfBytes, _, code, perr := netutil.FetchLimited(ctx, t.httpClient(), pdfURL, 10<<20, nil); perr == nil && code == 200 && len(pdfBytes) > 0 {
+			if pdfTxt, eerr := extractPDFPages(ctx, pdfBytes, 1, 4); eerr == nil && pdfTxt != "" {
+				out.WriteString("\n\nPDF Excerpt (pages 1-4):\n")
+				out.WriteString(clipRunes(pdfTxt, 5000))
+			}
+		}
+	}
+	return out.String(), nil
 }
 
 func (t *ReadSourceTool) readHuggingFace(ctx context.Context, u *url.URL) (string, error) {
@@ -420,7 +511,7 @@ func (t *ReadSourceTool) readHuggingFace(ctx context.Context, u *url.URL) (strin
 		return t.readGenericOrDoc(ctx, u.String())
 	}
 	repoID := parts[0] + "/" + parts[1]
-	metaBody, _, _, err := netutil.FetchLimited(ctx, t.client, "https://hf-mirror.com/api/models/"+repoID, 2<<20, nil)
+	metaBody, _, _, err := netutil.FetchLimited(ctx, t.httpClient(), "https://hf-mirror.com/api/models/"+repoID, 2<<20, nil)
 	if err != nil {
 		return "", err
 	}
@@ -430,7 +521,7 @@ func (t *ReadSourceTool) readHuggingFace(ctx context.Context, u *url.URL) (strin
 	if json.Unmarshal(metaBody, &meta) == nil {
 		fmt.Fprintf(&b, "Downloads: %v | Likes: %v | Pipeline: %v\n", meta["downloads"], meta["likes"], meta["pipeline_tag"])
 	}
-	if readme, _, code, rerr := netutil.FetchLimited(ctx, t.client, "https://hf-mirror.com/"+repoID+"/raw/main/README.md", 2<<20, nil); rerr == nil && code == 200 {
+	if readme, _, code, rerr := netutil.FetchLimited(ctx, t.httpClient(), "https://hf-mirror.com/"+repoID+"/raw/main/README.md", 2<<20, nil); rerr == nil && code == 200 {
 		b.WriteString("\nREADME:\n")
 		b.WriteString(clipRunes(string(readme), 5000))
 	}
@@ -438,7 +529,7 @@ func (t *ReadSourceTool) readHuggingFace(ctx context.Context, u *url.URL) (strin
 }
 
 func (t *ReadSourceTool) readGenericOrDoc(ctx context.Context, rawURL string) (string, error) {
-	data, ct, code, err := netutil.FetchLimited(ctx, t.client, rawURL, 10<<20, nil)
+	data, ct, code, err := netutil.FetchLimited(ctx, t.httpClient(), rawURL, 10<<20, nil)
 	if err != nil {
 		return "", err
 	}
@@ -473,6 +564,10 @@ func (t *ReadSourceTool) readGenericOrDoc(ctx context.Context, rawURL string) (s
 }
 
 func extractPDFText(ctx context.Context, pdfBytes []byte) (string, error) {
+	return extractPDFPages(ctx, pdfBytes, 0, 0)
+}
+
+func extractPDFPages(ctx context.Context, pdfBytes []byte, firstPage, lastPage int) (string, error) {
 	tmp, err := os.CreateTemp("", "fatfish-*.pdf")
 	if err != nil {
 		return "", err
@@ -484,7 +579,15 @@ func extractPDFText(ctx context.Context, pdfBytes []byte) (string, error) {
 	}
 	tmp.Close()
 
-	cmd := exec.CommandContext(ctx, "pdftotext", "-layout", tmp.Name(), "-")
+	args := []string{"-layout"}
+	if firstPage > 0 {
+		args = append(args, "-f", strconv.Itoa(firstPage))
+	}
+	if lastPage > 0 {
+		args = append(args, "-l", strconv.Itoa(lastPage))
+	}
+	args = append(args, tmp.Name(), "-")
+	cmd := exec.CommandContext(ctx, "pdftotext", args...)
 	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("pdftotext failed: %w", err)
@@ -562,6 +665,7 @@ type QuoteArgs struct {
 }
 
 type QuoteTool struct {
+	mu     sync.RWMutex
 	client *http.Client
 }
 
@@ -572,6 +676,20 @@ func NewQuoteTool(allowHosts []string) *QuoteTool {
 			AllowHosts: allowHosts,
 		}),
 	}
+}
+
+func (t *QuoteTool) UpdateAllowHosts(allowHosts []string) {
+	cli := netutil.NewSafeHTTPClient(netutil.SafeClientOptions{Timeout: 10 * time.Second, AllowHosts: allowHosts})
+	t.mu.Lock()
+	t.client = cli
+	t.mu.Unlock()
+}
+
+func (t *QuoteTool) httpClient() *http.Client {
+	t.mu.RLock()
+	c := t.client
+	t.mu.RUnlock()
+	return c
 }
 
 func (t *QuoteTool) Name() string   { return "quote" }
@@ -595,7 +713,7 @@ func (t *QuoteTool) Execute(ctx context.Context, _ ToolContext, args QuoteArgs) 
 
 	// 1. Realtime quote from Tencent qt.gtimg.cn (GBK encoded).
 	qtURL := "https://qt.gtimg.cn/q=" + url.QueryEscape(sym)
-	raw, _, _, err := netutil.FetchLimited(ctx, t.client, qtURL, 512<<10, nil)
+	raw, _, _, err := netutil.FetchLimited(ctx, t.httpClient(), qtURL, 512<<10, nil)
 	if err != nil {
 		return ToolResult{}, err
 	}
@@ -613,7 +731,7 @@ func (t *QuoteTool) Execute(ctx context.Context, _ ToolContext, args QuoteArgs) 
 
 	// 2. Daily K-line bars (up to 60 days).
 	klURL := fmt.Sprintf("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s,day,,,%d,qfq", url.QueryEscape(sym), days)
-	if klRaw, _, _, kerr := netutil.FetchLimited(ctx, t.client, klURL, 2<<20, nil); kerr == nil {
+	if klRaw, _, _, kerr := netutil.FetchLimited(ctx, t.httpClient(), klURL, 2<<20, nil); kerr == nil {
 		if klLines := parseTencentKline(klRaw, sym); len(klLines) > 0 {
 			b.WriteString("\nRecent Daily K-line (date, open, close, high, low, vol):\n")
 			b.WriteString(strings.Join(klLines, "\n"))

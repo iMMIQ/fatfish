@@ -99,6 +99,7 @@ type Message struct {
 	PlatformMsgID string    `json:"platform_msg_id,omitempty"`
 	SenderID      string    `json:"sender_id"`
 	SenderName    string    `json:"sender_name"`
+	SenderRole    string    `json:"sender_role,omitempty"`
 	FromBot       bool      `json:"from_bot"`
 	MentionedBot  bool      `json:"mentioned_bot,omitempty"`
 	RepliedToBot  bool      `json:"replied_to_bot,omitempty"`
@@ -372,4 +373,13 @@ type KVMetric struct {
 	MissReason       string    `json:"miss_reason"`
 	LatencyMs        int64     `json:"latency_ms"`
 	CreatedAt        time.Time `json:"created_at"`
+}
+
+// SnapshotInput provides the channel-scoped memory components used ONCE when opening a new Frame segment.
+// Lives in internal/model so internal/memory does not need to import internal/frame (SPEC §2 DAG).
+type SnapshotInput struct {
+	Lore            []LoreEntry
+	PinnedNotes     []Note
+	PreviousSummary string
+	MemberCards     []string // Pre-formatted active member summaries
 }

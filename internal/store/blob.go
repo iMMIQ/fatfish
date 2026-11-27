@@ -69,11 +69,15 @@ func (b *BlobStore) PutImage(raw []byte) (CanonicalBlob, error) {
 
 	var img image.Image
 	var err error
-	// For animated GIF, take first representative frame cleanly.
+	isAnimatedGIF := false
+	// For animated GIF, take first representative frame cleanly for LLM while preserving raw GIF for send_media.
 	if bytes.HasPrefix(raw, []byte("GIF8")) {
 		g, gerr := gif.DecodeAll(bytes.NewReader(raw))
 		if gerr == nil && len(g.Image) > 0 {
 			img = g.Image[0]
+			if len(g.Image) > 1 {
+				isAnimatedGIF = true
+			}
 		}
 	}
 	if img == nil {
@@ -148,6 +152,15 @@ func (b *BlobStore) PutImage(raw []byte) (CanonicalBlob, error) {
 			return CanonicalBlob{}, err
 		}
 	}
+	if isAnimatedGIF {
+		rawGifPath := filepath.Join(subDir, hash+".raw.gif")
+		if _, err := os.Stat(rawGifPath); os.IsNotExist(err) {
+			tmp := rawGifPath + ".tmp"
+			if err := os.WriteFile(tmp, raw, 0o644); err == nil {
+				_ = os.Rename(tmp, rawGifPath)
+			}
+		}
+	}
 
 	return CanonicalBlob{
 		SHA256:   hash,
@@ -181,6 +194,20 @@ func (b *BlobStore) ReadBytes(sha256Hex, mimeType string) ([]byte, error) {
 	return os.ReadFile(p)
 }
 
+// ReadMediaBytes returns the preserved raw animated GIF if present (for send_media),
+// otherwise returns the canonical JPEG/PNG bytes and mimeType.
+func (b *BlobStore) ReadMediaBytes(sha256Hex, mimeType string) ([]byte, string, error) {
+	if len(sha256Hex) < 2 {
+		return nil, "", errors.New("store: invalid sha256")
+	}
+	rawGifPath := filepath.Join(b.dir, sha256Hex[:2], sha256Hex+".raw.gif")
+	if raw, err := os.ReadFile(rawGifPath); err == nil && len(raw) > 0 {
+		return raw, "image/gif", nil
+	}
+	raw, err := b.ReadBytes(sha256Hex, mimeType)
+	return raw, mimeType, err
+}
+
 // DataURI returns the deterministic base64 data URI ("data:image/jpeg;base64,...") for LLM payloads.
 func (b *BlobStore) DataURI(sha256Hex, mimeType string) (string, error) {
 	raw, err := b.ReadBytes(sha256Hex, mimeType)
@@ -190,12 +217,14 @@ func (b *BlobStore) DataURI(sha256Hex, mimeType string) (string, error) {
 	return "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(raw), nil
 }
 
-// Delete removes a blob file if it exists.
+// Delete removes a blob file (and any preserved animated GIF companion) if it exists.
 func (b *BlobStore) Delete(sha256Hex, mimeType string) error {
 	p := b.PathFor(sha256Hex, mimeType)
 	if p == "" {
 		return nil
 	}
+	rawGifPath := filepath.Join(b.dir, sha256Hex[:2], sha256Hex+".raw.gif")
+	_ = os.Remove(rawGifPath)
 	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 		return err
 	}

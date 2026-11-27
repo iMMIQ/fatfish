@@ -106,6 +106,14 @@ func (a *hostAllowlist) allowsAddr(addr netip.Addr) bool {
 	return false
 }
 
+func (a *hostAllowlist) allowsHost(host string) bool {
+	if a == nil {
+		return false
+	}
+	_, ok := a.hosts[strings.ToLower(strings.TrimSpace(host))]
+	return ok
+}
+
 // SafeDialer returns a net.Dialer whose Control hook validates the resolved IP address
 // immediately before connect(), neutralizing DNS rebinding and IP-encoding bypasses.
 func SafeDialer(timeout time.Duration, allowHosts []string) *net.Dialer {
@@ -133,23 +141,38 @@ func SafeDialer(timeout time.Duration, allowHosts []string) *net.Dialer {
 	}
 }
 
-// NewSafeHTTPClient builds an http.Client with post-DNS SSRF blocking and redirect validation.
+// NewSafeHTTPClient builds an http.Client with post-DNS SSRF blocking, hostname/IP allowlisting,
+// optional default User-Agent, and redirect validation.
 func NewSafeHTTPClient(opts SafeClientOptions) *http.Client {
 	if opts.Timeout <= 0 {
 		opts.Timeout = 20 * time.Second
 	}
-	dialer := SafeDialer(minDuration(opts.Timeout, 10*time.Second), opts.AllowHosts)
+	dialTimeout := minDuration(opts.Timeout, 10*time.Second)
+	al := parseAllowlist(opts.AllowHosts)
+	safeDialer := SafeDialer(dialTimeout, opts.AllowHosts)
+	plainDialer := &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
+
 	tr := &http.Transport{
-		Proxy:                 nil, // Never proxy untrusted SSRF-checked requests through arbitrary local proxies
-		DialContext:           dialer.DialContext,
+		Proxy: nil, // Never proxy untrusted SSRF-checked requests through arbitrary local proxies
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			host, _, err := net.SplitHostPort(address)
+			if err == nil && al.allowsHost(host) {
+				return plainDialer.DialContext(ctx, network, address)
+			}
+			return safeDialer.DialContext(ctx, network, address)
+		},
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          32,
 		IdleConnTimeout:       60 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
+	var rt http.RoundTripper = tr
+	if strings.TrimSpace(opts.UserAgent) != "" {
+		rt = &uaRoundTripper{base: tr, userAgent: strings.TrimSpace(opts.UserAgent)}
+	}
 	return &http.Client{
-		Transport: tr,
+		Transport: rt,
 		Timeout:   opts.Timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 6 {
@@ -158,6 +181,20 @@ func NewSafeHTTPClient(opts SafeClientOptions) *http.Client {
 			return ValidateURL(req.URL.String())
 		},
 	}
+}
+
+type uaRoundTripper struct {
+	base      http.RoundTripper
+	userAgent string
+}
+
+func (u *uaRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Header.Get("User-Agent") == "" {
+		clone := req.Clone(req.Context())
+		clone.Header.Set("User-Agent", u.userAgent)
+		return u.base.RoundTrip(clone)
+	}
+	return u.base.RoundTrip(req)
 }
 
 // ValidateURL performs pre-flight scheme validation.
@@ -188,7 +225,9 @@ func FetchLimited(ctx context.Context, client *http.Client, rawURL string, maxBy
 	if err != nil {
 		return nil, "", 0, err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+	if _, hasUA := client.Transport.(*uaRoundTripper); !hasUA {
+		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}

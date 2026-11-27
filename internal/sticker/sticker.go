@@ -3,7 +3,9 @@ package sticker
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
@@ -47,6 +49,7 @@ type Engine struct {
 	contentIdx *vec.FlatF16Index
 
 	asyncSem chan struct{}
+	asyncWG  sync.WaitGroup
 }
 
 func NewEngine(st *store.Store, hub *infer.Hub, cfg config.StickerConfig, dim int, logger *slog.Logger) *Engine {
@@ -69,14 +72,57 @@ func NewEngine(st *store.Store, hub *infer.Hub, cfg config.StickerConfig, dim in
 	}
 }
 
+// UpdateConfig hot-swaps StickerConfig safely.
+func (e *Engine) UpdateConfig(cfg config.StickerConfig) {
+	e.mu.Lock()
+	e.cfg = cfg
+	e.mu.Unlock()
+}
+
+func (e *Engine) getConfig() config.StickerConfig {
+	e.mu.RLock()
+	c := e.cfg
+	e.mu.RUnlock()
+	return c
+}
+
+// Drain waits up to timeout for all in-flight async sticker workers to finish (SPEC §11.3).
+func (e *Engine) Drain(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		e.asyncWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		e.log.Warn("sticker async drain timed out", "timeout", timeout)
+	}
+}
+
+// MimeTypeFor infers the MIME type of a sticker file from its RelPath extension.
+func MimeTypeFor(st model.Sticker) string {
+	switch strings.ToLower(filepath.Ext(st.RelPath)) {
+	case ".gif":
+		return "image/gif"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".webp":
+		return "image/webp"
+	default:
+		return "image/png"
+	}
+}
+
 // LoadIndex loads all ready stickers and their pre-centered float16 dual vectors into RAM.
 func (e *Engine) LoadIndex(ctx context.Context) (int, error) {
+	cfg := e.getConfig()
 	rows, err := e.store.ListStickers(ctx, "ready")
 	if err != nil {
 		return 0, err
 	}
-	intentIdx := vec.NewFlatF16Index(e.dim, float32(e.cfg.DocCenteringAlpha))
-	contentIdx := vec.NewFlatF16Index(e.dim, float32(e.cfg.DocCenteringAlpha))
+	intentIdx := vec.NewFlatF16Index(e.dim, float32(cfg.DocCenteringAlpha))
+	contentIdx := vec.NewFlatF16Index(e.dim, float32(cfg.DocCenteringAlpha))
 	stMap := make(map[string]model.Sticker, len(rows))
 
 	for _, r := range rows {
@@ -110,15 +156,16 @@ type SearchOptions struct {
 // Search runs 3-way hybrid recall (FTS5 + v_intent + v_content) -> Weighted RRF -> Rerank ->
 // Exponential recent-use decay -> MMR diversity.
 func (e *Engine) Search(ctx context.Context, opts SearchOptions) ([]SearchHit, error) {
+	cfg := e.getConfig()
 	if opts.TopK <= 0 {
 		opts.TopK = 5
 	}
-	intentW := float32(e.cfg.ReactionIntentWeight)
+	intentW := float32(cfg.ReactionIntentWeight)
 	if intentW <= 0 {
 		intentW = 0.75
 	}
 	if opts.ExplicitLookup {
-		intentW = float32(e.cfg.ExplicitIntentWeight)
+		intentW = float32(cfg.ExplicitIntentWeight)
 		if intentW <= 0 {
 			intentW = 0.25
 		}
@@ -208,7 +255,7 @@ func (e *Engine) Search(ctx context.Context, opts SearchOptions) ([]SearchHit, e
 
 	// 5. Exponential anti-repeat decay for stickers recently used in this channel.
 	if opts.ChannelID != "" {
-		recent, _ := e.store.RecentStickerUses(ctx, opts.ChannelID, e.cfg.RecentWindow)
+		recent, _ := e.store.RecentStickerUses(ctx, opts.ChannelID, cfg.RecentWindow)
 		if len(recent) > 0 {
 			lastPos := make(map[string]int, len(recent))
 			for idx, id := range recent {
@@ -249,7 +296,7 @@ func (e *Engine) Search(ctx context.Context, opts SearchOptions) ([]SearchHit, e
 		}
 		return e.contentIdx.Vector(id)
 	}
-	diverse := vec.MMRRerank(mmrIn, vecLookup, float32(e.cfg.MMRLambda), opts.TopK)
+	diverse := vec.MMRRerank(mmrIn, vecLookup, float32(cfg.MMRLambda), opts.TopK)
 	out := make([]SearchHit, 0, len(diverse))
 	for _, d := range diverse {
 		out = append(out, candByID[d.ID])
@@ -291,7 +338,7 @@ func (e *Engine) PickOne(ctx context.Context, opts SearchOptions) (*SearchHit, e
 func (e *Engine) ReadStickerFile(st model.Sticker) ([]byte, error) {
 	p := st.RelPath
 	if !filepath.IsAbs(p) {
-		p = filepath.Join(e.cfg.PackDir, p)
+		p = filepath.Join(e.getConfig().PackDir, p)
 	}
 	return os.ReadFile(p)
 }
@@ -306,7 +353,8 @@ func (e *Engine) DispatchAsync(
 	checkEpoch func() int64,
 	sendFn func(ctx context.Context, st model.Sticker, imgBytes []byte) error,
 ) bool {
-	if !e.cfg.Enabled || strings.TrimSpace(intentQuery) == "" {
+	cfg := e.getConfig()
+	if !cfg.Enabled || strings.TrimSpace(intentQuery) == "" {
 		return false
 	}
 	select {
@@ -314,9 +362,11 @@ func (e *Engine) DispatchAsync(
 	default:
 		return false // Pool saturated, gracefully skip reaction sticker
 	}
+	e.asyncWG.Add(1)
 	go func() {
+		defer e.asyncWG.Done()
 		defer func() { <-e.asyncSem }()
-		to := time.Duration(e.cfg.AsyncSendTimeoutSec) * time.Second
+		to := time.Duration(cfg.AsyncSendTimeoutSec) * time.Second
 		if to <= 0 {
 			to = 15 * time.Second
 		}
@@ -350,6 +400,99 @@ func (e *Engine) DispatchAsync(
 		_ = e.store.RecordStickerUse(runCtx, ch, hit.Sticker.StickerID)
 	}()
 	return true
+}
+
+// EnrichAndTag populates missing intent_text (for legacy single-caption packs via `reindex --enrich`)
+// and optionally tags untagged `needs_review` stickers using the primary multimodal vision model.
+func (e *Engine) EnrichAndTag(ctx context.Context, tagUntagged bool) (enriched int, tagged int, err error) {
+	if e.hub == nil {
+		return 0, 0, fmt.Errorf("sticker: inference hub required for enrich/tag")
+	}
+	rows, err := e.store.ListStickers(ctx, "")
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, r := range rows {
+		st := r.Sticker
+		if st.Status == "ready" && strings.TrimSpace(st.IntentText) == "" && strings.TrimSpace(st.ContentText+st.OCRText) != "" {
+			resp, cerr := e.hub.Chat(ctx, "fast", infer.ChatRequest{
+				Messages: []infer.ChatMessage{
+					{Role: "system", Content: "Given a sticker visual description/OCR, output a concise comma-separated list of emotions, tones, and chat reply scenes (intent_text) in Chinese. Output plain text only."},
+					{Role: "user", Content: strings.TrimSpace(st.ContentText + " " + st.OCRText)},
+				},
+			})
+			if cerr == nil && strings.TrimSpace(resp.Content) != "" {
+				if uerr := e.store.UpdateStickerStatus(ctx, st.StickerID, st.Status, st.OCRText, strings.TrimSpace(resp.Content), st.ContentText); uerr == nil {
+					enriched++
+				}
+			}
+			continue
+		}
+		if tagUntagged && st.Status == "needs_review" && strings.TrimSpace(st.ContentText) == "" && strings.TrimSpace(st.IntentText) == "" {
+			raw, rerr := e.ReadStickerFile(st)
+			if rerr != nil || len(raw) == 0 {
+				continue
+			}
+			dataURI := "data:" + MimeTypeFor(st) + ";base64," + base64.StdEncoding.EncodeToString(raw)
+			resp, cerr := e.hub.Chat(ctx, "primary", infer.ChatRequest{
+				Messages: []infer.ChatMessage{
+					{Role: "system", Content: `Tag this chat sticker as JSON: {"ocr_text":"...","intent_text":"emotions/reply scenes in Chinese","content_text":"visual description in Chinese"}`},
+					{Role: "user", Content: []infer.ContentPart{
+						{Type: "text", Text: "Analyze this sticker:"},
+						{Type: "image_url", ImageURL: &infer.ImageURL{URL: dataURI}},
+					}},
+				},
+				ResponseFormat: map[string]any{"type": "json_object"},
+			})
+			if cerr != nil {
+				continue
+			}
+			var parsed struct {
+				OCRText     string `json:"ocr_text"`
+				IntentText  string `json:"intent_text"`
+				ContentText string `json:"content_text"`
+			}
+			if json.Unmarshal([]byte(resp.Content), &parsed) == nil && (parsed.IntentText != "" || parsed.ContentText != "") {
+				if uerr := e.store.UpdateStickerStatus(ctx, st.StickerID, "needs_review", strings.TrimSpace(parsed.OCRText), strings.TrimSpace(parsed.IntentText), strings.TrimSpace(parsed.ContentText)); uerr == nil {
+					tagged++
+				}
+			}
+		}
+	}
+	return enriched, tagged, nil
+}
+
+// ReindexOne embeds a single sticker (used when approving a sticker in the Console) and refreshes RAM index.
+func (e *Engine) ReindexOne(ctx context.Context, stickerID string) error {
+	if e.hub != nil {
+		rows, err := e.store.ListStickers(ctx, "ready")
+		if err != nil {
+			return err
+		}
+		for _, r := range rows {
+			if r.Sticker.StickerID != stickerID {
+				continue
+			}
+			it := strings.TrimSpace(r.Sticker.IntentText)
+			ct := strings.TrimSpace(r.Sticker.ContentText + " " + r.Sticker.OCRText)
+			if it == "" {
+				it = ct
+			}
+			if ct == "" {
+				ct = it
+			}
+			if it != "" {
+				if embs, err := e.hub.Embed(ctx, []string{it, ct}); err == nil && len(embs) == 2 && len(embs[0]) == e.dim && len(embs[1]) == e.dim {
+					vec.NormalizeInPlace(embs[0])
+					vec.NormalizeInPlace(embs[1])
+					_ = e.store.UpdateStickerVectors(ctx, stickerID, vec.EncodeFloat16(embs[0]), vec.EncodeFloat16(embs[1]))
+				}
+			}
+			break
+		}
+	}
+	_, err := e.LoadIndex(ctx)
+	return err
 }
 
 // Reindex computes embeddings for all ready stickers, applies doc-only centering with alpha,

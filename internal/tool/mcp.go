@@ -25,6 +25,7 @@ type CachedMCPTool struct {
 	RemoteName  string          `json:"remote_name"`
 	FullName    string          `json:"full_name"`
 	Description string          `json:"description"`
+	ReadOnly    bool            `json:"read_only,omitempty"`
 	Parameters  json.RawMessage `json:"parameters"`
 }
 
@@ -88,7 +89,7 @@ func (b *MCPBridge) InitAndRegister(ctx context.Context, servers []config.MCPSer
 			_ = reg.RegisterRaw(Entry{
 				Name:        ct.FullName,
 				Description: ct.Description,
-				ReadOnly:    false,
+				ReadOnly:    ct.ReadOnly,
 				Parameters:  ct.Parameters,
 				Invoke: func(callCtx context.Context, _ ToolContext, rawArgs json.RawMessage) (ToolResult, error) {
 					return b.invoke(callCtx, serverName, remoteName, rawArgs, timeout)
@@ -121,10 +122,15 @@ func (b *MCPBridge) discoverServer(ctx context.Context, conn *mcpServerConn) ([]
 		if err != nil {
 			cleaned = json.RawMessage(`{"type":"object","properties":{}}`)
 		}
+		readOnly := false
+		if t.Annotations != nil && t.Annotations.ReadOnlyHint {
+			readOnly = true
+		}
 		out = append(out, CachedMCPTool{
 			RemoteName:  t.Name,
 			FullName:    fmt.Sprintf("mcp_%s_%s", sanitizeToolPart(conn.cfg.Name), sanitizeToolPart(t.Name)),
 			Description: t.Description,
+			ReadOnly:    readOnly,
 			Parameters:  cleaned,
 		})
 	}
@@ -248,6 +254,28 @@ func (b *MCPBridge) connect(ctx context.Context, scfg config.MCPServerConfig) (*
 	default:
 		return nil, fmt.Errorf("mcp: unsupported transport %q", scfg.Transport)
 	}
+}
+
+// Probe tests connectivity and tool listing for each configured MCP server (for `fatfish check`).
+func (b *MCPBridge) Probe(ctx context.Context, servers []config.MCPServerConfig) map[string]error {
+	results := make(map[string]error, len(servers))
+	for _, scfg := range servers {
+		if strings.TrimSpace(scfg.Name) == "" {
+			continue
+		}
+		pctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		sess, err := b.connect(pctx, scfg)
+		if err != nil {
+			results[scfg.Name] = err
+			cancel()
+			continue
+		}
+		_, err = sess.ListTools(pctx, &mcp.ListToolsParams{})
+		_ = sess.Close()
+		cancel()
+		results[scfg.Name] = err
+	}
+	return results
 }
 
 // Close cleanly closes all active MCP client sessions.

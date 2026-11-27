@@ -9,6 +9,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -45,22 +46,32 @@ type StoredFramePayload struct {
 }
 
 // SnapshotInput provides the channel-scoped memory components used ONCE when opening a new segment.
-type SnapshotInput struct {
-	Lore            []model.LoreEntry
-	PinnedNotes     []model.Note
-	PreviousSummary string
-	MemberCards     []string // Pre-formatted active member summaries
-}
+type SnapshotInput = model.SnapshotInput
 
 // Builder manages segments, Segment-Pinned Memory Snapshots, FrozenFrames, batch trimming (80%->50%),
 // and the Adaptive Token Budget Calibrator.
 type Builder struct {
 	store *store.Store
+	mu    sync.RWMutex
 	cfg   config.FrameConfig
 }
 
 func NewBuilder(st *store.Store, cfg config.FrameConfig) *Builder {
 	return &Builder{store: st, cfg: cfg}
+}
+
+// UpdateConfig hot-swaps FrameConfig safely.
+func (b *Builder) UpdateConfig(cfg config.FrameConfig) {
+	b.mu.Lock()
+	b.cfg = cfg
+	b.mu.Unlock()
+}
+
+func (b *Builder) getConfig() config.FrameConfig {
+	b.mu.RLock()
+	cfg := b.cfg
+	b.mu.RUnlock()
+	return cfg
 }
 
 // ScopeHash returns SHA256(personaHash | toolsHash | modelID).
@@ -77,6 +88,7 @@ func SystemPrompt(personaText string) string {
 // BuildPinnedSnapshot formats [msg 1] ONCE at segment creation with strictly isolated budgets
 // so member cards can never crowd out lore or pinned notes.
 func (b *Builder) BuildPinnedSnapshot(in SnapshotInput) string {
+	cfg := b.getConfig()
 	var sections []string
 
 	if len(in.Lore) > 0 {
@@ -84,7 +96,7 @@ func (b *Builder) BuildPinnedSnapshot(in SnapshotInput) string {
 		for _, l := range in.Lore {
 			lines = append(lines, fmt.Sprintf("- %s: %s", l.Term, l.Meaning))
 		}
-		if sec := truncateToTokens(strings.Join(lines, "\n"), b.cfg.PinnedSnapshotBudgets.Lore); sec != "" {
+		if sec := truncateToTokens(strings.Join(lines, "\n"), cfg.PinnedSnapshotBudgets.Lore); sec != "" {
 			sections = append(sections, "[Channel Lore]\n"+sec)
 		}
 	}
@@ -94,13 +106,13 @@ func (b *Builder) BuildPinnedSnapshot(in SnapshotInput) string {
 		for _, n := range in.PinnedNotes {
 			lines = append(lines, fmt.Sprintf("- %s: %s", n.Key, n.Content))
 		}
-		if sec := truncateToTokens(strings.Join(lines, "\n"), b.cfg.PinnedSnapshotBudgets.Notes); sec != "" {
+		if sec := truncateToTokens(strings.Join(lines, "\n"), cfg.PinnedSnapshotBudgets.Notes); sec != "" {
 			sections = append(sections, "[Pinned Notes]\n"+sec)
 		}
 	}
 
 	if s := strings.TrimSpace(in.PreviousSummary); s != "" {
-		if sec := truncateToTokens(s, maxInt(b.cfg.SummaryTokenBudget/2, 250)); sec != "" {
+		if sec := truncateToTokens(s, maxInt(cfg.SummaryTokenBudget/2, 250)); sec != "" {
 			sections = append(sections, "[Previous Segment Summary]\n"+sec)
 		}
 	}
@@ -108,7 +120,7 @@ func (b *Builder) BuildPinnedSnapshot(in SnapshotInput) string {
 	if len(in.MemberCards) > 0 {
 		sorted := append([]string(nil), in.MemberCards...)
 		sort.Strings(sorted)
-		if sec := truncateToTokens(strings.Join(sorted, "\n"), b.cfg.PinnedSnapshotBudgets.Profiles); sec != "" {
+		if sec := truncateToTokens(strings.Join(sorted, "\n"), cfg.PinnedSnapshotBudgets.Profiles); sec != "" {
 			sections = append(sections, "[Active Members]\n"+sec)
 		}
 	}
@@ -129,12 +141,13 @@ func (b *Builder) EnsureActiveSegment(
 	scopeHash string,
 	snapshotFn func(ctx context.Context) (SnapshotInput, error),
 ) (*store.SegmentRecord, *store.SegmentRecord, error) {
+	cfg := b.getConfig()
 	chState, err := b.store.EnsureChannel(ctx, ch)
 	if err != nil {
 		return nil, nil, err
 	}
 	var closedSeg *store.SegmentRecord
-	idleLimit := time.Duration(maxInt(b.cfg.SegmentIdleMinutes, 30)) * time.Minute
+	idleLimit := time.Duration(maxInt(cfg.SegmentIdleMinutes, 30)) * time.Minute
 
 	if chState.ActiveSegmentID > 0 {
 		seg, err := b.store.GetSegment(ctx, chState.ActiveSegmentID)
@@ -177,59 +190,99 @@ func (b *Builder) EnsureActiveSegment(
 // Assemble builds the complete OpenAI messages slice for an LLM call:
 // [msg 0] system prompt (immutable)
 // [msg 1] Segment-Pinned Memory Snapshot (immutable for entire segment)
-// [msg 2..k] FrozenFrames (append-only, deterministic base64)
+// [msg 2..k] FrozenFrames (append-only, deterministic base64; NEVER mutated in-place)
 // [msg k+1] Current active turn (optional if currentPayload != nil)
+//
+// Returns estTextTokens as the RAW uncalibrated text token estimate (for the Adaptive Calibrator)
+// so feeding it back into RecordCalibratorSample never compounds previous multipliers.
 func (b *Builder) Assemble(
 	ctx context.Context,
 	seg *store.SegmentRecord,
 	personaText string,
 	currentPayload *StoredFramePayload,
 	modelKey string,
-) (msgs []infer.ChatMessage, prefixHash string, estTokens int, imageCount int, err error) {
+) (msgs []infer.ChatMessage, prefixHash string, estTextTokens int, imageCount int, err error) {
+	cfg := b.getConfig()
 	frames, err := b.store.ListFrames(ctx, seg.ID)
 	if err != nil {
 		return nil, "", 0, 0, err
 	}
 
-	mult := b.CalibratedMultiplier(ctx, modelKey)
+	mult, imgReserve := b.CalibratedBudget(ctx, modelKey)
 
-	// Check 80% -> 50% batch trim threshold BEFORE assembling so prefix stabilizes for next 10-15 turns.
-	budget := maxInt(b.cfg.InputTokenBudget, 4096)
-	highWater := int(float64(budget) * b.cfg.TrimHighWater)
-	lowWater := int(float64(budget) * b.cfg.TrimLowWater)
-
-	baseTok := int(float64(EstimateTextTokens(SystemPrompt(personaText))+EstimateTextTokens(seg.PinnedSnapshot)) * mult)
-	curTok := 0
-	if currentPayload != nil {
-		curTok = b.estimatePayloadTokens(*currentPayload, mult)
-	}
-	totalTok := baseTok + curTok
-	for _, f := range frames {
-		totalTok += int(float64(f.EstTokens) * mult)
-	}
-
-	if totalTok >= highWater && len(frames) > 2 {
-		dropIdx := findTurnTrimCutoff(frames, totalTok-lowWater, mult)
-		if dropIdx >= 0 && dropIdx < len(frames) {
-			_ = b.store.DeleteFramesUpToIndex(ctx, seg.ID, frames[dropIdx].FrameIndex)
-			frames = frames[dropIdx+1:]
+	// Parse stored frames once to compute exact raw text tokens and image counts without mutating history.
+	parsed := make([]StoredFramePayload, len(frames))
+	frameRawText := make([]int, len(frames))
+	frameImgCnt := make([]int, len(frames))
+	for i, f := range frames {
+		if err := json.Unmarshal([]byte(f.PayloadJSON), &parsed[i]); err == nil {
+			frameRawText[i] = estimatePayloadTextTokens(parsed[i])
+			frameImgCnt[i] = len(parsed[i].Images)
+		} else {
+			frameRawText[i] = f.EstTokens
 		}
 	}
 
-	// Track image budget across request: prioritize current turn images, then most recent frozen images.
-	maxImgs := maxInt(b.cfg.MaxImagesPerRequest, 6)
-	imgsAllowed := make(map[int]bool) // frame index -> include images
-	usedImgs := 0
-	if currentPayload != nil {
-		usedImgs += len(currentPayload.Images)
+	// Cap currentPayload images to maxImgs before evaluating batch trim.
+	maxImgs := maxInt(cfg.MaxImagesPerRequest, 6)
+	var curCopy StoredFramePayload
+	hasCur := currentPayload != nil
+	if hasCur {
+		curCopy = *currentPayload
+		if len(curCopy.Images) > maxImgs {
+			curCopy.Images = append([]MediaRef(nil), curCopy.Images[len(curCopy.Images)-maxImgs:]...)
+		}
 	}
-	for i := len(frames) - 1; i >= 0; i-- {
-		var p StoredFramePayload
-		if json.Unmarshal([]byte(frames[i].PayloadJSON), &p) == nil && len(p.Images) > 0 {
-			if usedImgs+len(p.Images) <= maxImgs {
-				imgsAllowed[frames[i].FrameIndex] = true
-				usedImgs += len(p.Images)
-			}
+
+	// 1. Whole-turn batch trim when total images exceed maxImgs.
+	// Drops oldest complete turns instead of mutating surviving FrozenFrames in-place (preserving KV cache!).
+	totalImgs := len(curCopy.Images)
+	for _, c := range frameImgCnt {
+		totalImgs += c
+	}
+	if totalImgs > maxImgs && len(frames) > 2 {
+		// Batch-trim down to <= maxImgs/2 (+ current turn) so the next several turns stay cache-stable.
+		targetDrop := totalImgs - maxImgs
+		if halfTarget := totalImgs - maxInt(maxImgs/2, len(curCopy.Images)); halfTarget > targetDrop {
+			targetDrop = halfTarget
+		}
+		if dropIdx := findImageTurnTrimCutoff(frames, frameImgCnt, targetDrop); dropIdx >= 0 && dropIdx < len(frames) {
+			_ = b.store.DeleteFramesUpToIndex(ctx, seg.ID, frames[dropIdx].FrameIndex)
+			frames = frames[dropIdx+1:]
+			parsed = parsed[dropIdx+1:]
+			frameRawText = frameRawText[dropIdx+1:]
+			frameImgCnt = frameImgCnt[dropIdx+1:]
+		}
+	}
+
+	// 2. Check 80% -> 50% token batch trim threshold BEFORE assembling so prefix stabilizes for next 10-15 turns.
+	budget := maxInt(cfg.InputTokenBudget, 4096)
+	highWater := int(float64(budget) * cfg.TrimHighWater)
+	lowWater := int(float64(budget) * cfg.TrimLowWater)
+
+	baseRawText := EstimateTextTokens(SystemPrompt(personaText)) + EstimateTextTokens(seg.PinnedSnapshot)
+	curRawText := 0
+	curImgs := 0
+	if hasCur {
+		curRawText = estimatePayloadTextTokens(curCopy)
+		curImgs = len(curCopy.Images)
+	}
+
+	totalBudgetTok := int(float64(baseRawText+curRawText)*mult) + curImgs*imgReserve
+	frameBudgetTok := make([]int, len(frames))
+	for i := range frames {
+		ft := int(float64(frameRawText[i])*mult) + frameImgCnt[i]*imgReserve
+		frameBudgetTok[i] = ft
+		totalBudgetTok += ft
+	}
+
+	if totalBudgetTok >= highWater && len(frames) > 2 {
+		dropIdx := findTurnTrimCutoff(frames, frameBudgetTok, totalBudgetTok-lowWater)
+		if dropIdx >= 0 && dropIdx < len(frames) {
+			_ = b.store.DeleteFramesUpToIndex(ctx, seg.ID, frames[dropIdx].FrameIndex)
+			frames = frames[dropIdx+1:]
+			parsed = parsed[dropIdx+1:]
+			frameRawText = frameRawText[dropIdx+1:]
 		}
 	}
 
@@ -243,16 +296,13 @@ func (b *Builder) Assemble(
 		Content: seg.PinnedSnapshot,
 	})
 
-	estTokens = baseTok
-	for _, f := range frames {
-		var p StoredFramePayload
-		if err := json.Unmarshal([]byte(f.PayloadJSON), &p); err != nil {
-			continue
-		}
-		cm, nImg := b.rehydratePayload(p, imgsAllowed[f.FrameIndex])
+	estTextTokens = baseRawText
+	for i := range frames {
+		// Every surviving FrozenFrame renders identically with its frozen images intact.
+		cm, nImg := b.rehydratePayload(parsed[i], true)
 		msgs = append(msgs, cm)
 		imageCount += nImg
-		estTokens += int(float64(f.EstTokens) * mult)
+		estTextTokens += frameRawText[i]
 	}
 
 	// Prefix hash covers [msg 0..k] (everything strictly prior to the current turn).
@@ -260,18 +310,19 @@ func (b *Builder) Assemble(
 	sum := sha256.Sum256(prefixBytes)
 	prefixHash = hex.EncodeToString(sum[:])
 
-	if currentPayload != nil {
-		cm, nImg := b.rehydratePayload(*currentPayload, true)
+	if hasCur {
+		cm, nImg := b.rehydratePayload(curCopy, true)
 		msgs = append(msgs, cm)
 		imageCount += nImg
-		estTokens += curTok
+		estTextTokens += curRawText
 	}
 
-	return msgs, prefixHash, estTokens, imageCount, nil
+	return msgs, prefixHash, estTextTokens, imageCount, nil
 }
 
 // AppendFrozenFrames persists one or more immutable turn frames (user / assistant / tool) to the segment.
 func (b *Builder) AppendFrozenFrames(ctx context.Context, seg *store.SegmentRecord, payloads ...StoredFramePayload) error {
+	cfg := b.getConfig()
 	existing, err := b.store.ListFrames(ctx, seg.ID)
 	if err != nil {
 		return err
@@ -285,10 +336,7 @@ func (b *Builder) AppendFrozenFrames(ctx context.Context, seg *store.SegmentReco
 		if err != nil {
 			return err
 		}
-		est := EstimateTextTokens(p.Text) + len(p.Images)*maxInt(b.cfg.ImageTokenReserve, 1600)
-		for _, tc := range p.ToolCalls {
-			est += EstimateTextTokens(tc.Function.Name + tc.Function.Arguments)
-		}
+		est := estimatePayloadTextTokens(p) + len(p.Images)*maxInt(cfg.ImageTokenReserve, 1600)
 		rec := &store.FrameRecord{
 			SegmentID:   seg.ID,
 			ChannelID:   seg.ChannelID,
@@ -309,6 +357,12 @@ func (b *Builder) AppendFrozenFrames(ctx context.Context, seg *store.SegmentReco
 // FormatUserTurn formats a batch of channel messages (plus optional one-time new-member delta lines)
 // into a deterministic StoredFramePayload.
 func FormatUserTurn(msgs []model.Message, loc *time.Location, newMemberDelta []string) StoredFramePayload {
+	return FormatUserTurnWithLimits(msgs, loc, newMemberDelta, "", 0, 0)
+}
+
+// FormatUserTurnWithLimits formats a turn while enforcing maxBackgroundImages (for non-trigger messages)
+// and maxTotalImages deterministically prior to freezing.
+func FormatUserTurnWithLimits(msgs []model.Message, loc *time.Location, newMemberDelta []string, triggerPlatformMsgID string, maxBgImgs, maxTotalImgs int) StoredFramePayload {
 	if loc == nil {
 		loc = time.UTC
 	}
@@ -317,8 +371,10 @@ func FormatUserTurn(msgs []model.Message, loc *time.Location, newMemberDelta []s
 		lines = append(lines, "[New Member Context] "+strings.Join(newMemberDelta, "; "))
 	}
 	var imgs []MediaRef
-	for _, m := range msgs {
+	bgImgsUsed := 0
+	for i, m := range msgs {
 		ts := m.CreatedAt.In(loc).Format("15:04")
+		isTrigger := (triggerPlatformMsgID != "" && m.PlatformMsgID == triggerPlatformMsgID) || (triggerPlatformMsgID == "" && i == len(msgs)-1)
 		var parts []string
 		for _, p := range m.Parts {
 			switch p.Kind {
@@ -328,7 +384,19 @@ func FormatUserTurn(msgs []model.Message, loc *time.Location, newMemberDelta []s
 				}
 			case model.PartImage:
 				if p.SHA256 != "" && p.MimeType != "" {
-					imgs = append(imgs, MediaRef{MediaID: p.MediaID, SHA256: p.SHA256, MimeType: p.MimeType})
+					allowImg := true
+					if !isTrigger && maxBgImgs > 0 && bgImgsUsed >= maxBgImgs {
+						allowImg = false
+					}
+					if maxTotalImgs > 0 && len(imgs) >= maxTotalImgs {
+						allowImg = false
+					}
+					if allowImg {
+						imgs = append(imgs, MediaRef{MediaID: p.MediaID, SHA256: p.SHA256, MimeType: p.MimeType})
+						if !isTrigger {
+							bgImgsUsed++
+						}
+					}
 					parts = append(parts, fmt.Sprintf("[图片 media_id=%s]", p.MediaID))
 				} else {
 					parts = append(parts, "[图片]")
@@ -338,7 +406,11 @@ func FormatUserTurn(msgs []model.Message, loc *time.Location, newMemberDelta []s
 					parts = append(parts, fmt.Sprintf("[语音转写: %s]", p.Transcript))
 				} else {
 					sec := p.DurationMs / 1000
-					parts = append(parts, fmt.Sprintf("[语音 %ds，暂不可转写]", sec))
+					if p.ASRStatus == "pending" {
+						parts = append(parts, fmt.Sprintf("[语音 %ds，转写中]", sec))
+					} else {
+						parts = append(parts, fmt.Sprintf("[语音 %ds，暂不可转写]", sec))
+					}
 				}
 			case model.PartCard:
 				parts = append(parts, fmt.Sprintf("[卡片: %s %s %s]", p.Title, p.Summary, p.URL))
@@ -351,7 +423,17 @@ func FormatUserTurn(msgs []model.Message, loc *time.Location, newMemberDelta []s
 					parts = append(parts, fmt.Sprintf("[引用: %s]", p.Text))
 				}
 			case model.PartForward:
-				parts = append(parts, "[合并转发]")
+				if len(p.Nodes) > 0 {
+					var nodeTxts []string
+					for _, n := range p.Nodes {
+						if t := strings.TrimSpace(n.Text); t != "" {
+							nodeTxts = append(nodeTxts, t)
+						}
+					}
+					parts = append(parts, fmt.Sprintf("[合并转发: %s]", strings.Join(nodeTxts, " | ")))
+				} else {
+					parts = append(parts, "[合并转发]")
+				}
 			}
 		}
 		if len(parts) > 0 {
@@ -400,20 +482,23 @@ func (b *Builder) rehydratePayload(p StoredFramePayload, includeImages bool) (in
 	return cm, loaded
 }
 
-func (b *Builder) estimatePayloadTokens(p StoredFramePayload, mult float64) int {
-	raw := EstimateTextTokens(p.Text) + len(p.Images)*maxInt(b.cfg.ImageTokenReserve, 1600)
-	return int(float64(raw) * mult)
+func estimatePayloadTextTokens(p StoredFramePayload) int {
+	raw := EstimateTextTokens(p.Text)
+	for _, tc := range p.ToolCalls {
+		raw += EstimateTextTokens(tc.Function.Name + tc.Function.Arguments)
+	}
+	return raw
 }
 
 // findTurnTrimCutoff drops complete turns (starting at role=='user' boundaries) until >= tokensToDrop are freed.
-func findTurnTrimCutoff(frames []store.FrameRecord, tokensToDrop int, mult float64) int {
+func findTurnTrimCutoff(frames []store.FrameRecord, frameTokens []int, tokensToDrop int) int {
 	if tokensToDrop <= 0 || len(frames) == 0 {
 		return -1
 	}
 	dropped := 0
 	lastDrop := -1
 	for i := 0; i < len(frames)-1; i++ {
-		dropped += int(float64(frames[i].EstTokens) * mult)
+		dropped += frameTokens[i]
 		// Only end trim right before a new user turn so assistant/tool pairs are never orphaned.
 		if frames[i+1].Role == "user" {
 			lastDrop = i
@@ -425,7 +510,27 @@ func findTurnTrimCutoff(frames []store.FrameRecord, tokensToDrop int, mult float
 	return lastDrop
 }
 
-// RecordCalibratorSample feeds first-attempt real prompt_tokens into the rolling 96-sample calibrator.
+// findImageTurnTrimCutoff drops oldest complete turns until >= imgsToDrop images are freed.
+func findImageTurnTrimCutoff(frames []store.FrameRecord, frameImgs []int, imgsToDrop int) int {
+	if imgsToDrop <= 0 || len(frames) == 0 {
+		return -1
+	}
+	dropped := 0
+	lastDrop := -1
+	for i := 0; i < len(frames)-1; i++ {
+		dropped += frameImgs[i]
+		if frames[i+1].Role == "user" {
+			lastDrop = i
+			if dropped >= imgsToDrop {
+				return lastDrop
+			}
+		}
+	}
+	return lastDrop
+}
+
+// RecordCalibratorSample feeds first-attempt real prompt_tokens (against raw uncalibrated estText)
+// into the rolling 96-sample calibrator.
 func (b *Builder) RecordCalibratorSample(ctx context.Context, modelKey string, estText, actualTok, imageCount int) {
 	if b.store == nil || estText <= 0 || actualTok <= 0 {
 		return
@@ -439,28 +544,59 @@ func (b *Builder) RecordCalibratorSample(ctx context.Context, modelKey string, e
 	})
 }
 
-// CalibratedMultiplier computes the adaptive token multiplier (+20% safety margin) from the last 96 samples.
-func (b *Builder) CalibratedMultiplier(ctx context.Context, modelKey string) float64 {
+// CalibratedBudget computes both the adaptive text multiplier (+20% safety margin) and
+// upward-only calibrated per-image token reserve from the rolling 96-sample window (SPEC §6.2).
+func (b *Builder) CalibratedBudget(ctx context.Context, modelKey string) (textMult float64, imgReserve int) {
+	cfg := b.getConfig()
+	baseReserve := maxInt(cfg.ImageTokenReserve, 1600)
+	textMult = 1.20
+	imgReserve = baseReserve
+
 	if b.store == nil || modelKey == "" {
-		return 1.20
+		return textMult, imgReserve
 	}
 	samples, err := b.store.RecentCalibratorSamples(ctx, modelKey, 96)
-	if err != nil || len(samples) < 3 {
-		return 1.20
+	if err != nil || len(samples) == 0 {
+		return textMult, imgReserve
 	}
+
 	var sumEst, sumAct float64
+	textSamples := 0
 	for _, s := range samples {
-		if s.ImageCount > 0 {
-			continue // Calibrate text ratio cleanly from text-only turns.
+		if s.ImageCount == 0 && s.EstText > 0 && s.ActualTok > 0 {
+			sumEst += float64(s.EstText)
+			sumAct += float64(s.ActualTok)
+			textSamples++
 		}
-		sumEst += float64(s.EstText)
-		sumAct += float64(s.ActualTok)
 	}
-	if sumEst < 100 {
-		return 1.20
+	rawRatio := 1.0
+	if textSamples >= 3 && sumEst >= 100 {
+		rawRatio = sumAct / sumEst
+		textMult = math.Max(0.8, math.Min(rawRatio*1.20, 3.0))
 	}
-	ratio := (sumAct / sumEst) * 1.20
-	return math.Max(0.8, math.Min(ratio, 3.0))
+
+	// Calibrate image reserve strictly upward from multimodal samples.
+	for _, s := range samples {
+		if s.ImageCount > 0 && s.ActualTok > 0 {
+			expectedText := int(float64(s.EstText) * rawRatio)
+			if s.ActualTok > expectedText {
+				impliedPerImg := int(math.Ceil(float64(s.ActualTok-expectedText) / float64(s.ImageCount) * 1.10))
+				if impliedPerImg > imgReserve {
+					imgReserve = impliedPerImg
+				}
+			}
+		}
+	}
+	if imgReserve > 8192 {
+		imgReserve = 8192
+	}
+	return textMult, imgReserve
+}
+
+// CalibratedMultiplier returns the adaptive text token multiplier (+20% safety margin).
+func (b *Builder) CalibratedMultiplier(ctx context.Context, modelKey string) float64 {
+	m, _ := b.CalibratedBudget(ctx, modelKey)
+	return m
 }
 
 // EstimateTextTokens provides a fast, zero-dependency token estimate for mixed CJK/ASCII text.

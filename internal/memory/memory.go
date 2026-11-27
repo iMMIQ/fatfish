@@ -14,7 +14,6 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/iMMIQ/fatfish/internal/frame"
 	"github.com/iMMIQ/fatfish/internal/infer"
 	"github.com/iMMIQ/fatfish/internal/model"
 	"github.com/iMMIQ/fatfish/internal/store"
@@ -72,7 +71,7 @@ func (s *Service) LoadIndex(ctx context.Context) (int, error) {
 }
 
 // BuildSnapshot constructs a channel-scoped SnapshotInput for a new Frame Segment.
-func (s *Service) BuildSnapshot(ctx context.Context, ch model.ChannelID, activeMemberIDs []string) (frame.SnapshotInput, error) {
+func (s *Service) BuildSnapshot(ctx context.Context, ch model.ChannelID, activeMemberIDs []string) (model.SnapshotInput, error) {
 	lore, _ := s.store.ListLore(ctx, ch, 15)
 	notes, _ := s.store.ListNotes(ctx, ch, true)
 	names, _ := s.store.GetMemberNames(ctx, ch)
@@ -93,7 +92,7 @@ func (s *Service) BuildSnapshot(ctx context.Context, ch model.ChannelID, activeM
 			cards = append(cards, card)
 		}
 	}
-	return frame.SnapshotInput{
+	return model.SnapshotInput{
 		Lore:        lore,
 		PinnedNotes: notes,
 		MemberCards: cards,

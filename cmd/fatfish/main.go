@@ -58,7 +58,7 @@ Usage:
   fatfish check   -c fatfish.yaml
   fatfish ingest  -c fatfish.yaml [--messages history.jsonl] [--stickers ./dir --pack default]
   fatfish distill -c fatfish.yaml [--channel <id>] [--limit 20] [--concurrency 2]
-  fatfish reindex -c fatfish.yaml [--eval queries.yaml]`)
+  fatfish reindex -c fatfish.yaml [--eval queries.yaml] [--enrich] [--tag]`)
 }
 
 func cmdServe(args []string) error {
@@ -181,6 +181,8 @@ func cmdReindex(args []string) error {
 	fs := flag.NewFlagSet("reindex", flag.ExitOnError)
 	cfgPath := fs.String("c", "configs/fatfish.example.yaml", "path to YAML config")
 	evalFile := fs.String("eval", "", "optional YAML file of sticker eval queries to tune alpha")
+	enrich := fs.Bool("enrich", false, "enrich missing sticker intent_text via LLM")
+	tag := fs.Bool("tag", false, "vision-tag untagged needs_review stickers via primary multimodal model")
 	_ = fs.Parse(args)
 
 	application, err := app.New(*cfgPath, false)
@@ -190,6 +192,14 @@ func cmdReindex(args []string) error {
 	defer application.Close()
 
 	ctx := context.Background()
+	if *enrich || *tag {
+		enr, tgd, err := application.Stickers.EnrichAndTag(ctx, *tag)
+		if err != nil {
+			fmt.Printf("[WARN] sticker enrich/tag skipped: %v\n", err)
+		} else {
+			fmt.Printf("[OK] Sticker enrichment complete (enriched=%d, vision_tagged=%d)\n", enr, tgd)
+		}
+	}
 	if err := application.Store.RebuildFTS(ctx); err != nil {
 		return fmt.Errorf("rebuild FTS5: %w", err)
 	}

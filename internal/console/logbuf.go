@@ -9,14 +9,18 @@ import (
 	"time"
 )
 
-// LogBroadcaster is an slog.Handler wrapper that tees JSON logs to a bounded ring buffer
-// and live SSE subscribers.
-type LogBroadcaster struct {
+type logBus struct {
 	mu      sync.RWMutex
 	ring    []string
 	maxSize int
 	subs    map[chan string]struct{}
-	inner   slog.Handler
+}
+
+// LogBroadcaster is an slog.Handler wrapper that tees JSON logs to a bounded ring buffer
+// and live SSE subscribers. Derived handlers from WithAttrs/WithGroup share the same bus & lock.
+type LogBroadcaster struct {
+	bus   *logBus
+	inner slog.Handler
 }
 
 func NewLogBroadcaster(out io.Writer, level slog.Level, maxSize int) *LogBroadcaster {
@@ -24,9 +28,11 @@ func NewLogBroadcaster(out io.Writer, level slog.Level, maxSize int) *LogBroadca
 		maxSize = 200
 	}
 	return &LogBroadcaster{
-		maxSize: maxSize,
-		subs:    make(map[chan string]struct{}),
-		inner:   slog.NewJSONHandler(out, &slog.HandlerOptions{Level: level}),
+		bus: &logBus{
+			maxSize: maxSize,
+			subs:    make(map[chan string]struct{}),
+		},
+		inner: slog.NewJSONHandler(out, &slog.HandlerOptions{Level: level}),
 	}
 }
 
@@ -48,54 +54,50 @@ func (l *LogBroadcaster) Handle(ctx context.Context, r slog.Record) error {
 	raw, _ := json.Marshal(entry)
 	line := string(raw)
 
-	l.mu.Lock()
-	l.ring = append(l.ring, line)
-	if len(l.ring) > l.maxSize {
-		l.ring = l.ring[len(l.ring)-l.maxSize:]
+	l.bus.mu.Lock()
+	l.bus.ring = append(l.bus.ring, line)
+	if len(l.bus.ring) > l.bus.maxSize {
+		l.bus.ring = l.bus.ring[len(l.bus.ring)-l.bus.maxSize:]
 	}
-	for ch := range l.subs {
+	for ch := range l.bus.subs {
 		select {
 		case ch <- line:
 		default:
 		}
 	}
-	l.mu.Unlock()
+	l.bus.mu.Unlock()
 	return nil
 }
 
 func (l *LogBroadcaster) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return &LogBroadcaster{
-		ring:    l.ring,
-		maxSize: l.maxSize,
-		subs:    l.subs,
-		inner:   l.inner.WithAttrs(attrs),
+		bus:   l.bus,
+		inner: l.inner.WithAttrs(attrs),
 	}
 }
 
 func (l *LogBroadcaster) WithGroup(name string) slog.Handler {
 	return &LogBroadcaster{
-		ring:    l.ring,
-		maxSize: l.maxSize,
-		subs:    l.subs,
-		inner:   l.inner.WithGroup(name),
+		bus:   l.bus,
+		inner: l.inner.WithGroup(name),
 	}
 }
 
 func (l *LogBroadcaster) Recent() []string {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	return append([]string(nil), l.ring...)
+	l.bus.mu.RLock()
+	defer l.bus.mu.RUnlock()
+	return append([]string(nil), l.bus.ring...)
 }
 
 func (l *LogBroadcaster) Subscribe() (chan string, func()) {
 	ch := make(chan string, 64)
-	l.mu.Lock()
-	l.subs[ch] = struct{}{}
-	l.mu.Unlock()
+	l.bus.mu.Lock()
+	l.bus.subs[ch] = struct{}{}
+	l.bus.mu.Unlock()
 	unsub := func() {
-		l.mu.Lock()
-		delete(l.subs, ch)
-		l.mu.Unlock()
+		l.bus.mu.Lock()
+		delete(l.bus.subs, ch)
+		l.bus.mu.Unlock()
 	}
 	return ch, unsub
 }

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	robfigcron "github.com/robfig/cron/v3"
@@ -37,7 +38,7 @@ type ChannelFilter interface {
 }
 
 // Scheduler polls persistent SQLite schedules and posts SystemTriggerEvents into Rooms,
-// and runs periodic maintenance (hourly incremental memory distill, daily digests, WAL/media cleanup).
+// and runs periodic maintenance (hourly incremental memory distill, daily digests, WAL/media quota cleanup).
 type Scheduler struct {
 	store          *store.Store
 	hub            *infer.Hub
@@ -49,6 +50,10 @@ type Scheduler struct {
 	minIntervalMin int
 	embedDim       int
 	log            *slog.Logger
+
+	mu            sync.RWMutex
+	roomMediaMiB  int
+	totalMediaMiB int
 }
 
 // SetMemoryHooks attaches optional in-process incremental memory distillation and channel filtering.
@@ -81,8 +86,22 @@ func NewScheduler(st *store.Store, hub *infer.Hub, disp Dispatcher, loc *time.Lo
 		maxPerChannel:  maxPerChannel,
 		minIntervalMin: minIntervalMin,
 		embedDim:       embedDim,
+		roomMediaMiB:   256,
+		totalMediaMiB:  1024,
 		log:            logger,
 	}
+}
+
+// SetMediaQuotas configures soft per-channel and hard global BlobStore LRU quotas (in MiB).
+func (s *Scheduler) SetMediaQuotas(roomMiB, totalMiB int) {
+	s.mu.Lock()
+	if roomMiB > 0 {
+		s.roomMediaMiB = roomMiB
+	}
+	if totalMiB > 0 {
+		s.totalMediaMiB = totalMiB
+	}
+	s.mu.Unlock()
 }
 
 var cronParser = robfigcron.NewParser(robfigcron.Minute | robfigcron.Hour | robfigcron.Dom | robfigcron.Month | robfigcron.Dow)
@@ -151,7 +170,8 @@ func (s *Scheduler) CreateSchedule(ctx context.Context, ch model.ChannelID, crea
 	return sc, nil
 }
 
-// Start runs the background scheduler loop until ctx is cancelled.
+// Start runs the background scheduler loop (user schedules, hourly incremental distill,
+// daily digest, WAL & media quota maintenance) until ctx is cancelled.
 func (s *Scheduler) Start(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
 	distillTicker := time.NewTicker(1 * time.Hour)
@@ -278,6 +298,13 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 func (s *Scheduler) runMaintenance(ctx context.Context, now time.Time) {
 	if pruned, err := s.store.PruneExpiredMedia(ctx, now); err == nil && pruned > 0 {
 		s.log.Info("pruned expired media assets", "count", pruned)
+	}
+	s.mu.RLock()
+	roomBytes := int64(s.roomMediaMiB) << 20
+	totalBytes := int64(s.totalMediaMiB) << 20
+	s.mu.RUnlock()
+	if evicted, err := s.store.EnforceMediaQuotas(ctx, roomBytes, totalBytes); err == nil && evicted > 0 {
+		s.log.Info("enforced blobstore media quotas", "evicted", evicted)
 	}
 	if err := s.store.Checkpoint(ctx, "TRUNCATE"); err != nil {
 		s.log.Warn("wal checkpoint failed", "err", err)

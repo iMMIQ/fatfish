@@ -76,6 +76,22 @@ func TestSSRFBlocked(t *testing.T) {
 		t.Fatalf("unexpected response: code=%d body=%q", code, string(body))
 	}
 
+	// Explicitly allowlisting hostname "localhost" + custom UserAgent must work.
+	hostSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(r.Header.Get("User-Agent")))
+	}))
+	defer hostSrv.Close()
+	localhostURL := "http://localhost" + hostSrv.URL[len("http://127.0.0.1"):]
+	hostClient := NewSafeHTTPClient(SafeClientOptions{
+		Timeout:    3 * time.Second,
+		AllowHosts: []string{"localhost"},
+		UserAgent:  "fatfish-test-ua/1.0",
+	})
+	uaBody, _, uaCode, err := FetchLimited(context.Background(), hostClient, localhostURL, 1024, nil)
+	if err != nil || uaCode != http.StatusOK || string(uaBody) != "fatfish-test-ua/1.0" {
+		t.Fatalf("expected localhost allowlist + custom UA to succeed, code=%d body=%q err=%v", uaCode, string(uaBody), err)
+	}
+
 	// Non-http schemes must be rejected.
 	if err := ValidateURL("file:///etc/passwd"); !errors.Is(err, ErrInvalidScheme) {
 		t.Fatalf("expected ErrInvalidScheme for file://, got %v", err)

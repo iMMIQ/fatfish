@@ -59,8 +59,9 @@ func (t *ComputeTool) Description() string {
 	return "Execute pure-Go Starlark calculations with preloaded math, json, time, stats (mean/median/stdev/percentile/corr/linreg), finance (pmt/irr/npv/cagr/drawdown), and chart (line/bar/pie/scatter/kline PNG)."
 }
 
-// ValidateStarlarkAST inspects the parsed AST before execution to block single-step OOM DoS
-// such as `[0] * 100000000`, `"a" * 100000000`, `range(100000000)`, or huge power exponents.
+// ValidateStarlarkAST inspects the parsed AST before execution to block single-step & exponential OOM DoS
+// such as `[0] * 100000000`, `n = 10**8; [0] * n`, `"a" * n`, `range(100000000)`, `x *= n`, or
+// loop self-doubling `x = x + x` / `x += x`.
 func ValidateStarlarkAST(src string) (*syntax.File, error) {
 	opts := &syntax.FileOptions{
 		Set:       true,
@@ -72,57 +73,114 @@ func ValidateStarlarkAST(src string) (*syntax.File, error) {
 		return nil, fmt.Errorf("compute: syntax error: %w", err)
 	}
 
+	// Track known variable names holding sequence/string values (conservatively).
+	seqVars := make(map[string]bool)
 	var blockErr error
-	syntax.Walk(file, func(n syntax.Node) bool {
+	var walkStmt func(n syntax.Node, inLoop bool)
+	walkStmt = func(n syntax.Node, inLoop bool) {
 		if blockErr != nil || n == nil {
-			return false
+			return
 		}
-		switch x := n.(type) {
-		case *syntax.BinaryExpr:
-			if x.Op == syntax.STAR {
-				if isSequenceExpr(x.X) && exceedsIntLiteral(x.Y, maxStarlarkRepeatMul) {
-					blockErr = fmt.Errorf("%w: sequence multiplication exceeds %d", ErrStarlarkOOMBlocked, maxStarlarkRepeatMul)
-					return false
+		syntax.Walk(n, func(cur syntax.Node) bool {
+			if blockErr != nil || cur == nil {
+				return false
+			}
+			switch x := cur.(type) {
+			case *syntax.ForStmt:
+				for _, st := range x.Body {
+					walkStmt(st, true)
 				}
-				if isSequenceExpr(x.Y) && exceedsIntLiteral(x.X, maxStarlarkRepeatMul) {
-					blockErr = fmt.Errorf("%w: sequence multiplication exceeds %d", ErrStarlarkOOMBlocked, maxStarlarkRepeatMul)
-					return false
+				return false
+			case *syntax.WhileStmt:
+				for _, st := range x.Body {
+					walkStmt(st, true)
 				}
-				// Even with non-literal variables, block list/string literal multiplied by arbitrary identifier inside loops if RHS is huge expression.
-				if isSequenceExpr(x.X) && !isSmallIntLiteral(x.Y, maxStarlarkRepeatMul) {
-					if _, isLit := x.Y.(*syntax.Literal); !isLit {
-						// Allow small multiplication only if bounded by runtime; conservatively block var*list if ambiguous?
-						// Check if RHS is binary/power expression like 10**8 or 10000*10000.
-						if val, ok := evalConstInt(x.Y); ok && val > maxStarlarkRepeatMul {
-							blockErr = fmt.Errorf("%w: sequence multiplication %d exceeds %d", ErrStarlarkOOMBlocked, val, maxStarlarkRepeatMul)
+				return false
+			case *syntax.AssignStmt:
+				if lhsID, ok := x.LHS.(*syntax.Ident); ok {
+					if isSequenceExpr(x.RHS) {
+						seqVars[lhsID.Name] = true
+					}
+					// Block exponential self-doubling inside loops: `x += x` or `x = x + x`.
+					if inLoop {
+						if x.Op == syntax.PLUS_EQ {
+							if rhsID, ok2 := x.RHS.(*syntax.Ident); ok2 && rhsID.Name == lhsID.Name {
+								blockErr = fmt.Errorf("%w: self-doubling %s += %s inside loop", ErrStarlarkOOMBlocked, lhsID.Name, rhsID.Name)
+								return false
+							}
+						}
+						if x.Op == syntax.EQ {
+							if bin, ok2 := x.RHS.(*syntax.BinaryExpr); ok2 && bin.Op == syntax.PLUS {
+								lx, okL := bin.X.(*syntax.Ident)
+								ry, okR := bin.Y.(*syntax.Ident)
+								if okL && okR && lx.Name == lhsID.Name && ry.Name == lhsID.Name {
+									blockErr = fmt.Errorf("%w: self-doubling %s = %s + %s inside loop", ErrStarlarkOOMBlocked, lhsID.Name, lx.Name, ry.Name)
+									return false
+								}
+							}
+						}
+					}
+				}
+				if x.Op == syntax.STAR_EQ {
+					val, ok := evalConstInt(x.RHS)
+					if !ok || val > maxStarlarkRepeatMul {
+						// Allow numeric `*=` only if LHS is not a known sequence var AND not inside loop with huge multiplier.
+						lhsID, isID := x.LHS.(*syntax.Ident)
+						if (ok && val > maxStarlarkRepeatMul) || (isID && seqVars[lhsID.Name]) || inLoop {
+							blockErr = fmt.Errorf("%w: unsafe augmented multiplication (*=)", ErrStarlarkOOMBlocked)
+							return false
+						}
+					}
+				}
+			case *syntax.BinaryExpr:
+				if x.Op == syntax.STAR {
+					lhsSeq := isSequenceExpr(x.X) || isTrackedSeqIdent(x.X, seqVars)
+					rhsSeq := isSequenceExpr(x.Y) || isTrackedSeqIdent(x.Y, seqVars)
+					if lhsSeq {
+						val, ok := evalConstInt(x.Y)
+						if !ok || val > maxStarlarkRepeatMul || val < 0 {
+							blockErr = fmt.Errorf("%w: sequence multiplication requires small constant <= %d", ErrStarlarkOOMBlocked, maxStarlarkRepeatMul)
+							return false
+						}
+					}
+					if rhsSeq {
+						val, ok := evalConstInt(x.X)
+						if !ok || val > maxStarlarkRepeatMul || val < 0 {
+							blockErr = fmt.Errorf("%w: sequence multiplication requires small constant <= %d", ErrStarlarkOOMBlocked, maxStarlarkRepeatMul)
+							return false
+						}
+					}
+				}
+			case *syntax.CallExpr:
+				if fn, ok := x.Fn.(*syntax.Ident); ok && fn.Name == "range" {
+					for _, arg := range x.Args {
+						if val, ok := evalConstInt(arg); ok && absInt64(val) > maxStarlarkRangeLen {
+							blockErr = fmt.Errorf("%w: range(%d) exceeds %d", ErrStarlarkOOMBlocked, val, maxStarlarkRangeLen)
 							return false
 						}
 					}
 				}
 			}
-		case *syntax.AssignStmt:
-			if x.Op == syntax.STAR_EQ {
-				if val, ok := evalConstInt(x.RHS); ok && val > maxStarlarkRepeatMul {
-					blockErr = fmt.Errorf("%w: augmented sequence multiplication exceeds %d", ErrStarlarkOOMBlocked, maxStarlarkRepeatMul)
-					return false
-				}
-			}
-		case *syntax.CallExpr:
-			if fn, ok := x.Fn.(*syntax.Ident); ok && fn.Name == "range" {
-				for _, arg := range x.Args {
-					if val, ok := evalConstInt(arg); ok && absInt64(val) > maxStarlarkRangeLen {
-						blockErr = fmt.Errorf("%w: range(%d) exceeds %d", ErrStarlarkOOMBlocked, val, maxStarlarkRangeLen)
-						return false
-					}
-				}
-			}
-		}
-		return true
-	})
+			return true
+		})
+	}
+	for _, st := range file.Stmts {
+		walkStmt(st, false)
+	}
 	if blockErr != nil {
 		return nil, blockErr
 	}
 	return file, nil
+}
+
+func isTrackedSeqIdent(e syntax.Expr, seqVars map[string]bool) bool {
+	if id, ok := e.(*syntax.Ident); ok {
+		return seqVars[id.Name]
+	}
+	if p, ok := e.(*syntax.ParenExpr); ok {
+		return isTrackedSeqIdent(p.X, seqVars)
+	}
+	return false
 }
 
 func isSequenceExpr(e syntax.Expr) bool {
@@ -233,6 +291,7 @@ func (t *ComputeTool) Execute(ctx context.Context, _ ToolContext, args ComputeAr
 		"stats":   statsModule(),
 		"finance": financeModule(),
 		"chart":   t.chartModule(&charts),
+		"range":   starlark.NewBuiltin("range", slSafeRange),
 		"round":   starlark.NewBuiltin("round", slRound),
 		"sum":     starlark.NewBuiltin("sum", slSum),
 	}
@@ -268,7 +327,41 @@ func (t *ComputeTool) Execute(ctx context.Context, _ ToolContext, args ComputeAr
 	}, nil
 }
 
-// --- Common Pythonic builtins (round, sum) for LLM ergonomics ---
+// --- Safe runtime range wrapper & Pythonic builtins (round, sum) ---
+
+// slSafeRange enforces maxStarlarkRangeLen at runtime even when range() is called with dynamic variables.
+func slSafeRange(thread *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var start, stop, step int64 = 0, 0, 1
+	switch len(args) {
+	case 1:
+		if err := starlark.UnpackPositionalArgs("range", args, kwargs, 1, &stop); err != nil {
+			return nil, err
+		}
+	case 2:
+		if err := starlark.UnpackPositionalArgs("range", args, kwargs, 2, &start, &stop); err != nil {
+			return nil, err
+		}
+	case 3:
+		if err := starlark.UnpackPositionalArgs("range", args, kwargs, 3, &start, &stop, &step); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("range: got %d arguments, want 1..3", len(args))
+	}
+	if step == 0 {
+		return nil, errors.New("range: step argument must not be zero")
+	}
+	var count int64
+	if step > 0 && stop > start {
+		count = (stop - start - 1)/step + 1
+	} else if step < 0 && stop < start {
+		count = (start - stop - 1)/(-step) + 1
+	}
+	if count > maxStarlarkRangeLen {
+		return nil, fmt.Errorf("%w: runtime range length %d exceeds %d", ErrStarlarkOOMBlocked, count, maxStarlarkRangeLen)
+	}
+	return starlark.Universe["range"].(*starlark.Builtin).CallInternal(thread, args, kwargs)
+}
 
 func slRound(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var xVal starlark.Value

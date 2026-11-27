@@ -3,8 +3,12 @@ package tool
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/iMMIQ/fatfish/internal/model"
+	"github.com/iMMIQ/fatfish/internal/transport"
 )
 
 type sampleNested struct {
@@ -47,5 +51,52 @@ func TestSchemaNoRefs(t *testing.T) {
 		if strings.Contains(raw, forbidden) {
 			t.Fatalf("frozen tool schema contains forbidden token %q: %s", forbidden, raw)
 		}
+	}
+}
+
+type stubTransport struct {
+	pokes int
+}
+
+func (s *stubTransport) Start(context.Context, func(*model.Message)) error             { return nil }
+func (s *stubTransport) StopInbound() error                                            { return nil }
+func (s *stubTransport) Stop() error                                                   { return nil }
+func (s *stubTransport) Probe(context.Context) error                                   { return nil }
+func (s *stubTransport) SelfID() string                                                { return "10001" }
+func (s *stubTransport) SendText(context.Context, model.ChannelID, string, transport.SendOptions) (string, error) {
+	return "1", nil
+}
+func (s *stubTransport) SendImage(context.Context, model.ChannelID, []byte, string, transport.SendOptions) (string, error) {
+	return "2", nil
+}
+func (s *stubTransport) SendPoke(context.Context, model.ChannelID, string) error {
+	s.pokes++
+	return nil
+}
+func (s *stubTransport) SendReaction(context.Context, model.ChannelID, string, string) error { return nil }
+func (s *stubTransport) FetchAudio(context.Context, string, string) ([]byte, string, error) {
+	return nil, "", nil
+}
+func (s *stubTransport) GetMessage(context.Context, model.ChannelID, string) (*model.Message, error) {
+	return nil, nil
+}
+func (s *stubTransport) GetForward(context.Context, string, int) ([]model.Part, error) { return nil, nil }
+
+func TestInteractPokeMaxOncePerTurn(t *testing.T) {
+	st := &stubTransport{}
+	it := NewInteractTool(st, nil)
+	tc := ToolContext{
+		ChannelID:     model.MakeChannelID("onebot", "10001", model.ChannelGroup, "99"),
+		SenderID:      "20001",
+		PokedThisTurn: &atomic.Bool{},
+	}
+	if _, err := it.Execute(context.Background(), tc, InteractArgs{Action: "poke"}); err != nil {
+		t.Fatalf("first poke should succeed: %v", err)
+	}
+	if _, err := it.Execute(context.Background(), tc, InteractArgs{Action: "poke"}); err == nil {
+		t.Fatal("second poke in same turn must be rejected")
+	}
+	if st.pokes != 1 {
+		t.Fatalf("expected exactly 1 poke sent, got %d", st.pokes)
 	}
 }

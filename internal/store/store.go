@@ -829,6 +829,110 @@ func (s *Store) PruneExpiredMedia(ctx context.Context, now time.Time) (int, erro
 	return deleted, nil
 }
 
+// EnforceMediaQuotas enforces soft per-channel (e.g. 256 MiB) and hard global (e.g. 1024 MiB)
+// byte quotas via oldest-first (LRU) eviction of media_assets and unreferenced blobs (SPEC §4.4).
+func (s *Store) EnforceMediaQuotas(ctx context.Context, roomMaxBytes, totalMaxBytes int64) (int, error) {
+	if roomMaxBytes <= 0 {
+		roomMaxBytes = 256 << 20
+	}
+	if totalMaxBytes <= 0 {
+		totalMaxBytes = 1024 << 20
+	}
+	deleted := 0
+
+	deleteAsset := func(ch, mid, sha, mime string) {
+		if _, err := s.writeDB.ExecContext(ctx,
+			`DELETE FROM media_assets WHERE channel_id = ? AND media_id = ?`, ch, mid); err != nil {
+			return
+		}
+		deleted++
+		var refs int
+		_ = s.readDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM media_assets WHERE sha256 = ?`, sha).Scan(&refs)
+		if refs == 0 {
+			_ = s.blobs.Delete(sha, mime)
+		}
+	}
+
+	// 1. Per-channel soft quota.
+	chRows, err := s.readDB.QueryContext(ctx,
+		`SELECT channel_id, SUM(byte_size) FROM media_assets GROUP BY channel_id HAVING SUM(byte_size) > ?`, roomMaxBytes)
+	if err != nil {
+		return 0, err
+	}
+	type chUsage struct {
+		ch    string
+		bytes int64
+	}
+	var overCh []chUsage
+	for chRows.Next() {
+		var u chUsage
+		if err := chRows.Scan(&u.ch, &u.bytes); err == nil {
+			overCh = append(overCh, u)
+		}
+	}
+	chRows.Close()
+
+	for _, u := range overCh {
+		rows, err := s.readDB.QueryContext(ctx,
+			`SELECT media_id, sha256, mime_type, byte_size FROM media_assets WHERE channel_id = ? ORDER BY created_at ASC`, u.ch)
+		if err != nil {
+			continue
+		}
+		type item struct {
+			mid, sha, mime string
+			size           int64
+		}
+		var items []item
+		for rows.Next() {
+			var it item
+			if err := rows.Scan(&it.mid, &it.sha, &it.mime, &it.size); err == nil {
+				items = append(items, it)
+			}
+		}
+		rows.Close()
+		cur := u.bytes
+		for _, it := range items {
+			if cur <= roomMaxBytes {
+				break
+			}
+			deleteAsset(u.ch, it.mid, it.sha, it.mime)
+			cur -= it.size
+		}
+	}
+
+	// 2. Global hard quota.
+	var totalBytes int64
+	_ = s.readDB.QueryRowContext(ctx, `SELECT COALESCE(SUM(byte_size), 0) FROM media_assets`).Scan(&totalBytes)
+	if totalBytes > totalMaxBytes {
+		rows, err := s.readDB.QueryContext(ctx,
+			`SELECT channel_id, media_id, sha256, mime_type, byte_size FROM media_assets ORDER BY created_at ASC`)
+		if err != nil {
+			return deleted, err
+		}
+		type gItem struct {
+			ch, mid, sha, mime string
+			size               int64
+		}
+		var items []gItem
+		for rows.Next() {
+			var it gItem
+			if err := rows.Scan(&it.ch, &it.mid, &it.sha, &it.mime, &it.size); err == nil {
+				items = append(items, it)
+			}
+		}
+		rows.Close()
+		for _, it := range items {
+			if totalBytes <= totalMaxBytes {
+				break
+			}
+			deleteAsset(it.ch, it.mid, it.sha, it.mime)
+			totalBytes -= it.size
+		}
+	}
+
+	return deleted, nil
+}
+
 // --- Segments & FrozenFrames (KV Prefix Cache) ---
 
 type SegmentRecord struct {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"image"
 	"image/color"
+	"image/gif"
 	"image/png"
 	"testing"
 	"time"
@@ -115,5 +116,30 @@ func TestBlobStoreCanonicalAndChannelMediaOwnership(t *testing.T) {
 	}
 	if _, err := st.GetMediaAsset(ctx, ch2, asset.MediaID); err == nil {
 		t.Fatalf("expected cross-channel media access to fail")
+	}
+
+	// Animated GIF must store canonical static image for LLM AND preserve raw GIF for send_media.
+	pal := color.Palette{color.RGBA{0, 0, 0, 255}, color.RGBA{255, 0, 0, 255}}
+	f1 := image.NewPaletted(image.Rect(0, 0, 8, 8), pal)
+	f2 := image.NewPaletted(image.Rect(0, 0, 8, 8), pal)
+	f2.SetColorIndex(1, 1, 1)
+	var gifBuf bytes.Buffer
+	if err := gif.EncodeAll(&gifBuf, &gif.GIF{Image: []*image.Paletted{f1, f2}, Delay: []int{10, 10}}); err != nil {
+		t.Fatalf("gif encode: %v", err)
+	}
+	gb, err := st.Blobs().PutImage(gifBuf.Bytes())
+	if err != nil {
+		t.Fatalf("PutImage gif: %v", err)
+	}
+	rawMedia, rawMime, err := st.Blobs().ReadMediaBytes(gb.SHA256, gb.MimeType)
+	if err != nil || rawMime != "image/gif" || !bytes.Equal(rawMedia, gifBuf.Bytes()) {
+		t.Fatalf("expected preserved raw animated GIF, mime=%q err=%v", rawMime, err)
+	}
+
+	// EnforceMediaQuotas must evict oldest assets when channel exceeds quota.
+	_, _ = st.RegisterMediaAsset(ctx, ch1, "u1", gb, time.Hour)
+	evicted, err := st.EnforceMediaQuotas(ctx, 1, 1)
+	if err != nil || evicted < 1 {
+		t.Fatalf("expected EnforceMediaQuotas to evict assets, evicted=%d err=%v", evicted, err)
 	}
 }

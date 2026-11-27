@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -91,7 +92,8 @@ func New(configPath string, enableTransport bool) (*App, error) {
 	reg := tool.NewRegistry(time.Duration(cfg.Tools.DefaultTimeoutSec) * time.Second)
 	computeTool := tool.NewComputeTool(cfg.Tools.ChartFontPath, cfg.Tools.StarlarkMaxSteps, cfg.Tools.StarlarkTimeoutSec)
 
-	// Scheduler needs room dispatcher; wire via late pointer after RoomManager creation.
+	// Single Scheduler instance wired to RoomManager via late-bound dispatcher closure
+	// so ScheduleTool and App.Sched always share the exact same live Scheduler.
 	var roomDisp *room.Manager
 	sched := cron.NewScheduler(
 		st, hub,
@@ -106,9 +108,14 @@ func New(configPath string, enableTransport bool) (*App, error) {
 		cfg.Models.Embed.Dim,
 		logger,
 	)
+	sched.SetMediaQuotas(cfg.Frame.RoomMediaMiB, cfg.Frame.TotalMediaMiB)
 
 	// Register all 10 high-leverage built-in tools (SPEC 10.2).
-	if err := registerBuiltins(reg, cfg, st, hub, memSvc, stkEng, sched, tr, computeTool); err != nil {
+	webSearchTool := tool.NewWebSearchTool(cfg.Tools.SSRFAllowHosts)
+	readSourceTool := tool.NewReadSourceTool(hub, cfg.Tools.SSRFAllowHosts)
+	quoteTool := tool.NewQuoteTool(cfg.Tools.SSRFAllowHosts)
+	interactTool := tool.NewInteractTool(tr, cfg.Tools.AllowRelayChannels)
+	if err := registerBuiltins(reg, st, memSvc, stkEng, sched, computeTool, webSearchTool, readSourceTool, quoteTool, interactTool); err != nil {
 		_ = st.Close()
 		return nil, err
 	}
@@ -138,14 +145,6 @@ func New(configPath string, enableTransport bool) (*App, error) {
 		Transport: tr,
 		Logger:    logger,
 	})
-	// Re-create scheduler bound directly to RoomManager so cron posts SystemTriggerEvent into Rooms.
-	sched = cron.NewScheduler(
-		st, hub, roomDisp, cfg.Location(),
-		cfg.Tools.MaxSchedulesPerChannel,
-		cfg.Tools.MinCronIntervalMinutes,
-		cfg.Models.Embed.Dim,
-		logger,
-	)
 	sched.SetMemoryHooks(memSvc, pol)
 
 	var conSrv *console.Server
@@ -167,13 +166,21 @@ func New(configPath string, enableTransport bool) (*App, error) {
 		}
 	}
 
-	// Wire atomic config hot-reload callbacks.
+	// Wire comprehensive atomic config hot-reload callbacks across all subsystems.
 	cfgMgr.OnReload(func(newCfg *config.Config) {
 		if err := pol.Update(newCfg.Policy); err != nil {
 			logger.Error("policy reload failed", "err", err)
 			return
 		}
 		hub.UpdateConfig(newCfg.Models)
+		fb.UpdateConfig(newCfg.Frame)
+		stkEng.UpdateConfig(newCfg.Sticker)
+		sched.SetMediaQuotas(newCfg.Frame.RoomMediaMiB, newCfg.Frame.TotalMediaMiB)
+		roomDisp.UpdateHTTPClient(newCfg.Tools.SSRFAllowHosts)
+		webSearchTool.UpdateAllowHosts(newCfg.Tools.SSRFAllowHosts)
+		readSourceTool.UpdateAllowHosts(newCfg.Tools.SSRFAllowHosts)
+		quoteTool.UpdateAllowHosts(newCfg.Tools.SSRFAllowHosts)
+		interactTool.UpdateAllowRelayChannels(newCfg.Tools.AllowRelayChannels)
 		logger.Info("configuration hot-reloaded")
 	})
 
@@ -200,14 +207,15 @@ func New(configPath string, enableTransport bool) (*App, error) {
 
 func registerBuiltins(
 	reg *tool.Registry,
-	cfg *config.Config,
 	st *store.Store,
-	hub *infer.Hub,
 	mem *memory.Service,
 	stk *sticker.Engine,
 	sched *cron.Scheduler,
-	tr transport.Transport,
 	comp *tool.ComputeTool,
+	webSearch *tool.WebSearchTool,
+	readSource *tool.ReadSourceTool,
+	quote *tool.QuoteTool,
+	interact *tool.InteractTool,
 ) error {
 	if err := tool.Register[tool.RecallArgs](reg, tool.NewRecallTool(mem)); err != nil {
 		return err
@@ -215,16 +223,16 @@ func registerBuiltins(
 	if err := tool.Register[tool.NoteArgs](reg, tool.NewNoteTool(st)); err != nil {
 		return err
 	}
-	if err := tool.Register[tool.WebSearchArgs](reg, tool.NewWebSearchTool(cfg.Tools.SSRFAllowHosts)); err != nil {
+	if err := tool.Register[tool.WebSearchArgs](reg, webSearch); err != nil {
 		return err
 	}
-	if err := tool.Register[tool.ReadSourceArgs](reg, tool.NewReadSourceTool(hub, cfg.Tools.SSRFAllowHosts)); err != nil {
+	if err := tool.Register[tool.ReadSourceArgs](reg, readSource); err != nil {
 		return err
 	}
 	if err := tool.Register[tool.ComputeArgs](reg, comp); err != nil {
 		return err
 	}
-	if err := tool.Register[tool.QuoteArgs](reg, tool.NewQuoteTool(cfg.Tools.SSRFAllowHosts)); err != nil {
+	if err := tool.Register[tool.QuoteArgs](reg, quote); err != nil {
 		return err
 	}
 	if err := tool.Register[tool.ScheduleArgs](reg, tool.NewScheduleTool(sched, st)); err != nil {
@@ -236,7 +244,7 @@ func registerBuiltins(
 	if err := tool.Register[tool.SendMediaArgs](reg, tool.NewSendMediaTool(st)); err != nil {
 		return err
 	}
-	if err := tool.Register[tool.InteractArgs](reg, tool.NewInteractTool(tr, cfg.Tools.AllowRelayChannels)); err != nil {
+	if err := tool.Register[tool.InteractArgs](reg, interact); err != nil {
 		return err
 	}
 	return nil
@@ -289,13 +297,28 @@ func (a *App) Serve(ctx context.Context) error {
 	a.Logger.Info("shutdown signal received, draining up to 15s...")
 
 	// Graceful Shutdown sequence (SPEC 11.3):
-	// 1. Close inbound transport reception.
+	// 1. Stop accepting new inbound transport events while keeping outbound WS open for in-flight deliveries.
+	if a.Trans != nil {
+		_ = a.Trans.StopInbound()
+	}
+	// 2. Wait up to 15s concurrently for in-flight LLM turns, bubble deliveries, and pending async sticker tasks.
+	var drainWG sync.WaitGroup
+	drainWG.Add(2)
+	go func() {
+		defer drainWG.Done()
+		a.Rooms.Drain(15 * time.Second)
+	}()
+	go func() {
+		defer drainWG.Done()
+		if a.Stickers != nil {
+			a.Stickers.Drain(15 * time.Second)
+		}
+	}()
+	drainWG.Wait()
+	// 3. Close transport socket, shutdown console, close MCP, flush WAL PASSIVE & close SQLite pools.
 	if a.Trans != nil {
 		_ = a.Trans.Stop()
 	}
-	// 2. Wait up to 15s for in-flight LLM turns & bubble deliveries.
-	a.Rooms.Drain(15 * time.Second)
-	// 3. Shutdown console, close MCP, flush WAL PASSIVE & close SQLite pools.
 	if a.Console != nil {
 		sdCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		_ = a.Console.Shutdown(sdCtx)
@@ -311,7 +334,8 @@ func (a *App) Serve(ctx context.Context) error {
 	return nil
 }
 
-// Check runs all pre-flight diagnostics for `fatfish check`.
+// Check runs all pre-flight diagnostics for `fatfish check` (SPEC §11.1):
+// YAML + expr rules, bundled .ttf font, pdftotext, frozen tools, transport, inference endpoints, and MCP servers.
 func (a *App) Check(ctx context.Context) error {
 	cfg := a.Config.Get()
 	fmt.Printf("[OK] YAML config parsed & %d policy expr rules compiled\n", 3+len(cfg.Policy.Overrides))
@@ -329,11 +353,36 @@ func (a *App) Check(ctx context.Context) error {
 
 	fmt.Printf("[OK] Frozen tool registry ready (%d tools, hash=%s)\n", len(a.Registry.Definitions()), a.Registry.Hash()[:12])
 
-	for _, role := range []string{"primary", "fast", "distill", "embed", "rerank", "asr"} {
-		if err := a.Hub.ProbeEndpoint(ctx, role); err != nil {
-			fmt.Printf("[WARN] inference endpoint %-8s: %v\n", role, err)
+	// Probe OneBot transport connectivity/config.
+	if cfg.Transport.OneBot.WSListen != "" || cfg.Transport.OneBot.WSURL != "" {
+		tr := onebot.New(cfg.Transport.OneBot, a.Logger)
+		if err := tr.Probe(ctx); err != nil {
+			fmt.Printf("[WARN] transport onebot          : %v\n", err)
 		} else {
-			fmt.Printf("[OK] inference endpoint %-8s reachable\n", role)
+			fmt.Printf("[OK] transport onebot ready\n")
+		}
+	}
+
+	roles := []string{"primary", "fast", "distill", "embed", "rerank", "asr"}
+	if cfg.Models.Translate.IsEnabled() {
+		roles = append(roles, "translate")
+	}
+	for _, role := range roles {
+		if err := a.Hub.ProbeEndpoint(ctx, role); err != nil {
+			fmt.Printf("[WARN] inference endpoint %-9s: %v\n", role, err)
+		} else {
+			fmt.Printf("[OK] inference endpoint %-9s reachable\n", role)
+		}
+	}
+
+	// Probe configured MCP servers.
+	if len(cfg.MCP.Servers) > 0 && a.MCP != nil {
+		for name, err := range a.MCP.Probe(ctx, cfg.MCP.Servers) {
+			if err != nil {
+				fmt.Printf("[WARN] mcp server %-14s: %v\n", name, err)
+			} else {
+				fmt.Printf("[OK] mcp server %-14s reachable\n", name)
+			}
 		}
 	}
 	return nil

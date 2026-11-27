@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/iMMIQ/fatfish/internal/cron"
@@ -18,9 +20,11 @@ import (
 // --- 1. recall ---
 
 type RecallArgs struct {
-	Mode   string `json:"mode" jsonschema:"required,enum=recent,enum=raw,enum=memory,description=Retrieval mode: recent (latest raw messages), raw (FTS5 keyword/sender search), memory (L1 episodes + L2 profiles/lore/notes/digests)"`
+	Mode   string `json:"mode" jsonschema:"required,enum=recent,enum=raw,enum=memory,description=Retrieval mode: recent (latest raw messages), raw (FTS5 keyword/sender/date search), memory (L1 episodes + L2 profiles/lore/notes/digests)"`
 	Query  string `json:"query,omitempty" jsonschema:"description=Search keywords or semantic question"`
 	Sender string `json:"sender,omitempty" jsonschema:"description=Optional member nickname, historical alias, or member ID"`
+	Since  string `json:"since,omitempty" jsonschema:"description=Optional inclusive start date/time filter (YYYY-MM-DD, YYYY-MM-DD HH:MM, or RFC3339)"`
+	Until  string `json:"until,omitempty" jsonschema:"description=Optional inclusive end date/time filter (YYYY-MM-DD, YYYY-MM-DD HH:MM, or RFC3339)"`
 	Limit  int    `json:"limit,omitempty" jsonschema:"description=Max items to return (default 15, max 50)"`
 }
 
@@ -32,21 +36,44 @@ func NewRecallTool(mem *memory.Service) *RecallTool { return &RecallTool{mem: me
 func (t *RecallTool) Name() string                  { return "recall" }
 func (t *RecallTool) ReadOnly() bool                { return true }
 func (t *RecallTool) Description() string {
-	return "Search current channel history, member aliases, episodic memories, profiles, lore, notes, and daily digests."
+	return "Search current channel history, member aliases, date ranges, episodic memories, profiles, lore, notes, and daily digests."
 }
 
 func (t *RecallTool) Execute(ctx context.Context, tc ToolContext, args RecallArgs) (ToolResult, error) {
+	sinceMs := parseOptionalTimeMs(args.Since, false)
+	untilMs := parseOptionalTimeMs(args.Until, true)
 	res, err := t.mem.Recall(ctx, memory.RecallOptions{
 		ChannelID: tc.ChannelID, // Strictly enforced from ToolContext, never LLM args
 		Mode:      args.Mode,
 		Query:     args.Query,
 		Sender:    args.Sender,
+		SinceMs:   sinceMs,
+		UntilMs:   untilMs,
 		Limit:     args.Limit,
 	})
 	if err != nil {
 		return ToolResult{}, err
 	}
 	return ToolResult{TextForLLM: res.Summary}, nil
+}
+
+func parseOptionalTimeMs(raw string, endOfDay bool) int64 {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.UnixMilli()
+	}
+	for _, layout := range []string{"2006-01-02 15:04:05", "2006-01-02 15:04", "2006-01-02T15:04:05", "2006-01-02"} {
+		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			if layout == "2006-01-02" && endOfDay {
+				t = t.Add(24*time.Hour - time.Millisecond)
+			}
+			return t.UnixMilli()
+		}
+	}
+	return 0
 }
 
 // --- 2. note ---
@@ -240,12 +267,16 @@ func (t *SendStickerTool) Execute(ctx context.Context, tc ToolContext, args Send
 		return ToolResult{}, err
 	}
 	_ = t.store.RecordStickerUse(ctx, tc.ChannelID, hit.Sticker.StickerID)
+	ext := filepath.Ext(hit.Sticker.RelPath)
+	if ext == "" {
+		ext = ".png"
+	}
 	return ToolResult{
 		TextForLLM: fmt.Sprintf("Selected sticker %s (%s).", hit.Sticker.StickerID, hit.Sticker.ContentText),
 		DirectMedia: []model.DirectMedia{{
 			Data:     raw,
-			MimeType: "image/png",
-			Filename: hit.Sticker.StickerID + ".png",
+			MimeType: sticker.MimeTypeFor(hit.Sticker),
+			Filename: hit.Sticker.StickerID + ext,
 		}},
 	}, nil
 }
@@ -273,7 +304,7 @@ func (t *SendMediaTool) Execute(ctx context.Context, tc ToolContext, args SendMe
 	if err != nil {
 		return ToolResult{}, fmt.Errorf("media_id %q not found in current channel", args.MediaID)
 	}
-	raw, err := t.store.Blobs().ReadBytes(asset.SHA256, asset.MimeType)
+	raw, mimeType, err := t.store.Blobs().ReadMediaBytes(asset.SHA256, asset.MimeType)
 	if err != nil {
 		return ToolResult{}, err
 	}
@@ -281,7 +312,7 @@ func (t *SendMediaTool) Execute(ctx context.Context, tc ToolContext, args SendMe
 		TextForLLM: fmt.Sprintf("Queued image %s for direct delivery.", asset.MediaID),
 		DirectMedia: []model.DirectMedia{{
 			Data:     raw,
-			MimeType: asset.MimeType,
+			MimeType: mimeType,
 			MediaID:  asset.MediaID,
 			SHA256:   asset.SHA256,
 		}},
@@ -298,22 +329,34 @@ type InteractArgs struct {
 }
 
 type InteractTool struct {
-	tr            transport.Transport
-	allowRelays   map[string]struct{}
+	tr          transport.Transport
+	mu          sync.RWMutex
+	allowRelays map[string]struct{}
 }
 
 func NewInteractTool(tr transport.Transport, allowRelayChannels []string) *InteractTool {
-	allow := make(map[string]struct{}, len(allowRelayChannels))
-	for _, c := range allowRelayChannels {
-		allow[strings.TrimSpace(c)] = struct{}{}
+	t := &InteractTool{tr: tr}
+	t.UpdateAllowRelayChannels(allowRelayChannels)
+	return t
+}
+
+// UpdateAllowRelayChannels hot-reloads the allowed relay channel allowlist.
+func (t *InteractTool) UpdateAllowRelayChannels(channels []string) {
+	allow := make(map[string]struct{}, len(channels))
+	for _, c := range channels {
+		if s := strings.TrimSpace(c); s != "" {
+			allow[s] = struct{}{}
+		}
 	}
-	return &InteractTool{tr: tr, allowRelays: allow}
+	t.mu.Lock()
+	t.allowRelays = allow
+	t.mu.Unlock()
 }
 
 func (t *InteractTool) Name() string   { return "interact" }
 func (t *InteractTool) ReadOnly() bool { return false }
 func (t *InteractTool) Description() string {
-	return "Perform social interactions: poke the triggering sender, react with an emoji on the trigger message, or relay (admin + allowlist only)."
+	return "Perform social interactions: poke the triggering sender (max once per turn), react with an emoji on the trigger message, or relay (admin + allowlist only)."
 }
 
 func (t *InteractTool) Execute(ctx context.Context, tc ToolContext, args InteractArgs) (ToolResult, error) {
@@ -322,6 +365,10 @@ func (t *InteractTool) Execute(ctx context.Context, tc ToolContext, args Interac
 	}
 	switch strings.ToLower(strings.TrimSpace(args.Action)) {
 	case "poke":
+		// Enforce SPEC §10.2 max once/turn poke limit.
+		if tc.PokedThisTurn != nil && !tc.PokedThisTurn.CompareAndSwap(false, true) {
+			return ToolResult{}, errors.New("interact.poke is limited to at most once per turn")
+		}
 		pokeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
 		if err := t.tr.SendPoke(pokeCtx, tc.ChannelID, tc.SenderID); err != nil {
@@ -344,7 +391,10 @@ func (t *InteractTool) Execute(ctx context.Context, tc ToolContext, args Interac
 			return ToolResult{}, errors.New("interact.relay is restricted to administrators")
 		}
 		target := strings.TrimSpace(args.TargetChannel)
-		if _, ok := t.allowRelays[target]; !ok {
+		t.mu.RLock()
+		_, ok := t.allowRelays[target]
+		t.mu.RUnlock()
+		if !ok {
 			return ToolResult{}, fmt.Errorf("interact.relay target %q is not in allow_relay_channels", target)
 		}
 		if strings.TrimSpace(args.Text) == "" {

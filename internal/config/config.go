@@ -36,6 +36,7 @@ type Config struct {
 
 	// Runtime-populated metadata (not serialized to YAML).
 	ConfigPath  string `yaml:"-"`
+	PersonaPath string `yaml:"-"`
 	PersonaText string `yaml:"-"`
 	PersonaHash string `yaml:"-"`
 }
@@ -471,6 +472,11 @@ func loadPersona(cfg *Config, baseDir string) error {
 		if err != nil {
 			return fmt.Errorf("config: read persona %s: %w", cfg.Persona.File, err)
 		}
+		if absP, aerr := filepath.Abs(p); aerr == nil {
+			cfg.PersonaPath = absP
+		} else {
+			cfg.PersonaPath = p
+		}
 		cfg.PersonaText = strings.TrimSpace(string(data))
 	}
 	sum := sha256.Sum256([]byte(cfg.PersonaText))
@@ -643,7 +649,24 @@ func (m *Manager) SaveAndReload(raw []byte) (*Config, error) {
 	return cfg, nil
 }
 
-// Watch monitors the config file's parent directory via fsnotify and reloads on edits.
+// SavePersona atomically updates the active persona markdown file and hot-reloads config (rotating PersonaHash).
+func (m *Manager) SavePersona(text string) (*Config, error) {
+	cur := m.cur.Load()
+	if cur == nil || strings.TrimSpace(cur.PersonaPath) == "" {
+		return nil, errors.New("config: persona.file is not configured")
+	}
+	tmp := cur.PersonaPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(text), 0o600); err != nil {
+		return nil, fmt.Errorf("config: write persona temp file: %w", err)
+	}
+	if err := os.Rename(tmp, cur.PersonaPath); err != nil {
+		_ = os.Remove(tmp)
+		return nil, fmt.Errorf("config: rename persona file: %w", err)
+	}
+	return m.Reload()
+}
+
+// Watch monitors the config file's parent directory (and persona.file directory if separate) via fsnotify and reloads on edits.
 func (m *Manager) Watch(ctx context.Context, onErr func(error)) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -659,6 +682,14 @@ func (m *Manager) Watch(ctx context.Context, onErr func(error)) error {
 		_ = watcher.Close()
 		return err
 	}
+	watchedNames := map[string]bool{base: true}
+	if cur := m.cur.Load(); cur != nil && cur.PersonaPath != "" {
+		pDir := filepath.Dir(cur.PersonaPath)
+		if pDir != dir {
+			_ = watcher.Add(pDir)
+		}
+		watchedNames[filepath.Base(cur.PersonaPath)] = true
+	}
 	go func() {
 		defer watcher.Close()
 		var debounce *time.Timer
@@ -673,7 +704,7 @@ func (m *Manager) Watch(ctx context.Context, onErr func(error)) error {
 				if !ok {
 					return
 				}
-				if filepath.Base(ev.Name) != base {
+				if !watchedNames[filepath.Base(ev.Name)] {
 					continue
 				}
 				if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) == 0 {

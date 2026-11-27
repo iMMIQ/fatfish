@@ -62,7 +62,7 @@
 
 {{else if eq .Page "dashboard"}}
   <div class="grid">
-    <div class="card"><div class="muted">Go Heap Alloc</div><div class="kpi">{{printf "%.1f" .HeapMiB}} MiB</div></div>
+    <div class="card"><div class="muted">Process RSS / Go Heap</div><div class="kpi">{{printf "%.1f" .RSSMiB}} <span class="muted">MiB (heap {{printf "%.1f" .HeapMiB}})</span></div></div>
     <div class="card"><div class="muted">Goroutines</div><div class="kpi">{{.Goroutines}}</div></div>
     <div class="card"><div class="muted">Active Rooms</div><div class="kpi">{{.ActiveRooms}}</div></div>
     <div class="card"><div class="muted">KV Prefix Cache Hit Rate</div><div class="kpi">{{printf "%.1f%%" .KVHitRate}}</div></div>
@@ -100,6 +100,14 @@
 
   <div class="card">
     <h2>Recent KV Cache Telemetry</h2>
+    {{if .KVMetrics}}
+    <div style="display:flex;align-items:flex-end;gap:4px;height:68px;padding:8px 4px;margin-bottom:10px;background:#0b1220;border:1px solid var(--border);border-radius:6px;">
+      {{range .KVMetrics}}
+      {{$p := pct .CachedTokens .PromptTokens}}
+      <div title="#{{.SegmentID}} {{printf "%.1f%%" $p}} ({{.CachedTokens}}/{{.PromptTokens}})" style="flex:1;height:{{if gt .PromptTokens 0}}{{printf "%.0f%%" $p}}{{else}}2px{{end}};min-height:2px;background:var(--accent);border-radius:2px 2px 0 0;"></div>
+      {{end}}
+    </div>
+    {{end}}
     <table>
       <thead><tr><th>Channel</th><th>Segment</th><th>Prompt</th><th>Cached</th><th>Hit %</th><th>Latency</th></tr></thead>
       <tbody>
@@ -116,11 +124,24 @@
 
 {{else if eq .Page "config"}}
   <div class="card">
-    <h2>YAML Configuration & expr Policy Live Editor</h2>
-    <p class="muted">Saving compiles every expr rule before atomically swapping live config. Invalid syntax is rejected cleanly.</p>
-    <form hx-post="/api/config/save" hx-target="#cfg-status" hx-swap="innerHTML">
-      <textarea name="yaml" rows="24">{{.ConfigYAML}}</textarea>
+    <h2>Persona Markdown Editor</h2>
+    <p class="muted">Saving updates persona.file atomically and rotates segment scope_hash cleanly.</p>
+    <form hx-post="/api/persona/save" hx-target="#persona-status" hx-swap="innerHTML">
+      <textarea name="persona" rows="10">{{.PersonaMD}}</textarea>
       <div style="margin-top:10px;display:flex;gap:10px;align-items:center;">
+        <button type="submit">Save Persona</button>
+        <div id="persona-status"></div>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>YAML Configuration & expr Policy Live Editor</h2>
+    <p class="muted">Dry-run or save compiles every expr rule before atomically swapping live config. Invalid syntax is rejected cleanly.</p>
+    <form hx-post="/api/config/save" hx-target="#cfg-status" hx-swap="innerHTML">
+      <textarea id="cfg-yaml" name="yaml" rows="24">{{.ConfigYAML}}</textarea>
+      <div style="margin-top:10px;display:flex;gap:10px;align-items:center;">
+        <button type="button" class="secondary" hx-post="/api/config/validate" hx-include="#cfg-yaml" hx-target="#cfg-status" hx-swap="innerHTML">Dry-Run Validate</button>
         <button type="submit">Validate & Atomic Save</button>
         <div id="cfg-status"></div>
       </div>
@@ -176,7 +197,19 @@
   </div>
 
   <div class="card">
-    <h3>L2 Profiles & Lore</h3>
+    <h3>L2 Channel Lore</h3>
+    <table>
+      <thead><tr><th>Term</th><th>Meaning</th><th>Confidence</th></tr></thead>
+      <tbody>
+        {{range .Lore}}
+        <tr><td>{{.Term}}</td><td>{{.Meaning}}</td><td class="muted">{{printf "%.2f" .Confidence}}</td></tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>L2 Member Profiles</h3>
     <table>
       <thead><tr><th>Member ID</th><th>Corroborated Facts</th><th>Separated Jokes</th></tr></thead>
       <tbody>

@@ -9,13 +9,16 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/iMMIQ/fatfish/internal/config"
 	"github.com/iMMIQ/fatfish/internal/infer"
 	"github.com/iMMIQ/fatfish/internal/model"
+	"github.com/iMMIQ/fatfish/internal/policy"
 	"github.com/iMMIQ/fatfish/internal/room"
 	"github.com/iMMIQ/fatfish/internal/sticker"
 	"github.com/iMMIQ/fatfish/internal/store"
@@ -97,7 +100,9 @@ func (s *Server) routes() http.Handler {
 	// Protected routes
 	mux.Handle("GET /{$}", s.auth(http.HandlerFunc(s.handleDashboard)))
 	mux.Handle("GET /config", s.auth(http.HandlerFunc(s.handleConfigPage)))
+	mux.Handle("POST /api/config/validate", s.auth(http.HandlerFunc(s.handleConfigValidate)))
 	mux.Handle("POST /api/config/save", s.auth(http.HandlerFunc(s.handleConfigSave)))
+	mux.Handle("POST /api/persona/save", s.auth(http.HandlerFunc(s.handlePersonaSave)))
 	mux.Handle("GET /memory", s.auth(http.HandlerFunc(s.handleMemoryPage)))
 	mux.Handle("POST /api/memory/note", s.auth(http.HandlerFunc(s.handleNoteSave)))
 	mux.Handle("POST /api/memory/note/delete", s.auth(http.HandlerFunc(s.handleNoteDelete)))
@@ -199,6 +204,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 	_ = s.tmpl.Execute(w, map[string]any{
 		"Page":        "dashboard",
+		"RSSMiB":      readProcessRSSMiB(ms),
 		"HeapMiB":     float64(ms.Alloc) / (1024 * 1024),
 		"Goroutines":  runtime.NumGoroutine(),
 		"ActiveRooms": activeRooms,
@@ -209,17 +215,75 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func readProcessRSSMiB(ms runtime.MemStats) float64 {
+	if raw, err := os.ReadFile("/proc/self/statm"); err == nil {
+		fields := strings.Fields(string(raw))
+		if len(fields) >= 2 {
+			if pages, err := strconv.ParseInt(fields[1], 10, 64); err == nil && pages > 0 {
+				return float64(pages*int64(os.Getpagesize())) / (1024 * 1024)
+			}
+		}
+	}
+	return float64(ms.Sys) / (1024 * 1024)
+}
+
 func (s *Server) handleConfigPage(w http.ResponseWriter, _ *http.Request) {
 	rawYAML := ""
-	if s.deps.Config != nil && s.deps.Config.Get() != nil && s.deps.Config.Get().ConfigPath != "" {
-		if b, err := os.ReadFile(s.deps.Config.Get().ConfigPath); err == nil {
-			rawYAML = string(b)
+	personaMD := ""
+	if s.deps.Config != nil && s.deps.Config.Get() != nil {
+		cfg := s.deps.Config.Get()
+		if cfg.ConfigPath != "" {
+			if b, err := os.ReadFile(cfg.ConfigPath); err == nil {
+				rawYAML = string(b)
+			}
+		}
+		if cfg.PersonaPath != "" {
+			if b, err := os.ReadFile(cfg.PersonaPath); err == nil {
+				personaMD = string(b)
+			}
+		} else {
+			personaMD = cfg.PersonaText
 		}
 	}
 	_ = s.tmpl.Execute(w, map[string]any{
 		"Page":       "config",
 		"ConfigYAML": rawYAML,
+		"PersonaMD":  personaMD,
 	})
+}
+
+func (s *Server) handleConfigValidate(w http.ResponseWriter, r *http.Request) {
+	raw := []byte(r.FormValue("yaml"))
+	baseDir := ""
+	if s.deps.Config != nil && s.deps.Config.Get() != nil && s.deps.Config.Get().ConfigPath != "" {
+		baseDir = filepath.Dir(s.deps.Config.Get().ConfigPath)
+	}
+	cfg, err := config.ParseBytes(raw, baseDir)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprintf(w, `<span class="badge err">Dry-Run Failed: %s</span>`, html.EscapeString(err.Error()))
+		return
+	}
+	if err := policy.ValidateConfig(cfg); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprintf(w, `<span class="badge err">Expr Validation Failed: %s</span>`, html.EscapeString(err.Error()))
+		return
+	}
+	_, _ = w.Write([]byte(`<span class="badge ok">Dry-Run Validated (YAML + all expr rules OK)</span>`))
+}
+
+func (s *Server) handlePersonaSave(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Config == nil {
+		http.Error(w, "config manager unavailable", http.StatusInternalServerError)
+		return
+	}
+	text := r.FormValue("persona")
+	if _, err := s.deps.Config.SavePersona(text); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprintf(w, `<span class="badge err">Save Failed: %s</span>`, html.EscapeString(err.Error()))
+		return
+	}
+	_, _ = w.Write([]byte(`<span class="badge ok">Persona Saved & Hot-Reloaded</span>`))
 }
 
 func (s *Server) handleConfigSave(w http.ResponseWriter, r *http.Request) {
@@ -250,11 +314,13 @@ func (s *Server) handleMemoryPage(w http.ResponseWriter, r *http.Request) {
 	var notes []model.Note
 	var episodes []model.Episode
 	var profiles []model.MemberProfile
+	var lore []model.LoreEntry
 	if selected != "" && s.deps.Store != nil {
 		ch := model.ChannelID(selected)
 		notes, _ = s.deps.Store.ListNotes(ctx, ch, false)
 		episodes, _, _ = s.deps.Store.ListEpisodes(ctx, ch, 30)
 		profiles, _ = s.deps.Store.ListProfiles(ctx, ch, 30)
+		lore, _ = s.deps.Store.ListLore(ctx, ch, 50)
 	}
 	_ = s.tmpl.Execute(w, map[string]any{
 		"Page":            "memory",
@@ -263,6 +329,7 @@ func (s *Server) handleMemoryPage(w http.ResponseWriter, r *http.Request) {
 		"Notes":           notes,
 		"Episodes":        episodes,
 		"Profiles":        profiles,
+		"Lore":            lore,
 	})
 }
 
@@ -339,7 +406,11 @@ func (s *Server) handleStickerApprove(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(html.EscapeString(err.Error())))
 		return
 	}
-	_, _ = w.Write([]byte(`<span class="badge ok">Approved</span>`))
+	// Refresh live RAM index & embed vectors immediately so approved sticker is searchable right away.
+	if s.deps.Stickers != nil {
+		_ = s.deps.Stickers.ReindexOne(r.Context(), id)
+	}
+	_, _ = w.Write([]byte(`<span class="badge ok">Approved & Indexed</span>`))
 }
 
 func (s *Server) handleLogsPage(w http.ResponseWriter, _ *http.Request) {

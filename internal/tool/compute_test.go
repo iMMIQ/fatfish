@@ -21,6 +21,10 @@ func TestStarlarkOOMBlocked(t *testing.T) {
 		`x = 100000000 * [1]`,
 		`x = range(100000000)`,
 		`x = [0] * (1000 * 1000)`,
+		"n = 100000000\nx = [0] * n",
+		"n = 100000000\nx = range(n)",
+		"n = 100000000\nx = [0]\nx *= n",
+		"x = [0]\nfor i in range(30):\n    x = x + x",
 	}
 	for _, code := range attacks {
 		_, err := ct.Execute(context.Background(), ToolContext{}, ComputeArgs{Code: code})
