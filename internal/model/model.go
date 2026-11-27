@@ -69,6 +69,7 @@ const (
 	PartForward PartKind = "forward"
 	PartMention PartKind = "mention"
 	PartNotice  PartKind = "notice"
+	PartLink    PartKind = "link"
 )
 
 // Part represents a single normalized content segment in a Message.
@@ -137,6 +138,17 @@ func (m Message) PlainText() string {
 					b.WriteByte(' ')
 				}
 				b.WriteString(strings.TrimSpace(p.Title + " " + p.Summary))
+			}
+		case PartLink:
+			txt := strings.TrimSpace(p.Text)
+			if txt == "" {
+				txt = strings.TrimSpace(p.Title + " " + p.Summary)
+			}
+			if txt != "" {
+				if b.Len() > 0 {
+					b.WriteByte(' ')
+				}
+				b.WriteString(txt)
 			}
 		case PartFile:
 			if p.Title != "" {

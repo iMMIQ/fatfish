@@ -11,9 +11,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
-	"os/exec"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,6 +22,7 @@ import (
 
 	"github.com/iMMIQ/fatfish/internal/infer"
 	"github.com/iMMIQ/fatfish/internal/netutil"
+	"github.com/iMMIQ/fatfish/internal/parser"
 	"github.com/iMMIQ/fatfish/internal/vec"
 )
 
@@ -248,16 +246,18 @@ func (t *WebSearchTool) searchArxiv(ctx context.Context, q string, limit int) (s
 // --- 4. read_source ---
 
 type ReadSourceArgs struct {
-	URL       string `json:"url" jsonschema:"required,description=URL to read (supports bilibili, b23.tv, arxiv, hf-mirror/huggingface, generic web pages, and .pdf/.xlsx/.docx/.txt files)"`
+	URL       string `json:"url" jsonschema:"required,description=URL to read (supports bilibili, b23.tv, github, arxiv, hf-mirror/huggingface, x/twitter, weixin articles, generic web pages, and .pdf/.xlsx/.docx/.txt files)"`
 	Query     string `json:"query,omitempty" jsonschema:"description=Optional question or keywords to semantically extract the most relevant sections from long financial reports, PDFs, or spreadsheets"`
 	Pages     string `json:"pages,omitempty" jsonschema:"description=Optional PDF page range e.g. '1-5' or '12-18' for targeted reading"`
 	Translate bool   `json:"translate,omitempty" jsonschema:"description=Optionally translate long foreign text to Simplified Chinese via internal translator"`
 }
 
 type ReadSourceTool struct {
-	mu     sync.RWMutex
-	client *http.Client
-	hub    *infer.Hub
+	mu           sync.RWMutex
+	client       *http.Client
+	parser       *parser.Service
+	sharedParser bool
+	hub          *infer.Hub
 }
 
 func NewReadSourceTool(hub *infer.Hub, allowHosts []string) *ReadSourceTool {
@@ -266,15 +266,38 @@ func NewReadSourceTool(hub *infer.Hub, allowHosts []string) *ReadSourceTool {
 			Timeout:    25 * time.Second,
 			AllowHosts: allowHosts,
 		}),
+		parser: parser.NewService(parser.Options{
+			AllowHosts: allowHosts,
+			Timeout:    15 * time.Second,
+		}),
 		hub: hub,
 	}
+}
+
+// SetParser injects a shared parser.Service so read_source shares cache and site config with proactive link parsing.
+func (t *ReadSourceTool) SetParser(p *parser.Service) {
+	if p == nil {
+		return
+	}
+	t.mu.Lock()
+	t.parser = p
+	t.sharedParser = true
+	t.mu.Unlock()
 }
 
 func (t *ReadSourceTool) UpdateAllowHosts(allowHosts []string) {
 	cli := netutil.NewSafeHTTPClient(netutil.SafeClientOptions{Timeout: 25 * time.Second, AllowHosts: allowHosts})
 	t.mu.Lock()
 	t.client = cli
+	ownParser := t.parser
+	isShared := t.sharedParser
 	t.mu.Unlock()
+	if ownParser != nil && !isShared {
+		ownParser.UpdateOptions(parser.Options{
+			AllowHosts: allowHosts,
+			Timeout:    15 * time.Second,
+		})
+	}
 }
 
 func (t *ReadSourceTool) httpClient() *http.Client {
@@ -284,16 +307,18 @@ func (t *ReadSourceTool) httpClient() *http.Client {
 	return c
 }
 
+func (t *ReadSourceTool) parserSvc() *parser.Service {
+	t.mu.RLock()
+	p := t.parser
+	t.mu.RUnlock()
+	return p
+}
+
 func (t *ReadSourceTool) Name() string   { return "read_source" }
 func (t *ReadSourceTool) ReadOnly() bool { return true }
 func (t *ReadSourceTool) Description() string {
-	return "Deep-read Bilibili videos, arXiv papers, HuggingFace models, web pages, and PDF/XLSX/DOCX/TXT documents."
+	return "Deep-read Bilibili videos/dynamics, GitHub repos/issues/PRs, arXiv papers, HuggingFace models, X/Twitter posts, WeChat articles, web pages, and PDF/XLSX/DOCX/TXT documents."
 }
-
-var (
-	bvidRe    = regexp.MustCompile(`BV[0-9A-Za-z]{10}`)
-	arxivIDRe = regexp.MustCompile(`(\d{4}\.\d{4,5})(v\d+)?`)
-)
 
 func (t *ReadSourceTool) Execute(ctx context.Context, _ ToolContext, args ReadSourceArgs) (ToolResult, error) {
 	rawURL := strings.TrimSpace(args.URL)
@@ -302,18 +327,30 @@ func (t *ReadSourceTool) Execute(ctx context.Context, _ ToolContext, args ReadSo
 	}
 	u, _ := url.Parse(rawURL)
 	host := strings.ToLower(u.Hostname())
+	lowPath := strings.ToLower(u.Path)
+	firstPage, lastPage := parsePageRange(args.Pages)
+
+	// Binary office/PDF documents (or explicit PDF page ranges) use dedicated document extractors.
+	isExplicitDoc := firstPage > 0 || lastPage > 0 ||
+		strings.HasSuffix(lowPath, ".xlsx") ||
+		strings.HasSuffix(lowPath, ".docx") ||
+		(strings.HasSuffix(lowPath, ".pdf") && !strings.Contains(host, "arxiv.org"))
 
 	var content string
 	var err error
-	switch {
-	case strings.Contains(host, "b23.tv") || strings.Contains(host, "bilibili.com"):
-		content, err = t.readBilibili(ctx, rawURL)
-	case strings.Contains(host, "arxiv.org"):
-		content, err = t.readArxiv(ctx, rawURL)
-	case strings.Contains(host, "huggingface.co") || strings.Contains(host, "hf-mirror.com"):
-		content, err = t.readHuggingFace(ctx, u)
-	default:
-		firstPage, lastPage := parsePageRange(args.Pages)
+	if isExplicitDoc {
+		content, err = t.readGenericOrDoc(ctx, rawURL, firstPage, lastPage)
+	} else if psvc := t.parserSvc(); psvc != nil {
+		res, perr := psvc.Parse(ctx, rawURL, parser.ParseOptions{Deep: true})
+		if perr == nil && res != nil {
+			content = res.FormatForReadSource()
+		} else if errors.Is(perr, parser.ErrUnsupportedContent) {
+			// URL without doc suffix whose Content-Type turned out to be PDF/XLSX/DOCX.
+			content, err = t.readGenericOrDoc(ctx, rawURL, firstPage, lastPage)
+		} else {
+			err = perr
+		}
+	} else {
 		content, err = t.readGenericOrDoc(ctx, rawURL, firstPage, lastPage)
 	}
 	if err != nil {
@@ -330,209 +367,6 @@ func (t *ReadSourceTool) Execute(ctx context.Context, _ ToolContext, args ReadSo
 		}
 	}
 	return ToolResult{TextForLLM: netutil.WrapExternalData(rawURL, clipRunes(content, 8000))}, nil
-}
-
-func (t *ReadSourceTool) readBilibili(ctx context.Context, rawURL string) (string, error) {
-	bvid := bvidRe.FindString(rawURL)
-	if bvid == "" {
-		// Resolve b23.tv short link via SSRF-safe client.
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-		resp, err := t.httpClient().Do(req)
-		if err != nil {
-			return "", err
-		}
-		finalURL := resp.Request.URL.String()
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
-		bvid = bvidRe.FindString(finalURL)
-	}
-	if bvid == "" {
-		return t.readGenericOrDoc(ctx, rawURL, 0, 0)
-	}
-
-	apiURL := "https://api.bilibili.com/x/web-interface/view?bvid=" + bvid
-	body, _, _, err := netutil.FetchLimited(ctx, t.httpClient(), apiURL, 2<<20, map[string]string{"Referer": "https://www.bilibili.com/"})
-	if err != nil {
-		return "", err
-	}
-	var view struct {
-		Code int `json:"code"`
-		Data struct {
-			Aid      int64  `json:"aid"`
-			Cid      int64  `json:"cid"`
-			Bvid     string `json:"bvid"`
-			Title    string `json:"title"`
-			Desc     string `json:"desc"`
-			Duration int    `json:"duration"`
-			Owner    struct {
-				Name string `json:"name"`
-			} `json:"owner"`
-			Stat struct {
-				View  int `json:"view"`
-				Like  int `json:"like"`
-				Coin  int `json:"coin"`
-				Reply int `json:"reply"`
-			} `json:"stat"`
-			Pages []struct {
-				Cid  int64  `json:"cid"`
-				Page int    `json:"page"`
-				Part string `json:"part"`
-			} `json:"pages"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(body, &view); err != nil {
-		return "", err
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "Bilibili %s\nTitle: %s\nUP: %s | Duration: %ds | Views: %d | Likes: %d | Coins: %d\nDescription: %s\n",
-		view.Data.Bvid, view.Data.Title, view.Data.Owner.Name, view.Data.Duration,
-		view.Data.Stat.View, view.Data.Stat.Like, view.Data.Stat.Coin, view.Data.Desc)
-	if len(view.Data.Pages) > 1 {
-		b.WriteString("Pages:\n")
-		for i, p := range view.Data.Pages {
-			if i >= 10 {
-				break
-			}
-			fmt.Fprintf(&b, "  P%d: %s\n", p.Page, p.Part)
-		}
-	}
-	// Best-effort subtitle fetch via player endpoint (SPEC §10.2).
-	cid := view.Data.Cid
-	if cid == 0 && len(view.Data.Pages) > 0 {
-		cid = view.Data.Pages[0].Cid
-	}
-	if cid > 0 {
-		pURL := fmt.Sprintf("https://api.bilibili.com/x/player/v2?bvid=%s&cid=%d", bvid, cid)
-		if pBody, _, _, perr := netutil.FetchLimited(ctx, t.httpClient(), pURL, 1<<20, map[string]string{"Referer": "https://www.bilibili.com/"}); perr == nil {
-			var pl struct {
-				Data struct {
-					Subtitle struct {
-						Subtitles []struct {
-							SubtitleURL string `json:"subtitle_url"`
-						} `json:"subtitles"`
-					} `json:"subtitle"`
-				} `json:"data"`
-			}
-			if json.Unmarshal(pBody, &pl) == nil && len(pl.Data.Subtitle.Subtitles) > 0 {
-				subURL := strings.TrimSpace(pl.Data.Subtitle.Subtitles[0].SubtitleURL)
-				if strings.HasPrefix(subURL, "//") {
-					subURL = "https:" + subURL
-				}
-				if strings.HasPrefix(subURL, "http") {
-					if sBody, _, _, serr := netutil.FetchLimited(ctx, t.httpClient(), subURL, 2<<20, nil); serr == nil {
-						var sj struct {
-							Body []struct {
-								Content string `json:"content"`
-							} `json:"body"`
-						}
-						if json.Unmarshal(sBody, &sj) == nil && len(sj.Body) > 0 {
-							var lines []string
-							for _, seg := range sj.Body {
-								if s := strings.TrimSpace(seg.Content); s != "" {
-									lines = append(lines, s)
-								}
-							}
-							if len(lines) > 0 {
-								b.WriteString("Subtitles:\n  " + clipRunes(strings.Join(lines, " "), 2500) + "\n")
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-	// Fetch top comments if aid available.
-	if view.Data.Aid > 0 {
-		cURL := fmt.Sprintf("https://api.bilibili.com/x/v2/reply?type=1&oid=%d&sort=2&ps=5", view.Data.Aid)
-		if cBody, _, _, cerr := netutil.FetchLimited(ctx, t.httpClient(), cURL, 1<<20, nil); cerr == nil {
-			var cr struct {
-				Data struct {
-					Replies []struct {
-						Member  struct{ Uname string `json:"uname"` } `json:"member"`
-						Content struct{ Message string `json:"message"` } `json:"content"`
-						Like    int `json:"like"`
-					} `json:"replies"`
-				} `json:"data"`
-			}
-			if json.Unmarshal(cBody, &cr) == nil && len(cr.Data.Replies) > 0 {
-				b.WriteString("Top Comments:\n")
-				for _, r := range cr.Data.Replies {
-					fmt.Fprintf(&b, "  - %s (♥%d): %s\n", r.Member.Uname, r.Like, r.Content.Message)
-				}
-			}
-		}
-	}
-	return b.String(), nil
-}
-
-func (t *ReadSourceTool) readArxiv(ctx context.Context, rawURL string) (string, error) {
-	m := arxivIDRe.FindStringSubmatch(rawURL)
-	if len(m) < 2 {
-		return t.readGenericOrDoc(ctx, rawURL, 0, 0)
-	}
-	id := m[1]
-	atomURL := "https://export.arxiv.org/api/query?id_list=" + id
-	body, _, _, err := netutil.FetchLimited(ctx, t.httpClient(), atomURL, 2<<20, nil)
-	if err != nil {
-		return "", err
-	}
-	var feed struct {
-		Entries []struct {
-			Title     string `xml:"title"`
-			Summary   string `xml:"summary"`
-			Published string `xml:"published"`
-			Authors   []struct {
-				Name string `xml:"name"`
-			} `xml:"author"`
-		} `xml:"entry"`
-	}
-	if err := xml.Unmarshal(body, &feed); err != nil || len(feed.Entries) == 0 {
-		return t.readGenericOrDoc(ctx, rawURL, 0, 0)
-	}
-	e := feed.Entries[0]
-	authors := make([]string, 0, len(e.Authors))
-	for _, a := range e.Authors {
-		authors = append(authors, a.Name)
-	}
-	var out strings.Builder
-	fmt.Fprintf(&out, "arXiv:%s (%s)\nTitle: %s\nAuthors: %s\nAbstract: %s",
-		id, e.Published, strings.Join(strings.Fields(e.Title), " "), strings.Join(authors, ", "), strings.Join(strings.Fields(e.Summary), " "))
-
-	// Extract first pages of the PDF via pdftotext when available (SPEC §10.2 Atom + PDF pages).
-	if _, lerr := exec.LookPath("pdftotext"); lerr == nil {
-		pdfURL := "https://arxiv.org/pdf/" + id + ".pdf"
-		if pdfBytes, _, code, perr := netutil.FetchLimited(ctx, t.httpClient(), pdfURL, 10<<20, nil); perr == nil && code == 200 && len(pdfBytes) > 0 {
-			if pdfTxt, eerr := extractPDFPages(ctx, pdfBytes, 1, 4); eerr == nil && pdfTxt != "" {
-				out.WriteString("\n\nPDF Excerpt (pages 1-4):\n")
-				out.WriteString(clipRunes(pdfTxt, 5000))
-			}
-		}
-	}
-	return out.String(), nil
-}
-
-func (t *ReadSourceTool) readHuggingFace(ctx context.Context, u *url.URL) (string, error) {
-	repo := strings.Trim(u.Path, "/")
-	parts := strings.Split(repo, "/")
-	if len(parts) < 2 {
-		return t.readGenericOrDoc(ctx, u.String(), 0, 0)
-	}
-	repoID := parts[0] + "/" + parts[1]
-	metaBody, _, _, err := netutil.FetchLimited(ctx, t.httpClient(), "https://hf-mirror.com/api/models/"+repoID, 2<<20, nil)
-	if err != nil {
-		return "", err
-	}
-	var b strings.Builder
-	b.WriteString("HuggingFace Model: " + repoID + "\n")
-	var meta map[string]any
-	if json.Unmarshal(metaBody, &meta) == nil {
-		fmt.Fprintf(&b, "Downloads: %v | Likes: %v | Pipeline: %v\n", meta["downloads"], meta["likes"], meta["pipeline_tag"])
-	}
-	if readme, _, code, rerr := netutil.FetchLimited(ctx, t.httpClient(), "https://hf-mirror.com/"+repoID+"/raw/main/README.md", 2<<20, nil); rerr == nil && code == 200 {
-		b.WriteString("\nREADME:\n")
-		b.WriteString(clipRunes(string(readme), 5000))
-	}
-	return b.String(), nil
 }
 
 func (t *ReadSourceTool) readGenericOrDoc(ctx context.Context, rawURL string, firstPage, lastPage int) (string, error) {
@@ -727,31 +561,7 @@ func extractPDFText(ctx context.Context, pdfBytes []byte) (string, error) {
 }
 
 func extractPDFPages(ctx context.Context, pdfBytes []byte, firstPage, lastPage int) (string, error) {
-	tmp, err := os.CreateTemp("", "fatfish-*.pdf")
-	if err != nil {
-		return "", err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(pdfBytes); err != nil {
-		tmp.Close()
-		return "", err
-	}
-	tmp.Close()
-
-	args := []string{"-layout"}
-	if firstPage > 0 {
-		args = append(args, "-f", strconv.Itoa(firstPage))
-	}
-	if lastPage > 0 {
-		args = append(args, "-l", strconv.Itoa(lastPage))
-	}
-	args = append(args, tmp.Name(), "-")
-	cmd := exec.CommandContext(ctx, "pdftotext", args...)
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("pdftotext failed: %w", err)
-	}
-	return strings.TrimSpace(string(out)), nil
+	return parser.ExtractPDFPages(ctx, pdfBytes, firstPage, lastPage)
 }
 
 const (

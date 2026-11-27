@@ -138,6 +138,22 @@ policy:
       rules:
         reply_gate: "mentioned || replied_to_bot || poked || (cooldown_ok && rand < 0.05)"
 
+link_parser:
+  enabled: true
+  proactive_reply: true       # Proactively parse inbound links and let fatfish decide whether to reply
+  cooldown_sec: 15            # Per-channel cooldown between proactive link triggers
+  dedup_ttl_sec: 1800         # Skip proactive re-triggering for the same canonical URL within 30 min
+  max_urls_per_msg: 2         # Max candidate links parsed per message
+  wait_sec: 4.0               # Bounded inline wait for link parsing before gate/turn
+  timeout_sec: 12             # HTTP fetch timeout per link
+  cache_ttl_sec: 1200         # Shared in-memory cache TTL across proactive parser and read_source
+  night_proactive: true       # Allow proactive link parsing during night hours (23:00-07:00)
+  twitter_api_base: "https://api.fxtwitter.com"
+  github_token: "${GITHUB_TOKEN}"
+  bilibili_cookie: "${BILIBILI_COOKIE}"
+  ignore_domains: []
+  disabled_channels: []
+
 sticker:
   enabled: true
   pack_dir: "./data/stickers"

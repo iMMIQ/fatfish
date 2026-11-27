@@ -28,8 +28,9 @@ type Config struct {
 	Models    ModelsConfig    `yaml:"models"`
 	Persona   PersonaConfig   `yaml:"persona"`
 	Frame     FrameConfig     `yaml:"frame"`
-	Policy    PolicyConfig    `yaml:"policy"`
-	Sticker   StickerConfig   `yaml:"sticker"`
+	Policy     PolicyConfig     `yaml:"policy"`
+	LinkParser LinkParserConfig `yaml:"link_parser"`
+	Sticker    StickerConfig    `yaml:"sticker"`
 	Tools     ToolsConfig     `yaml:"tools"`
 	MCP       MCPConfig       `yaml:"mcp"`
 	Console   ConsoleConfig   `yaml:"console"`
@@ -175,6 +176,24 @@ type PolicyOverrideBlock struct {
 	ProactiveCooldownSec *int              `yaml:"proactive_cooldown_sec,omitempty"`
 	ThreadMaxTurns       *int              `yaml:"thread_max_turns,omitempty"`
 	Rules                PolicyRulesConfig `yaml:"rules"`
+}
+
+// LinkParserConfig controls proactive URL extraction, Tier-1 site parsing, caching, and fatfish-decided replies.
+type LinkParserConfig struct {
+	Enabled          bool     `yaml:"enabled"`
+	ProactiveReply   bool     `yaml:"proactive_reply"`
+	CooldownSec      int      `yaml:"cooldown_sec"`
+	DedupTTLSec      int      `yaml:"dedup_ttl_sec"`
+	MaxURLsPerMsg    int      `yaml:"max_urls_per_msg"`
+	WaitSec          float64  `yaml:"wait_sec"`
+	TimeoutSec       int      `yaml:"timeout_sec"`
+	CacheTTLSec      int      `yaml:"cache_ttl_sec"`
+	NightProactive   bool     `yaml:"night_proactive"`
+	TwitterAPIBase   string   `yaml:"twitter_api_base"`
+	GitHubToken      string   `yaml:"github_token"`
+	BilibiliCookie   string   `yaml:"bilibili_cookie"`
+	IgnoreDomains    []string `yaml:"ignore_domains"`
+	DisabledChannels []string `yaml:"disabled_channels"`
 }
 
 type StickerConfig struct {
@@ -343,6 +362,18 @@ func defaultConfig() *Config {
 				AutoCollectSticker: "is_group && !from_bot && image_kb > 0 && image_kb < 2048",
 			},
 		},
+		LinkParser: LinkParserConfig{
+			Enabled:        true,
+			ProactiveReply: true,
+			CooldownSec:    15,
+			DedupTTLSec:    1800,
+			MaxURLsPerMsg:  2,
+			WaitSec:        4.0,
+			TimeoutSec:     12,
+			CacheTTLSec:    1200,
+			NightProactive: true,
+			TwitterAPIBase: "https://api.fxtwitter.com",
+		},
 		Sticker: StickerConfig{
 			Enabled:              true,
 			PackDir:              "./data/stickers",
@@ -438,6 +469,27 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Policy.MaxReplyBubbles <= 0 {
 		cfg.Policy.MaxReplyBubbles = 4
+	}
+	if cfg.LinkParser.CooldownSec < 0 {
+		cfg.LinkParser.CooldownSec = 15
+	}
+	if cfg.LinkParser.DedupTTLSec <= 0 {
+		cfg.LinkParser.DedupTTLSec = 1800
+	}
+	if cfg.LinkParser.MaxURLsPerMsg <= 0 {
+		cfg.LinkParser.MaxURLsPerMsg = 2
+	}
+	if cfg.LinkParser.WaitSec <= 0 {
+		cfg.LinkParser.WaitSec = 4.0
+	}
+	if cfg.LinkParser.TimeoutSec <= 0 {
+		cfg.LinkParser.TimeoutSec = 12
+	}
+	if cfg.LinkParser.CacheTTLSec <= 0 {
+		cfg.LinkParser.CacheTTLSec = 1200
+	}
+	if strings.TrimSpace(cfg.LinkParser.TwitterAPIBase) == "" {
+		cfg.LinkParser.TwitterAPIBase = "https://api.fxtwitter.com"
 	}
 	if cfg.Sticker.RecentWindow <= 0 {
 		cfg.Sticker.RecentWindow = 30

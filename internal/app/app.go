@@ -19,6 +19,7 @@ import (
 	"github.com/iMMIQ/fatfish/internal/infer"
 	"github.com/iMMIQ/fatfish/internal/memory"
 	"github.com/iMMIQ/fatfish/internal/model"
+	"github.com/iMMIQ/fatfish/internal/parser"
 	"github.com/iMMIQ/fatfish/internal/policy"
 	"github.com/iMMIQ/fatfish/internal/room"
 	"github.com/iMMIQ/fatfish/internal/sticker"
@@ -111,8 +112,10 @@ func New(configPath string, enableTransport bool) (*App, error) {
 	sched.SetMediaQuotas(cfg.Frame.RoomMediaMiB, cfg.Frame.TotalMediaMiB)
 
 	// Register all 10 high-leverage built-in tools (SPEC 10.2).
+	linkParser := parser.NewService(buildParserOptions(cfg))
 	webSearchTool := tool.NewWebSearchTool(cfg.Tools.SSRFAllowHosts)
 	readSourceTool := tool.NewReadSourceTool(hub, cfg.Tools.SSRFAllowHosts)
+	readSourceTool.SetParser(linkParser)
 	quoteTool := tool.NewQuoteTool(cfg.Tools.SSRFAllowHosts, computeTool.Renderer())
 	sched.SetPriceFetcher(quoteTool)
 	interactTool := tool.NewInteractTool(tr, cfg.Tools.AllowRelayChannels)
@@ -143,6 +146,7 @@ func New(configPath string, enableTransport bool) (*App, error) {
 		Memory:    memSvc,
 		Stickers:  stkEng,
 		Registry:  reg,
+		Parser:    linkParser,
 		Transport: tr,
 		Logger:    logger,
 	})
@@ -180,6 +184,7 @@ func New(configPath string, enableTransport bool) (*App, error) {
 		sched.UpdateConfig(newCfg.Location(), newCfg.Tools.MaxSchedulesPerChannel, newCfg.Tools.MinCronIntervalMinutes)
 		reg.UpdateDefaultTimeout(time.Duration(newCfg.Tools.DefaultTimeoutSec) * time.Second)
 		roomDisp.UpdateHTTPClient(newCfg.Tools.SSRFAllowHosts)
+		linkParser.UpdateOptions(buildParserOptions(newCfg))
 		webSearchTool.UpdateAllowHosts(newCfg.Tools.SSRFAllowHosts)
 		readSourceTool.UpdateAllowHosts(newCfg.Tools.SSRFAllowHosts)
 		quoteTool.UpdateAllowHosts(newCfg.Tools.SSRFAllowHosts)
@@ -206,6 +211,18 @@ func New(configPath string, enableTransport bool) (*App, error) {
 		Logger:   logger,
 		Compute:  computeTool,
 	}, nil
+}
+
+func buildParserOptions(cfg *config.Config) parser.Options {
+	return parser.Options{
+		AllowHosts:     cfg.Tools.SSRFAllowHosts,
+		Timeout:        time.Duration(cfg.LinkParser.TimeoutSec) * time.Second,
+		CacheTTL:       time.Duration(cfg.LinkParser.CacheTTLSec) * time.Second,
+		TwitterAPIBase: cfg.LinkParser.TwitterAPIBase,
+		GitHubToken:    cfg.LinkParser.GitHubToken,
+		BilibiliCookie: cfg.LinkParser.BilibiliCookie,
+		IgnoreDomains:  cfg.LinkParser.IgnoreDomains,
+	}
 }
 
 func registerBuiltins(

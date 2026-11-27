@@ -86,4 +86,15 @@ func TestParseEventMultimodalAndPoke(t *testing.T) {
 	if jMsg == nil || !jMsg.SilentNotice || len(jMsg.Parts) != 1 || jMsg.Parts[0].Text != "[加入了本群]" {
 		t.Fatalf("unexpected join notice: %+v", jMsg)
 	}
+
+	// QQ mini-program JSON card: must pick qqdocurl over cover preview image URL.
+	cardPart := parseQQJSONCard(`{"app":"com.tencent.miniapp_01","prompt":"[QQ小程序]哔哩哔哩","meta":{"detail_1":{"title":"哔哩哔哩","desc":"实测视频标题","preview":"https://i0.hdslb.com/cover.jpg","qqdocurl":"https://b23.tv/real123"}}}`)
+	if cardPart == nil || cardPart.URL != "https://b23.tv/real123" || cardPart.Summary != "实测视频标题" {
+		t.Fatalf("expected qqdocurl over preview image, got %+v", cardPart)
+	}
+	// Card with only preview image and no jump URL must leave URL empty.
+	previewOnly := parseQQJSONCard(`{"prompt":"[图片卡片]","meta":{"detail_1":{"preview":"https://i0.hdslb.com/only_cover.jpg"}}}`)
+	if previewOnly == nil || previewOnly.URL != "" {
+		t.Fatalf("preview image URL must not be treated as jump URL, got %+v", previewOnly)
+	}
 }

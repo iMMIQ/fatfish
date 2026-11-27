@@ -526,6 +526,15 @@ func FormatUserTurnWithLimits(msgs []model.Message, loc *time.Location, newMembe
 				}
 			case model.PartCard:
 				parts = append(parts, fmt.Sprintf("[卡片: %s %s %s]", p.Title, p.Summary, p.URL))
+			case model.PartLink:
+				txt := strings.TrimSpace(p.Text)
+				if txt == "" {
+					txt = strings.TrimSpace(p.Title + " " + p.Summary)
+				}
+				if txt != "" {
+					src := strings.ReplaceAll(p.URL, `"`, "'")
+					parts = append(parts, fmt.Sprintf("<external_data source=\"link_parse:%s\">\n%s\n</external_data>", src, txt))
+				}
 			case model.PartFile:
 				parts = append(parts, fmt.Sprintf("[文件: %s url=%s]", p.Title, p.URL))
 			case model.PartPoke:

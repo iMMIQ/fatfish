@@ -24,6 +24,7 @@ import (
 	"github.com/iMMIQ/fatfish/internal/memory"
 	"github.com/iMMIQ/fatfish/internal/model"
 	"github.com/iMMIQ/fatfish/internal/netutil"
+	"github.com/iMMIQ/fatfish/internal/parser"
 	"github.com/iMMIQ/fatfish/internal/policy"
 	"github.com/iMMIQ/fatfish/internal/sticker"
 	"github.com/iMMIQ/fatfish/internal/store"
@@ -42,6 +43,7 @@ type Manager struct {
 	memory   *memory.Service
 	stickers *sticker.Engine
 	registry *tool.Registry
+	parser   *parser.Service
 	tr       transport.Transport
 	httpMu   sync.RWMutex
 	httpCli  *http.Client
@@ -67,6 +69,7 @@ type Dependencies struct {
 	Memory    *memory.Service
 	Stickers  *sticker.Engine
 	Registry  *tool.Registry
+	Parser    *parser.Service
 	Transport transport.Transport
 	Logger    *slog.Logger
 }
@@ -76,8 +79,13 @@ func NewManager(deps Dependencies) *Manager {
 		deps.Logger = slog.Default()
 	}
 	var allowHosts []string
+	linkParser := deps.Parser
 	if deps.Config != nil && deps.Config.Get() != nil {
-		allowHosts = deps.Config.Get().Tools.SSRFAllowHosts
+		cfg := deps.Config.Get()
+		allowHosts = cfg.Tools.SSRFAllowHosts
+		if linkParser == nil {
+			linkParser = parser.NewService(parserOptionsFromConfig(cfg))
+		}
 	}
 	sdCtx, sdCancel := context.WithCancel(context.Background())
 	return &Manager{
@@ -90,6 +98,7 @@ func NewManager(deps Dependencies) *Manager {
 		memory:         deps.Memory,
 		stickers:       deps.Stickers,
 		registry:       deps.Registry,
+		parser:         linkParser,
 		tr:             deps.Transport,
 		httpCli:        netutil.NewSafeHTTPClient(netutil.SafeClientOptions{Timeout: 10 * time.Second, AllowHosts: allowHosts}),
 		log:            deps.Logger,
@@ -106,6 +115,21 @@ func (m *Manager) UpdateHTTPClient(allowHosts []string) {
 	m.httpMu.Lock()
 	m.httpCli = cli
 	m.httpMu.Unlock()
+}
+
+func parserOptionsFromConfig(cfg *config.Config) parser.Options {
+	if cfg == nil {
+		return parser.Options{}
+	}
+	return parser.Options{
+		AllowHosts:     cfg.Tools.SSRFAllowHosts,
+		Timeout:        time.Duration(cfg.LinkParser.TimeoutSec) * time.Second,
+		CacheTTL:       time.Duration(cfg.LinkParser.CacheTTLSec) * time.Second,
+		TwitterAPIBase: cfg.LinkParser.TwitterAPIBase,
+		GitHubToken:    cfg.LinkParser.GitHubToken,
+		BilibiliCookie: cfg.LinkParser.BilibiliCookie,
+		IgnoreDomains:  cfg.LinkParser.IgnoreDomains,
+	}
 }
 
 func (m *Manager) httpClient() *http.Client {
@@ -239,12 +263,14 @@ type Room struct {
 	stopCh      chan struct{}
 	stopOne     sync.Once
 
-	epoch          atomic.Int64
-	muteUntilNano  atomic.Int64 // UnixNano; atomic so actor & turn worker share safely
-	msgCount       atomic.Uint64
-	lastProactive  time.Time
-	lastPlusOne    time.Time
-	seenInSegment  map[string]bool // tracks members already introduced in active segment
+	epoch             atomic.Int64
+	muteUntilNano     atomic.Int64 // UnixNano; atomic so actor & turn worker share safely
+	msgCount          atomic.Uint64
+	lastProactive     time.Time
+	lastLinkProactive time.Time
+	lastPlusOne       time.Time
+	recentLinks       map[string]time.Time // per-channel canonical URL dedup map (actor-owned)
+	seenInSegment     map[string]bool      // tracks members already introduced in active segment
 	lastSegID      int64
 	pendingMsgs    []model.Message // messages accumulated since last LLM turn
 	pendingTrigger *triggerState
@@ -288,9 +314,10 @@ type senderStamp struct {
 }
 
 type perceptionResult struct {
-	parts   []model.Part
-	changed bool
-	imageKB int
+	parts       []model.Part
+	changed     bool
+	imageKB     int
+	parsedLinks []string
 }
 
 type plusOneAction int
@@ -317,6 +344,7 @@ func newRoom(mgr *Manager, ch model.ChannelID) *Room {
 		percPatchCh:   make(chan perceptionPatch, 64),
 		turnDoneCh:    make(chan turnOutcome, 1),
 		stopCh:        make(chan struct{}),
+		recentLinks:   make(map[string]time.Time),
 		seenInSegment: make(map[string]bool),
 		plusOneUsers:  make(map[string]struct{}),
 	}
@@ -446,6 +474,7 @@ func (r *Room) onAdminCommand(cmd model.AdminCommand) {
 		}
 		r.pendingMsgs = nil
 		r.pendingTrigger = nil
+		r.recentLinks = make(map[string]time.Time)
 		r.seenInSegment = make(map[string]bool)
 		r.threadUserID = ""
 		r.threadTurns = 0
@@ -557,7 +586,7 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		return 0, false
 	}
 
-	// Launch bounded async perception tasks (image canonicalization + voice ASR + forward nodes)
+	// Launch bounded async perception tasks (image canonicalization + voice ASR + forward nodes + link parsing)
 	// on a DEEP COPY of msg so the Room Actor goroutine never races with background perception!
 	hasMedia, hasAudio, hasForward := false, false, false
 	for _, p := range msg.Parts {
@@ -570,9 +599,14 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 			hasForward = true
 		}
 	}
+	hasLinkCandidate := r.mgr.parser != nil &&
+		cfg.LinkParser.Enabled &&
+		!linkChannelDisabled(cfg.LinkParser.DisabledChannels, r.ch) &&
+		len(r.mgr.parser.ExtractMessageLinks(msg, cfg.LinkParser.MaxURLsPerMsg)) > 0
+
 	var perceptionCh chan perceptionResult
 	var deliveredInline atomic.Bool
-	if hasMedia || hasAudio || hasForward {
+	if hasMedia || hasAudio || hasForward || hasLinkCandidate {
 		perceptionCh = make(chan perceptionResult, 1)
 		msgCopy := cloneMessage(*msg)
 		r.mgr.wg.Add(1)
@@ -588,7 +622,7 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 			res := r.runPerception(&msgCopy, cfg)
 			perceptionCh <- res
 			// If perception completed after onMessage moved on (silent msg or timeout),
-			// patch r.pendingMsgs via actor channel so subsequent turns see the image/transcript!
+			// patch r.pendingMsgs via actor channel so subsequent turns see the image/transcript/link!
 			if res.changed && !deliveredInline.Load() {
 				select {
 				case r.percPatchCh <- perceptionPatch{seq: msgCopy.Seq, parts: res.parts}:
@@ -681,6 +715,7 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		IsNight:      isNight,
 		Hour:         hour,
 		BurstUsers:   burstUsers,
+		HasLink:      hasLinkCandidate,
 		TextLen:      len([]rune(plain)),
 		Rand:         rand.Float64(),
 	}
@@ -702,11 +737,30 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		}
 	}
 
-	// Wait bounded for perception if this message triggers or joins an active turn.
-	if perceptionCh != nil && (shouldReply || r.pendingTrigger != nil) {
+	// Proactive link parsing candidate: when a group member sends a link without explicitly triggering a reply,
+	// wait bounded for link parsing and then let fatfish decide via proactive gate whether to reply, react, or ignore.
+	linkCooldownOK := time.Since(r.lastLinkProactive) >= time.Duration(cfg.LinkParser.CooldownSec)*time.Second
+	linkProactiveCandidate := r.ch.IsGroup() &&
+		hasLinkCandidate &&
+		!shouldReply &&
+		cfg.LinkParser.ProactiveReply &&
+		linkCooldownOK &&
+		(!isNight || cfg.LinkParser.NightProactive) &&
+		!(r.pendingTrigger != nil && !r.pendingTrigger.proactive)
+
+	// Wait bounded for perception if this message triggers, joins an active turn, or is a proactive link candidate.
+	linkProactiveTriggered := false
+	if perceptionCh != nil && (shouldReply || r.pendingTrigger != nil || linkProactiveCandidate) {
 		waitDur := time.Duration(cfg.Policy.MediaWaitSec * float64(time.Second))
 		if hasAudio {
-			waitDur = time.Duration(cfg.Policy.ASRWaitSec * float64(time.Second))
+			if asrW := time.Duration(cfg.Policy.ASRWaitSec * float64(time.Second)); asrW > waitDur {
+				waitDur = asrW
+			}
+		}
+		if hasLinkCandidate {
+			if linkW := time.Duration(cfg.LinkParser.WaitSec * float64(time.Second)); linkW > waitDur {
+				waitDur = linkW
+			}
 		}
 		if waitDur <= 0 {
 			waitDur = 3 * time.Second
@@ -717,6 +771,14 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 			if res.changed {
 				msg.Parts = res.parts
 				plain = strings.TrimSpace(msg.PlainText())
+			}
+			if len(res.parsedLinks) > 0 {
+				dedupTTL := time.Duration(cfg.LinkParser.DedupTTLSec) * time.Second
+				isFresh := r.markFreshLinks(res.parsedLinks, now, dedupTTL)
+				if linkProactiveCandidate && isFresh {
+					linkProactiveTriggered = true
+					shouldReply = true
+				}
 			}
 		case <-time.After(waitDur):
 			// Proceed with placeholder; background perception patches L0+FTS5 & r.pendingMsgs on completion.
@@ -758,13 +820,17 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 	case pokeBystanderTriggered:
 		trigKind = "poke_bystander"
 		proactive = true
+	case linkProactiveTriggered:
+		trigKind = "link"
+		proactive = true
 	case inThread:
 		trigKind = "thread"
 		proactive = false
 	}
 
 	// Enforce hard proactive cooldown in Go regardless of custom reply_gate expressions (SPEC §5.3).
-	if proactive && !cooldownOK {
+	// Link proactive triggers use their own dedicated link_parser.cooldown_sec already checked above.
+	if proactive && trigKind != "link" && !cooldownOK {
 		return 0, false
 	}
 	// Never let a lower-priority proactive trigger overwrite a queued explicit trigger (e.g. pure @bot wait).
@@ -960,11 +1026,88 @@ func (r *Room) runPerception(msg *model.Message, cfg *config.Config) perceptionR
 		}
 	}
 
+	// Proactive link parsing (Tier-1 extractors + generic web pages) with bounded timeout & shared cache.
+	var parsedLinks []string
+	if r.mgr.parser != nil && cfg.LinkParser.Enabled && !linkChannelDisabled(cfg.LinkParser.DisabledChannels, r.ch) {
+		alreadyHasLink := false
+		for _, p := range msg.Parts {
+			if p.Kind == model.PartLink {
+				alreadyHasLink = true
+				break
+			}
+		}
+		if !alreadyHasLink {
+			lTimeout := time.Duration(cfg.LinkParser.TimeoutSec) * time.Second
+			if lTimeout <= 0 {
+				lTimeout = 12 * time.Second
+			}
+			lCtx, lCancel := context.WithTimeout(ctx, lTimeout)
+			results := r.mgr.parser.ParseMessageLinks(lCtx, msg, cfg.LinkParser.MaxURLsPerMsg)
+			lCancel()
+			for _, res := range results {
+				compact := res.CompactForContext(450)
+				if compact == "" {
+					continue
+				}
+				msg.Parts = append(msg.Parts, model.Part{
+					Kind:    model.PartLink,
+					URL:     res.CanonicalURL,
+					Title:   res.Title,
+					Summary: res.Summary,
+					Text:    compact,
+				})
+				parsedLinks = append(parsedLinks, res.CanonicalURL)
+				changed = true
+			}
+		}
+	}
+
 	if changed {
 		_ = r.mgr.store.PatchMessageParts(ctx, msg)
 	}
 	partsOut := append([]model.Part(nil), msg.Parts...)
-	return perceptionResult{parts: partsOut, changed: changed, imageKB: maxImageKB}
+	return perceptionResult{parts: partsOut, changed: changed, imageKB: maxImageKB, parsedLinks: parsedLinks}
+}
+
+func (r *Room) markFreshLinks(canonURLs []string, now time.Time, ttl time.Duration) bool {
+	if ttl <= 0 {
+		ttl = 30 * time.Minute
+	}
+	// Prune expired entries.
+	for u, ts := range r.recentLinks {
+		if now.Sub(ts) >= ttl {
+			delete(r.recentLinks, u)
+		}
+	}
+	fresh := false
+	for _, u := range canonURLs {
+		if u == "" {
+			continue
+		}
+		if ts, ok := r.recentLinks[u]; !ok || now.Sub(ts) >= ttl {
+			fresh = true
+			r.recentLinks[u] = now
+		}
+	}
+	return fresh
+}
+
+func linkChannelDisabled(disabled []string, ch model.ChannelID) bool {
+	if len(disabled) == 0 {
+		return false
+	}
+	idStr := string(ch)
+	nativeID := ch.NativeID()
+	shortKey := ""
+	if _, _, kind, nid, ok := model.ParseChannelID(ch); ok {
+		shortKey = string(kind) + ":" + nid
+	}
+	for _, item := range disabled {
+		if item == idStr || item == nativeID || (shortKey != "" && item == shortKey) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Room) autoCollectSticker(ctx context.Context, cfg *config.Config, raw []byte, fallbackExt string) {
@@ -1119,7 +1262,11 @@ func (r *Room) startTurn(trig triggerState) {
 
 func (r *Room) applyTurnOutcome(out turnOutcome) {
 	if out.proactiveActed {
-		r.lastProactive = time.Now()
+		if out.trig.kind == "link" {
+			r.lastLinkProactive = time.Now()
+		} else {
+			r.lastProactive = time.Now()
+		}
 	}
 	if out.skippedThread {
 		r.threadUserID = ""
@@ -1135,7 +1282,9 @@ func (r *Room) applyTurnOutcome(out turnOutcome) {
 		}
 	}
 	if out.committed {
-		if out.trig.proactive {
+		if out.trig.kind == "link" {
+			r.lastLinkProactive = time.Now()
+		} else if out.trig.proactive {
 			r.lastProactive = time.Now()
 		}
 		if out.trig.msg.SenderID != "" && out.trig.msg.SenderID != "system" {
@@ -1270,6 +1419,8 @@ func (r *Room) runTurnWorker(
 		userPayload.Text += "\n[提示: 多名群友正在刷屏复读同一句话，用一句简短俏皮的话自然打断复读。]"
 	} else if trig.kind == "poke_bystander" {
 		userPayload.Text += "\n[提示: 这是群友之间互戳，不是戳你；觉得有节目效果就随口吃瓜调侃一句，没必要接就回复 [[skip]]。]"
+	} else if trig.kind == "link" {
+		userPayload.Text += "\n[提示: 群友刚发了链接，系统已自动解析出上方内容。用纯文本简洁提炼核心看点或按你的性格自然点评一两句（不要机械复读原始链接，不要写冗长模板）；觉得没必要接话可直接输出 [[skip]]。]"
 	}
 	out, err := r.mgr.runner.Run(ctx, agent.TurnInput{
 		ChannelID:    r.ch,
@@ -1643,6 +1794,9 @@ func (r *Room) runProactiveGate(ctx context.Context, trig triggerState, cfg *con
 	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
 		lines[i], lines[j] = lines[j], lines[i]
 	}
+	if len(lines) == 0 {
+		lines = append(lines, fmt.Sprintf("%s: %s", trig.msg.SenderName, trig.msg.PlainText()))
+	}
 	gatePrompt := fmt.Sprintf(`你是群友“%s”，正在潜水看群聊。判断对最新一条消息应该怎么反应，不要抢话、不要强行插嘴：
 - "reply"：真的有接梗/吐槽/搭话空间，或者别人提到了你感兴趣的话题/在叫你。
 - "react"：不需要说话，悄悄给最新消息贴一个 QQ 表情表态更有活人感（例如附和、吃瓜、觉得好笑或无语）。
@@ -1652,6 +1806,17 @@ func (r *Room) runProactiveGate(ctx context.Context, trig triggerState, cfg *con
 76(赞), 66(爱心), 182(笑哭), 179(doge/狗头), 271(吃瓜), 357(裂开/无语), 424(续火/热闹), 181(戳一戳), 319(比心)
 
 只输出严格 JSON：{"action":"reply"|"react"|"ignore","emoji_id":"数字ID或空字符串"}`, botName)
+	if trig.kind == "link" {
+		gatePrompt = fmt.Sprintf(`你是群友“%s”，正在看群聊。群友刚发了一条链接（系统已自动解析出标题/作者/摘要附在消息里）。判断对这条链接应该怎么反应：
+- "reply"：链接内容有看点、信息量或值得帮群友用纯文本简短提炼要点/吐槽搭话（优先推荐，尤其是视频、文章、论文、项目、推文等有实质内容的链接）。
+- "react"：链接标题和内容已经一目了然没必要多嘴，或者悄悄贴个表情表态更自然。
+- "ignore"：明显是无意义广告、重复水帖、私密事务或解析内容残缺无价值，保持潜水。
+
+若选 "react"，emoji_id 必须从以下数字 ID 中选一个：
+76(赞), 66(爱心), 182(笑哭), 179(doge/狗头), 271(吃瓜), 357(裂开/无语), 424(续火/热闹), 181(戳一戳), 319(比心)
+
+只输出严格 JSON：{"action":"reply"|"react"|"ignore","emoji_id":"数字ID或空字符串"}`, botName)
+	}
 
 	resp, err := r.mgr.hub.Chat(ctx, "fast", infer.ChatRequest{
 		Messages: []infer.ChatMessage{

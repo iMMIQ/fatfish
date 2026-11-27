@@ -545,25 +545,42 @@ func parseQQJSONCard(raw string) *model.Part {
 	if err := json.Unmarshal([]byte(raw), &m); err != nil {
 		return nil
 	}
-	title := anyToString(m["prompt"])
-	var summary, jumpURL string
+	prompt := strings.TrimSpace(anyToString(m["prompt"]))
+	var metaTitle, summary, jumpURL string
+	urlPriority := 99
+	pickURL := func(candidate string, prio int) {
+		c := strings.TrimSpace(candidate)
+		if (strings.HasPrefix(c, "http://") || strings.HasPrefix(c, "https://")) && prio < urlPriority {
+			jumpURL = c
+			urlPriority = prio
+		}
+	}
 	if meta, ok := m["meta"].(map[string]any); ok {
 		for _, v := range meta {
 			sub, ok := v.(map[string]any)
 			if !ok {
 				continue
 			}
-			if t := anyToString(sub["title"]); t != "" && title == "" {
-				title = t
+			if t := strings.TrimSpace(anyToString(sub["title"])); t != "" && metaTitle == "" {
+				metaTitle = t
 			}
-			if d := anyToString(sub["desc"]); d != "" && summary == "" {
+			if d := strings.TrimSpace(anyToString(sub["desc"])); d != "" && summary == "" {
 				summary = d
 			}
-			for _, k := range []string{"qqdocurl", "jumpUrl", "url", "preview"} {
-				if u := anyToString(sub[k]); strings.HasPrefix(u, "http") && jumpURL == "" {
-					jumpURL = u
-				}
-			}
+			// Strict priority: real jump URLs first; never treat cover `preview` image URL as the link target.
+			pickURL(anyToString(sub["qqdocurl"]), 1)
+			pickURL(anyToString(sub["jumpUrl"]), 2)
+			pickURL(anyToString(sub["jump_url"]), 3)
+			pickURL(anyToString(sub["url"]), 4)
+		}
+	}
+	title := prompt
+	if title == "" {
+		title = metaTitle
+	} else if metaTitle != "" && !strings.Contains(title, metaTitle) {
+		// Preserve both prompt (e.g. "[QQ小程序]哔哩哔哩") and specific meta title when distinct.
+		if strings.HasPrefix(title, "[") && strings.HasSuffix(title, "]") {
+			title = title + " " + metaTitle
 		}
 	}
 	if title == "" && summary == "" && jumpURL == "" {
@@ -829,6 +846,10 @@ func (c *Client) GetForward(ctx context.Context, forwardID string, maxNodes int)
 					}
 				} else if s.Type == "image" {
 					parts = append(parts, "[图片]")
+				} else if s.Type == "json" {
+					if card := parseQQJSONCard(anyToString(s.Data["data"])); card != nil {
+						parts = append(parts, strings.TrimSpace(fmt.Sprintf("[卡片: %s %s %s]", card.Title, card.Summary, card.URL)))
+					}
 				}
 			}
 			txt = strings.Join(parts, " ")

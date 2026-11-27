@@ -30,6 +30,7 @@ type PolicyEnv struct {
 	NewMsgs      int     `expr:"new_msgs"`
 	WaitSec      float64 `expr:"wait_sec"`
 	Proactive    bool    `expr:"proactive"`
+	HasLink      bool    `expr:"has_link"`
 	TextLen      int     `expr:"text_len"`
 	ImageKB      int     `expr:"image_kb"`
 	Rand         float64 `expr:"rand"`

@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -355,5 +357,220 @@ func TestNormalizeQQEmojiIDAndEnrichEvents(t *testing.T) {
 	}
 	if len(r.pendingMsgs) != 1 || r.pendingMsgs[0].SenderName != "Alice" || r.pendingMsgs[0].Parts[0].Text != `[撤回了刚才的消息: "secret typo"]` {
 		t.Fatalf("unexpected pending recall notice: %+v", r.pendingMsgs)
+	}
+}
+
+func TestRoomProactiveLinkParseAndFatfishGate(t *testing.T) {
+	// Mock target web server hosting two articles.
+	webSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		switch r.URL.Path {
+		case "/post-1":
+			_, _ = w.Write([]byte(`<html><head><title>Go 1.26 新特性解析</title><meta property="og:description" content="详细介绍了纯 Go 性能优化与内存改进"></head><body><article><p>Go 1.26 带来了显著的 GC 延迟下降和更快的编译速度。</p></article></body></html>`))
+		case "/post-2":
+			_, _ = w.Write([]byte(`<html><head><title>随手广告链接</title><meta property="og:description" content="普通推广页"></head><body><article><p>欢迎光临，这是一条没有讨论价值的普通推广页面。</p></article></body></html>`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer webSrv.Close()
+
+	// Mock LLM server distinguishing fast gate ("fast-m") vs primary ("primary-m").
+	var gateAction atomic.Value
+	gateAction.Store("reply")
+	var primaryCalls atomic.Int32
+	var gateCalls atomic.Int32
+	var mu sync.Mutex
+	var lastPrimaryPrompt string
+	var lastGatePrompt string
+
+	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model    string `json:"model"`
+			Messages []struct {
+				Role    string `json:"role"`
+				Content any    `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Model == "fast-m" {
+			gateCalls.Add(1)
+			if len(req.Messages) > 1 {
+				if s, ok := req.Messages[len(req.Messages)-1].Content.(string); ok {
+					mu.Lock()
+					lastGatePrompt = s
+					mu.Unlock()
+				}
+			}
+			act := gateAction.Load().(string)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"finish_reason": "stop",
+					"message":       map[string]any{"content": `{"action":"` + act + `","emoji_id":""}`},
+				}},
+			})
+			return
+		}
+		primaryCalls.Add(1)
+		if len(req.Messages) > 0 {
+			if s, ok := req.Messages[len(req.Messages)-1].Content.(string); ok {
+				mu.Lock()
+				lastPrimaryPrompt = s
+				mu.Unlock()
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"finish_reason": "stop",
+				"message":       map[string]any{"content": "这篇主要讲 Go 1.26 的 GC 延迟下降和编译提速，挺实用的"},
+			}},
+		})
+	}))
+	defer llmSrv.Close()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "fatfish.yaml")
+	yamlCfg := `data_dir: "` + filepath.ToSlash(dir) + `"
+timezone: "UTC"
+models:
+  primary:
+    base_url: "` + llmSrv.URL + `"
+    model: "primary-m"
+    timeout_sec: 5
+  fast:
+    base_url: "` + llmSrv.URL + `"
+    model: "fast-m"
+    timeout_sec: 5
+policy:
+  input_debounce_sec: 0.05
+  explicit_debounce_sec: 0.05
+  rules:
+    reply_gate: "mentioned"
+link_parser:
+  enabled: true
+  proactive_reply: true
+  cooldown_sec: 0
+  dedup_ttl_sec: 1800
+  wait_sec: 2.0
+  timeout_sec: 5
+  night_proactive: true
+tools:
+  ssrf_allow_hosts: ["127.0.0.1"]
+`
+	if err := os.WriteFile(cfgPath, []byte(yamlCfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfgMgr, err := config.NewManager(cfgPath, policy.ValidateConfig)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	st, err := store.Open(dir, 512, 5)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+	pol, _ := policy.NewEngine(cfgMgr.Get().Policy)
+	hub := infer.NewHub(cfgMgr.Get().Models)
+	fb := frame.NewBuilder(st, cfgMgr.Get().Frame)
+	runner := agent.NewRunner(hub, st, fb, nil, nil)
+	tr := &mockTransport{}
+
+	mgr := NewManager(Dependencies{
+		Config:    cfgMgr,
+		Store:     st,
+		Policy:    pol,
+		Hub:       hub,
+		Frames:    fb,
+		Runner:    runner,
+		Transport: tr,
+	})
+	defer mgr.Drain(2 * time.Second)
+
+	ch := model.MakeChannelID("onebot", "10001", model.ChannelGroup, "54321")
+
+	// 1. Group member drops a link without @bot -> parsed proactively, fast gate says "reply", primary receives parsed content and replies.
+	mgr.Dispatch(&model.Message{
+		ChannelID:     ch,
+		PlatformMsgID: "m1",
+		SenderID:      "u1",
+		SenderName:    "Alice",
+		Parts:         []model.Part{{Kind: model.PartText, Text: "看看这个 " + webSrv.URL + "/post-1"}},
+		CreatedAt:     time.Now(),
+	})
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && tr.sentTexts.Load() < 1 {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if tr.sentTexts.Load() != 1 || gateCalls.Load() != 1 || primaryCalls.Load() != 1 {
+		t.Fatalf("expected 1 gate + 1 primary + 1 sent text, got gate=%d primary=%d sent=%d",
+			gateCalls.Load(), primaryCalls.Load(), tr.sentTexts.Load())
+	}
+	mu.Lock()
+	gp, pp := lastGatePrompt, lastPrimaryPrompt
+	mu.Unlock()
+	if !strings.Contains(gp, "Go 1.26 新特性解析") {
+		t.Fatalf("fast gate should see parsed link title, got: %s", gp)
+	}
+	if !strings.Contains(pp, `<external_data source="link_parse:`) || !strings.Contains(pp, "Go 1.26 新特性解析") {
+		t.Fatalf("primary prompt should include external_data wrapped link parse, got: %s", pp)
+	}
+
+	// 2. Duplicate same URL within dedup_ttl_sec must NOT re-trigger proactive gate/reply.
+	mgr.Dispatch(&model.Message{
+		ChannelID:     ch,
+		PlatformMsgID: "m2",
+		SenderID:      "u2",
+		SenderName:    "Bob",
+		Parts:         []model.Part{{Kind: model.PartText, Text: webSrv.URL + "/post-1?utm_source=dup"}},
+		CreatedAt:     time.Now(),
+	})
+	time.Sleep(250 * time.Millisecond)
+	if gateCalls.Load() != 1 || primaryCalls.Load() != 1 {
+		t.Fatalf("duplicate URL should be deduped, got gate=%d primary=%d", gateCalls.Load(), primaryCalls.Load())
+	}
+
+	// 3. New URL when fatfish fast gate decides "ignore" -> 0 primary call, 0 sent text, yet L0 message still enriched.
+	gateAction.Store("ignore")
+	mgr.Dispatch(&model.Message{
+		ChannelID:     ch,
+		PlatformMsgID: "m3",
+		SenderID:      "u2",
+		SenderName:    "Bob",
+		Parts:         []model.Part{{Kind: model.PartText, Text: webSrv.URL + "/post-2"}},
+		CreatedAt:     time.Now(),
+	})
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && gateCalls.Load() < 2 {
+		time.Sleep(25 * time.Millisecond)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if gateCalls.Load() != 2 || primaryCalls.Load() != 1 || tr.sentTexts.Load() != 1 {
+		t.Fatalf("gate=ignore should not call primary or send text: gate=%d primary=%d sent=%d",
+			gateCalls.Load(), primaryCalls.Load(), tr.sentTexts.Load())
+	}
+	saved, err := st.GetMessageByPlatformID(context.Background(), ch, "m3")
+	if err != nil || saved == nil || !strings.Contains(saved.PlainText(), "随手广告链接") {
+		t.Fatalf("ignored link should still be patched into L0 history, got: %+v err=%v", saved, err)
+	}
+
+	// 4. Explicit @bot with link must run ONCE (mention turn, skipping proactive gate) -> zero double reply.
+	mgr.Dispatch(&model.Message{
+		ChannelID:     ch,
+		PlatformMsgID: "m4",
+		SenderID:      "u1",
+		SenderName:    "Alice",
+		MentionedBot:  true,
+		Parts:         []model.Part{{Kind: model.PartText, Text: "总结一下 " + webSrv.URL + "/post-1"}},
+		CreatedAt:     time.Now(),
+	})
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && tr.sentTexts.Load() < 2 {
+		time.Sleep(25 * time.Millisecond)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if gateCalls.Load() != 2 || primaryCalls.Load() != 2 || tr.sentTexts.Load() != 2 {
+		t.Fatalf("explicit @bot + link must bypass proactive gate and send exactly 1 reply: gate=%d primary=%d sent=%d",
+			gateCalls.Load(), primaryCalls.Load(), tr.sentTexts.Load())
 	}
 }
