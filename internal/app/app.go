@@ -146,6 +146,7 @@ func New(configPath string, enableTransport bool) (*App, error) {
 		cfg.Models.Embed.Dim,
 		logger,
 	)
+	sched.SetMemoryHooks(memSvc, pol)
 
 	var conSrv *console.Server
 	if cfg.Console.Enabled {

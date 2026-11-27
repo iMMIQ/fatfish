@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -99,13 +100,27 @@ func (s *Service) BuildSnapshot(ctx context.Context, ch model.ChannelID, activeM
 	}, nil
 }
 
-// FormatMemberCard formats corroborated (non-tentative) facts and jokes cleanly for prompt injection.
+// FormatMemberCard formats corroborated (non-tentative) facts ranked by time-decayed confidence
+// and jokes cleanly for prompt injection.
 func FormatMemberCard(p model.MemberProfile, displayName string) string {
-	var facts []string
+	nowMs := time.Now().UnixMilli()
+	type scoredFact struct {
+		text  string
+		score float64
+	}
+	var ranked []scoredFact
 	for _, f := range p.Facts {
 		if !f.Tentative && f.Confidence >= 0.5 && strings.TrimSpace(f.Text) != "" {
-			facts = append(facts, f.Text)
+			ranked = append(ranked, scoredFact{
+				text:  f.Text,
+				score: decayedFactScore(f, nowMs),
+			})
 		}
+	}
+	sort.Slice(ranked, func(i, j int) bool { return ranked[i].score > ranked[j].score })
+	facts := make([]string, 0, 5)
+	for _, rf := range ranked {
+		facts = append(facts, rf.text)
 		if len(facts) >= 5 {
 			break
 		}
@@ -589,7 +604,85 @@ func (s *Service) MergeCandidateFact(ctx context.Context, ch model.ChannelID, me
 			UpdatedAt:        now,
 		})
 	}
+	p.Facts = CompactProfileFacts(p.Facts, now)
 	return s.store.SaveProfile(ctx, p)
+}
+
+const (
+	maxConfirmedProfileFacts = 20
+	maxTentativeProfileFacts = 15
+	tentativeExpireDays      = 60.0
+	factDecayHalfLifeDays    = 90.0
+)
+
+func decayedFactScore(f model.ProfileFact, nowMs int64) float64 {
+	if f.UpdatedAt <= 0 || nowMs <= f.UpdatedAt {
+		return f.Confidence
+	}
+	ageDays := float64(nowMs-f.UpdatedAt) / (24 * 3600 * 1000)
+	return f.Confidence * math.Exp(-ageDays/factDecayHalfLifeDays)
+}
+
+// CompactProfileFacts applies time decay, expires uncorroborated tentative facts older than 60d,
+// and caps stored facts per member (<=20 confirmed, <=15 tentative) so L2 profiles never bloat unboundedly.
+func CompactProfileFacts(facts []model.ProfileFact, nowMs int64) []model.ProfileFact {
+	var confirmed, tentative []model.ProfileFact
+	for _, f := range facts {
+		if strings.TrimSpace(f.Text) == "" {
+			continue
+		}
+		if f.Tentative {
+			if f.UpdatedAt > 0 && nowMs > f.UpdatedAt {
+				ageDays := float64(nowMs-f.UpdatedAt) / (24 * 3600 * 1000)
+				if ageDays > tentativeExpireDays {
+					continue // Expire stale single-episode tentative claim
+				}
+			}
+			tentative = append(tentative, f)
+		} else {
+			confirmed = append(confirmed, f)
+		}
+	}
+
+	sort.Slice(confirmed, func(i, j int) bool {
+		si := decayedFactScore(confirmed[i], nowMs)
+		sj := decayedFactScore(confirmed[j], nowMs)
+		if si == sj {
+			return confirmed[i].UpdatedAt > confirmed[j].UpdatedAt
+		}
+		return si > sj
+	})
+	if len(confirmed) > maxConfirmedProfileFacts {
+		confirmed = confirmed[:maxConfirmedProfileFacts]
+	}
+
+	sort.Slice(tentative, func(i, j int) bool {
+		return tentative[i].UpdatedAt > tentative[j].UpdatedAt
+	})
+	if len(tentative) > maxTentativeProfileFacts {
+		tentative = tentative[:maxTentativeProfileFacts]
+	}
+
+	out := make([]model.ProfileFact, 0, len(confirmed)+len(tentative))
+	out = append(out, confirmed...)
+	out = append(out, tentative...)
+	return out
+}
+
+// DistillIncremental runs a lightweight bounded incremental distillation pass (<=5 new episodes,
+// concurrency=1) for a single channel inside the live serve process, updating RAM vectors immediately.
+func (s *Service) DistillIncremental(ctx context.Context, ch model.ChannelID) (int, error) {
+	return s.DistillChannel(ctx, DistillOptions{
+		ChannelID:   ch,
+		MaxEpisodes: 5,
+		Concurrency: 1,
+		Role:        "distill",
+	})
+}
+
+// ReloadIndex refreshes the in-memory float16 episode index from SQLite (picks up external CLI distill runs).
+func (s *Service) ReloadIndex(ctx context.Context) (int, error) {
+	return s.LoadIndex(ctx)
 }
 
 func (s *Service) AddProfileJoke(ctx context.Context, ch model.ChannelID, memberID, jokeText string, episodeID int64) error {

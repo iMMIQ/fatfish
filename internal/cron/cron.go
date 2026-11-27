@@ -24,16 +24,37 @@ type Dispatcher interface {
 	DispatchSystem(ev model.SystemTriggerEvent)
 }
 
-// Scheduler polls persistent SQLite schedules and posts SystemTriggerEvents into Rooms.
+// MemoryHooks lets the scheduler run lightweight hourly incremental distillation
+// and refresh the live RAM episode vector index without introducing package cycles.
+type MemoryHooks interface {
+	DistillIncremental(ctx context.Context, ch model.ChannelID) (int, error)
+	ReloadIndex(ctx context.Context) (int, error)
+}
+
+// ChannelFilter restricts background memory maintenance to enabled channels.
+type ChannelFilter interface {
+	ChannelAllowed(ch model.ChannelID) bool
+}
+
+// Scheduler polls persistent SQLite schedules and posts SystemTriggerEvents into Rooms,
+// and runs periodic maintenance (hourly incremental memory distill, daily digests, WAL/media cleanup).
 type Scheduler struct {
 	store          *store.Store
 	hub            *infer.Hub
 	dispatcher     Dispatcher
+	memHooks       MemoryHooks
+	chanFilter     ChannelFilter
 	loc            *time.Location
 	maxPerChannel  int
 	minIntervalMin int
 	embedDim       int
 	log            *slog.Logger
+}
+
+// SetMemoryHooks attaches optional in-process incremental memory distillation and channel filtering.
+func (s *Scheduler) SetMemoryHooks(hooks MemoryHooks, filter ChannelFilter) {
+	s.memHooks = hooks
+	s.chanFilter = filter
 }
 
 func NewScheduler(st *store.Store, hub *infer.Hub, disp Dispatcher, loc *time.Location, maxPerChannel, minIntervalMin, embedDim int, logger *slog.Logger) *Scheduler {
@@ -133,8 +154,10 @@ func (s *Scheduler) CreateSchedule(ctx context.Context, ch model.ChannelID, crea
 // Start runs the background scheduler loop until ctx is cancelled.
 func (s *Scheduler) Start(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
+	distillTicker := time.NewTicker(1 * time.Hour)
 	maintTicker := time.NewTicker(6 * time.Hour)
 	defer ticker.Stop()
+	defer distillTicker.Stop()
 	defer maintTicker.Stop()
 
 	for {
@@ -143,9 +166,80 @@ func (s *Scheduler) Start(ctx context.Context) {
 			return
 		case now := <-ticker.C:
 			s.tick(ctx, now)
+			s.maybeRunDailyDigests(ctx, now)
+		case <-distillTicker.C:
+			s.RunIncrementalDistill(ctx)
 		case now := <-maintTicker.C:
 			s.runMaintenance(ctx, now)
 		}
+	}
+}
+
+// RunIncrementalDistill refreshes RAM episode vectors (picking up any external CLI runs)
+// and incrementally distills new messages across all allowed channels.
+func (s *Scheduler) RunIncrementalDistill(ctx context.Context) {
+	if s.memHooks == nil {
+		return
+	}
+	if n, err := s.memHooks.ReloadIndex(ctx); err == nil {
+		s.log.Info("reloaded episode vector index", "count", n)
+	}
+	chs, err := s.store.ListChannels(ctx)
+	if err != nil {
+		return
+	}
+	total := 0
+	for _, c := range chs {
+		if ctx.Err() != nil {
+			return
+		}
+		if s.chanFilter != nil && !s.chanFilter.ChannelAllowed(c.ChannelID) {
+			continue
+		}
+		n, err := s.memHooks.DistillIncremental(ctx, c.ChannelID)
+		if err != nil {
+			s.log.Warn("incremental distill failed", "channel", c.ChannelID, "err", err)
+			continue
+		}
+		total += n
+	}
+	if total > 0 {
+		s.log.Info("hourly incremental distill finished", "new_episodes", total)
+	}
+}
+
+// maybeRunDailyDigests generates yesterday's channel digests once per day after 00:15 local time.
+func (s *Scheduler) maybeRunDailyDigests(ctx context.Context, now time.Time) {
+	local := now.In(s.loc)
+	if local.Hour() != 0 || local.Minute() < 15 {
+		return
+	}
+	yesterday := local.AddDate(0, 0, -1)
+	dayKey := yesterday.Format("2006-01-02")
+	metaKey := "daily_digest_done:" + dayKey
+	if done, err := s.store.GetMeta(ctx, metaKey); err == nil && done == "1" {
+		return
+	}
+	_ = s.store.SetMeta(ctx, metaKey, "1")
+
+	chs, err := s.store.ListChannels(ctx)
+	if err != nil {
+		return
+	}
+	generated := 0
+	for _, c := range chs {
+		if ctx.Err() != nil {
+			return
+		}
+		if s.chanFilter != nil && !s.chanFilter.ChannelAllowed(c.ChannelID) {
+			continue
+		}
+		if d, err := s.GenerateDailyDigest(ctx, c.ChannelID, yesterday); err == nil && d != nil {
+			generated++
+		}
+	}
+	if generated > 0 {
+		s.log.Info("generated daily digests", "day", dayKey, "channels", generated)
 	}
 }
 

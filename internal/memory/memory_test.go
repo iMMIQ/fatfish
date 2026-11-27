@@ -58,3 +58,43 @@ func TestAntiSarcasmCorroborationAndChannelIsolation(t *testing.T) {
 		t.Fatalf("expected empty profile in ch2, got %+v", p2)
 	}
 }
+
+func TestProfileDecayAndCap(t *testing.T) {
+	now := int64(1760000000000)
+	dayMs := int64(24 * 3600 * 1000)
+
+	var in []model.ProfileFact
+	// Add 1 stale tentative (>60d) that must expire and 1 fresh tentative that must survive.
+	in = append(in, model.ProfileFact{Text: "stale joke claim", Confidence: 0.4, Tentative: true, UpdatedAt: now - 75*dayMs})
+	in = append(in, model.ProfileFact{Text: "fresh claim", Confidence: 0.4, Tentative: true, UpdatedAt: now - 5*dayMs})
+
+	// Add 25 confirmed facts: oldest low-confidence facts must be evicted past cap (20).
+	for i := 0; i < 25; i++ {
+		in = append(in, model.ProfileFact{
+			Text:       "fact_" + string(rune('a'+i)),
+			Confidence: 0.75,
+			Tentative:  false,
+			UpdatedAt:  now - int64(i*15)*dayMs,
+		})
+	}
+
+	out := CompactProfileFacts(in, now)
+	confirmedCnt, tentativeCnt := 0, 0
+	for _, f := range out {
+		if f.Text == "stale joke claim" {
+			t.Fatal("expected >60d tentative fact to expire")
+		}
+		if f.Tentative {
+			tentativeCnt++
+		} else {
+			confirmedCnt++
+		}
+	}
+	if confirmedCnt != maxConfirmedProfileFacts || tentativeCnt != 1 {
+		t.Fatalf("expected %d confirmed and 1 tentative, got confirmed=%d tentative=%d",
+			maxConfirmedProfileFacts, confirmedCnt, tentativeCnt)
+	}
+	if out[0].Text != "fact_a" {
+		t.Fatalf("expected freshest confirmed fact_a ranked first, got %q", out[0].Text)
+	}
+}
