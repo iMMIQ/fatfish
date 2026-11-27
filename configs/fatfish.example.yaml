@@ -1,0 +1,163 @@
+# fatfish public example configuration
+# Copy to fatfish.yaml (gitignored) and supply secrets via environment variables.
+
+data_dir: "./data"
+timezone: "Asia/Shanghai"
+
+transport:
+  onebot:
+    ws_url: "ws://127.0.0.1:6199"
+    # Or run as a Reverse WebSocket server (NapCat connects inbound):
+    # ws_listen: "0.0.0.0:6199"
+    token: "${ONEBOT_TOKEN}"
+    self_id: "100000001"
+    admin_ids:
+      - "100000002"
+    reconnect_min_sec: 1
+    reconnect_max_sec: 30
+    api_timeout_sec: 10
+
+models:
+  primary:
+    base_url: "${LLM_BASE_URL}"
+    api_key: "${LLM_API_KEY}"
+    model: "glm-5.3-flash"
+    multimodal: true
+    timeout_sec: 90
+  fast:
+    base_url: "${LLM_BASE_URL}"
+    api_key: "${LLM_API_KEY}"
+    model: "glm-5.3-flash"
+    timeout_sec: 20
+  distill:
+    base_url: "http://127.0.0.1:8088/v1"
+    api_key: "${LOCAL_INFER_API_KEY}"
+    model: "local-distill-model"
+    timeout_sec: 120
+    max_concurrent: 1
+  embed:
+    base_url: "http://127.0.0.1:8088/v1"
+    api_key: "${LOCAL_INFER_API_KEY}"
+    model: "local-embed-model"
+    dim: 2048
+    max_batch: 64
+    timeout_sec: 15
+  rerank:
+    base_url: "http://127.0.0.1:8088/v1"
+    api_key: "${LOCAL_INFER_API_KEY}"
+    model: "local-rerank-model"
+    max_batch: 64
+    timeout_sec: 15
+  asr:
+    base_url: "http://127.0.0.1:8088/v1"
+    api_key: "${LOCAL_INFER_API_KEY}"
+    model: "local-asr-model"
+    timeout_sec: 15
+  translate:
+    enabled: false
+    base_url: "http://127.0.0.1:8088/v1"
+    api_key: "${LOCAL_INFER_API_KEY}"
+    model: "local-translate-model"
+    timeout_sec: 30
+
+persona:
+  file: "configs/personas/example.md"
+
+frame:
+  input_token_budget: 32768
+  trim_high_water: 0.80
+  trim_low_water: 0.50
+  segment_idle_minutes: 30
+  summary_token_budget: 512
+  pinned_snapshot_budgets:
+    lore: 120
+    notes: 140
+    profiles: 220
+  max_images_per_request: 6
+  max_background_images: 2
+  image_token_reserve: 1600
+  image_max_dim: 1280
+  max_image_mib: 10
+  media_retention_hours: 24
+  room_media_mib: 256
+  total_media_mib: 1024
+
+policy:
+  enabled_channels: []
+  disabled_channels: []
+  ignored_bots: []
+  nicknames: ["fatfish", "fish"]
+  mention_wait_sec: 1.0
+  media_wait_sec: 3.0
+  asr_wait_sec: 4.0
+  input_debounce_sec: 1.2
+  proactive_cooldown_sec: 60
+  gate_token_budget: 4096
+  gate_include_images: false
+  thread_continuation_sec: 90
+  thread_max_turns: 3
+  thread_min_interval_sec: 4.0
+  mute_backoff_sec: 1800
+  smart_reply_decoration: true
+  split_newline_bubbles: true
+  max_reply_bubbles: 4
+  bubble_typing_delay_max_sec: 1.0
+  strip_trailing_period: true
+  plus_one:
+    enabled: true
+    min_users: 3
+    repeat_prob: 0.32
+    break_prob: 0.06
+    cooldown_sec: 180
+  poke:
+    mode: "bot_only" # bot_only | all | ignore
+    reverse_prob: 0.0
+    after_reply_prob: 0.15
+    after_reply_max_chars: 35
+    after_reply_delay_sec: 0.5
+  rules:
+    reply_gate: "mentioned || replied_to_bot || poked || (in_thread && thread_turns < 3) || (!is_night && cooldown_ok && (hit_nickname ? rand < 0.70 : rand < 0.03))"
+    drop_stale: "proactive && (new_msgs >= 4 || wait_sec >= 20)"
+    auto_collect_sticker: "is_group && !from_bot && image_kb > 0 && image_kb < 2048"
+  overrides:
+    "onebot:100000001:group:123456789":
+      rules:
+        reply_gate: "mentioned || replied_to_bot || poked || (cooldown_ok && rand < 0.05)"
+
+sticker:
+  enabled: true
+  pack_dir: "./data/stickers"
+  default_pack: "default"
+  doc_centering_alpha: 0.7
+  reaction_intent_weight: 0.75
+  explicit_intent_weight: 0.25
+  recent_window: 30
+  mmr_lambda: 0.7
+  async_send_timeout_sec: 15
+  auto_collect: false
+
+tools:
+  default_timeout_sec: 30
+  allow_relay_channels: []
+  max_schedules_per_channel: 10
+  min_cron_interval_minutes: 5
+  chart_font_path: "./assets/fonts/NotoSansSC-Regular.ttf"
+  starlark_max_steps: 500000
+  starlark_timeout_sec: 3
+  ssrf_allow_hosts:
+    - "127.0.0.1"
+
+mcp:
+  servers: []
+  # Example Streamable HTTP MCP server:
+  # - name: "web_search"
+  #   transport: "streamable_http"
+  #   url: "https://example.com/mcp"
+  #   headers:
+  #     Authorization: "Bearer ${MCP_API_KEY}"
+  #   timeout_sec: 30
+
+console:
+  enabled: true
+  listen: "127.0.0.1:6185"
+  token: "${FATFISH_CONSOLE_TOKEN}"

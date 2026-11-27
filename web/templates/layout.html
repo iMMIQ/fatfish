@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>fatfish Console</title>
+  <script src="/static/htmx.min.js"></script>
+  <style>
+    :root { --bg:#0f172a; --card:#1e293b; --border:#334155; --text:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --ok:#22c55e; --warn:#f59e0b; --err:#ef4444; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:ui-sans-serif,system-ui,-apple-system,sans-serif; background:var(--bg); color:var(--text); }
+    header { display:flex; align-items:center; justify-content:space-between; padding:12px 20px; border-bottom:1px solid var(--border); background:#0b1220; }
+    header h1 { margin:0; font-size:18px; color:var(--accent); }
+    nav { display:flex; gap:10px; }
+    nav a { color:var(--muted); text-decoration:none; padding:6px 12px; border-radius:6px; font-size:14px; }
+    nav a.active, nav a:hover { background:var(--card); color:var(--text); }
+    main { max-width:1180px; margin:20px auto; padding:0 16px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; margin-bottom:16px; }
+    .card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:14px; margin-bottom:14px; }
+    .card h2, .card h3 { margin:0 0 10px 0; font-size:15px; color:#f8fafc; }
+    .kpi { font-size:24px; font-weight:700; color:var(--accent); }
+    .muted { color:var(--muted); font-size:12px; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--border); vertical-align:top; }
+    th { color:var(--muted); font-weight:600; }
+    .badge { display:inline-block; padding:2px 7px; border-radius:999px; font-size:11px; font-weight:600; }
+    .ok { background:rgba(34,197,94,.2); color:var(--ok); }
+    .warn { background:rgba(245,158,11,.2); color:var(--warn); }
+    .err { background:rgba(239,68,68,.2); color:var(--err); }
+    textarea, input, select { width:100%; background:#0b1220; color:var(--text); border:1px solid var(--border); border-radius:6px; padding:8px; font-family:ui-monospace,monospace; font-size:13px; }
+    button { background:var(--accent); color:#0b1220; border:none; border-radius:6px; padding:7px 14px; font-weight:600; cursor:pointer; }
+    button.secondary { background:var(--border); color:var(--text); }
+    pre.logbox { background:#0b1220; border:1px solid var(--border); border-radius:6px; padding:10px; height:460px; overflow:auto; font-size:12px; line-height:1.45; }
+    .row { display:flex; gap:10px; align-items:center; margin-bottom:10px; }
+    .row > * { flex:1; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>fatfish</h1>
+  {{if ne .Page "login"}}
+  <nav>
+    <a href="/" class="{{if eq .Page "dashboard"}}active{{end}}">Dashboard</a>
+    <a href="/config" class="{{if eq .Page "config"}}active{{end}}">Config & Policy</a>
+    <a href="/memory" class="{{if eq .Page "memory"}}active{{end}}">Memory</a>
+    <a href="/stickers" class="{{if eq .Page "stickers"}}active{{end}}">Stickers</a>
+    <a href="/logs" class="{{if eq .Page "logs"}}active{{end}}">Live Logs</a>
+  </nav>
+  {{end}}
+</header>
+<main>
+{{if eq .Page "login"}}
+  <div class="card" style="max-width:420px;margin:60px auto;">
+    <h2>Console Authentication</h2>
+    {{if .Error}}<p class="badge err">{{.Error}}</p>{{end}}
+    <form method="POST" action="/login">
+      <p class="muted">Enter FATFISH_CONSOLE_TOKEN (stored in HttpOnly SameSite=Strict cookie).</p>
+      <input type="password" name="token" placeholder="Console Token" required autofocus />
+      <div style="margin-top:12px;"><button type="submit">Sign In</button></div>
+    </form>
+  </div>
+
+{{else if eq .Page "dashboard"}}
+  <div class="grid">
+    <div class="card"><div class="muted">Go Heap Alloc</div><div class="kpi">{{printf "%.1f" .HeapMiB}} MiB</div></div>
+    <div class="card"><div class="muted">Goroutines</div><div class="kpi">{{.Goroutines}}</div></div>
+    <div class="card"><div class="muted">Active Rooms</div><div class="kpi">{{.ActiveRooms}}</div></div>
+    <div class="card"><div class="muted">KV Prefix Cache Hit Rate</div><div class="kpi">{{printf "%.1f%%" .KVHitRate}}</div></div>
+  </div>
+
+  <div class="card">
+    <h2>Inference Circuit Breakers</h2>
+    <table>
+      <thead><tr><th>Capability</th><th>State</th><th>Calls</th><th>Errors</th><th>Last Error</th></tr></thead>
+      <tbody>
+        {{range .Breakers}}
+        <tr>
+          <td>{{.Name}}</td>
+          <td><span class="badge {{if eq (printf "%s" .State) "closed"}}ok{{else if eq (printf "%s" .State) "half_open"}}warn{{else}}err{{end}}">{{.State}}</span></td>
+          <td>{{.TotalCalls}}</td>
+          <td>{{.TotalErrors}}</td>
+          <td class="muted">{{.LastError}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Tool Latency & Errors</h2>
+    <table>
+      <thead><tr><th>Tool</th><th>Calls</th><th>Errors</th><th>Avg Latency (ms)</th><th>Last Error</th></tr></thead>
+      <tbody>
+        {{range .ToolStats}}
+        <tr><td>{{.Name}}</td><td>{{.Calls}}</td><td>{{.Errors}}</td><td>{{.AvgMs}}</td><td class="muted">{{.LastErrStr}}</td></tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Recent KV Cache Telemetry</h2>
+    <table>
+      <thead><tr><th>Channel</th><th>Segment</th><th>Prompt</th><th>Cached</th><th>Hit %</th><th>Latency</th></tr></thead>
+      <tbody>
+        {{range .KVMetrics}}
+        <tr>
+          <td>{{.ChannelID}}</td><td>#{{.SegmentID}}</td><td>{{.PromptTokens}}</td><td>{{.CachedTokens}}</td>
+          <td>{{if gt .PromptTokens 0}}{{printf "%.1f%%" (pct .CachedTokens .PromptTokens)}}{{else}}-{{end}}</td>
+          <td>{{.LatencyMs}}ms</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+
+{{else if eq .Page "config"}}
+  <div class="card">
+    <h2>YAML Configuration & expr Policy Live Editor</h2>
+    <p class="muted">Saving compiles every expr rule before atomically swapping live config. Invalid syntax is rejected cleanly.</p>
+    <form hx-post="/api/config/save" hx-target="#cfg-status" hx-swap="innerHTML">
+      <textarea name="yaml" rows="24">{{.ConfigYAML}}</textarea>
+      <div style="margin-top:10px;display:flex;gap:10px;align-items:center;">
+        <button type="submit">Validate & Atomic Save</button>
+        <div id="cfg-status"></div>
+      </div>
+    </form>
+  </div>
+
+{{else if eq .Page "memory"}}
+  <div class="card">
+    <h2>Memory Explorer (Channel-Isolated)</h2>
+    <form method="GET" action="/memory" class="row">
+      <select name="channel">
+        {{range .Channels}}
+        <option value="{{.ChannelID}}" {{if eq (printf "%s" .ChannelID) $.SelectedChannel}}selected{{end}}>{{.ChannelID}} (epoch {{.Epoch}})</option>
+        {{end}}
+      </select>
+      <button type="submit" style="flex:0 0 auto;">Load Channel</button>
+    </form>
+  </div>
+
+  {{if .SelectedChannel}}
+  <div class="card">
+    <h3>Pinned Notes</h3>
+    <form hx-post="/api/memory/note" hx-target="#note-status" class="row">
+      <input type="hidden" name="channel" value="{{.SelectedChannel}}" />
+      <input name="key" placeholder="Note key" required />
+      <input name="content" placeholder="Note content" required />
+      <button type="submit" style="flex:0 0 auto;">Save Pinned Note</button>
+    </form>
+    <div id="note-status" class="muted"></div>
+    <table>
+      <thead><tr><th>Key</th><th>Content</th><th>Pinned</th><th>Action</th></tr></thead>
+      <tbody>
+        {{range .Notes}}
+        <tr>
+          <td>{{.Key}}</td><td>{{.Content}}</td><td>{{.Pinned}}</td>
+          <td><button class="secondary" hx-post="/api/memory/note/delete" hx-vals='{"channel":"{{$.SelectedChannel}}","key":"{{.Key}}"}' hx-swap="outerHTML">Delete</button></td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>L1 Episodes</h3>
+    <table>
+      <thead><tr><th>Time</th><th>Topic</th><th>Summary</th></tr></thead>
+      <tbody>
+        {{range .Episodes}}
+        <tr><td class="muted">{{.StartTS.Format "2006-01-02 15:04"}}</td><td>{{.Topic}}</td><td>{{.Summary}}</td></tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>L2 Profiles & Lore</h3>
+    <table>
+      <thead><tr><th>Member ID</th><th>Corroborated Facts</th><th>Separated Jokes</th></tr></thead>
+      <tbody>
+        {{range .Profiles}}
+        <tr>
+          <td>{{.MemberID}}</td>
+          <td>{{range .Facts}}<div>{{if .Tentative}}[tentative] {{end}}{{.Text}} ({{printf "%.2f" .Confidence}})</div>{{end}}</td>
+          <td class="muted">{{range .Jokes}}<div>{{.Text}}</div>{{end}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{end}}
+
+{{else if eq .Page "stickers"}}
+  <div class="card">
+    <h2>Sticker Dual-Vector Search Lab</h2>
+    <form hx-get="/api/stickers/search" hx-target="#stk-results" class="row">
+      <input name="q" placeholder="Test query e.g. 无语摊手 / 摸鱼" required />
+      <button type="submit" style="flex:0 0 auto;">Search</button>
+    </form>
+    <div id="stk-results"></div>
+  </div>
+
+  <div class="card">
+    <h2>Needs Review Queue ({{len .ReviewStickers}})</h2>
+    <table>
+      <thead><tr><th>ID</th><th>Pack</th><th>Path</th><th>Intent / Content</th><th>Action</th></tr></thead>
+      <tbody>
+        {{range .ReviewStickers}}
+        <tr>
+          <td>{{.StickerID}}</td><td>{{.PackID}}</td><td class="muted">{{.RelPath}}</td>
+          <td>
+            <form hx-post="/api/stickers/approve" hx-swap="outerHTML" class="row">
+              <input type="hidden" name="id" value="{{.StickerID}}" />
+              <input name="ocr" value="{{.OCRText}}" placeholder="OCR text" />
+              <input name="intent" value="{{.IntentText}}" placeholder="Intent / scenes" />
+              <input name="content" value="{{.ContentText}}" placeholder="Visual content" />
+              <button type="submit" style="flex:0 0 auto;">Approve</button>
+            </form>
+          </td>
+          <td><span class="badge warn">{{.Status}}</span></td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+
+{{else if eq .Page "logs"}}
+  <div class="card">
+    <h2>Live Structured Log Stream (SSE)</h2>
+    <pre id="logbox" class="logbox">{{range .RecentLogs}}{{.}}
+{{end}}</pre>
+    <script>
+      const box = document.getElementById('logbox');
+      const es = new EventSource('/api/logs/stream');
+      es.onmessage = (e) => {
+        box.textContent += e.data + "\n";
+        box.scrollTop = box.scrollHeight;
+      };
+    </script>
+  </div>
+{{end}}
+</main>
+</body>
+</html>

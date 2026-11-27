@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Privacy & Secret Gate
+        run: ./scripts/privacy-check.sh
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet & Race Tests
+        run: |
+          go vet ./...
+          go test -race -count=1 ./...
+
+      - name: Static Zero-CGO Build (amd64)
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o fatfish ./cmd/fatfish

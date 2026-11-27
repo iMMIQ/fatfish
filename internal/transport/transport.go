@@ -1,0 +1,31 @@
+package transport
+
+import (
+	"context"
+	"errors"
+
+	"github.com/iMMIQ/fatfish/internal/model"
+)
+
+// ErrRiskMuted indicates platform anti-spam or group mute rejection (e.g. OneBot retcode 1200).
+var ErrRiskMuted = errors.New("transport: message rejected due to mute or risk control")
+
+// SendOptions controls optional reply quote and @mention decoration on outbound messages.
+type SendOptions struct {
+	ReplyToMsgID  string
+	MentionUserID string
+}
+
+// Transport abstracts a messaging platform adapter (OneBot v11, Telegram, Discord, etc.).
+type Transport interface {
+	Start(ctx context.Context, onMessage func(*model.Message)) error
+	Stop() error
+	SelfID() string
+
+	SendText(ctx context.Context, ch model.ChannelID, text string, opts SendOptions) (platformMsgID string, err error)
+	SendImage(ctx context.Context, ch model.ChannelID, imgBytes []byte, mimeType string, opts SendOptions) (platformMsgID string, err error)
+	SendPoke(ctx context.Context, ch model.ChannelID, targetUserID string) error
+	SendReaction(ctx context.Context, ch model.ChannelID, platformMsgID string, emojiID string) error
+	FetchAudio(ctx context.Context, fileID, outFormat string) (audioBytes []byte, filename string, err error)
+	GetMessage(ctx context.Context, ch model.ChannelID, platformMsgID string) (*model.Message, error)
+}
