@@ -463,7 +463,8 @@ func (s *Service) DistillWindow(ctx context.Context, ch model.ChannelID, win []m
 Rules:
 1. Key every participant strictly by their immutable member_id shown in parentheses, NEVER by nickname.
 2. Separate jokes/sarcasm/shitposting into candidate_jokes or candidate_lore; NEVER record sarcasm as candidate_facts.
-3. Output ONLY valid compact JSON matching:
+3. Keep arrays compact (at most 5 items each) so the JSON stays concise and valid.
+4. Output ONLY valid compact JSON matching:
 {"topic":"...","summary":"...","participants":[{"id":"...","role_in_topic":"..."}],"notable_quotes":["..."],"candidate_facts":[{"member_id":"...","fact":"...","serious":true}],"candidate_jokes":[{"member_id":"...","joke":"..."}],"candidate_lore":[{"term":"...","meaning":"..."}]}`
 
 	resp, err := s.hub.Chat(ctx, role, infer.ChatRequest{
@@ -471,7 +472,7 @@ Rules:
 			{Role: "system", Content: sysPrompt},
 			{Role: "user", Content: transcript},
 		},
-		MaxTokens:          1024,
+		MaxTokens:          2048,
 		ResponseFormat:     map[string]any{"type": "json_object"},
 		ChatTemplateKwargs: map[string]any{"enable_thinking": false},
 	})
