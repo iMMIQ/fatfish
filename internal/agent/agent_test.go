@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -74,15 +75,24 @@ func TestRunnerParallelReadOnlyToolsAndStickerMarker(t *testing.T) {
 			})
 			return
 		}
-		// Verify reasoning_content was preserved in multi-step tool loop.
+		// Verify reasoning_content was preserved and DirectMedia receipt was injected into tool messages.
 		foundReasoning := false
+		mediaReceipts := 0
 		for _, m := range req.Messages {
 			if m.Role == "assistant" && m.ReasoningContent == "thinking step 1" {
 				foundReasoning = true
 			}
+			if m.Role == "tool" {
+				if s, ok := m.Content.(string); ok && strings.Contains(s, "queued for direct delivery") {
+					mediaReceipts++
+				}
+			}
 		}
 		if !foundReasoning {
 			t.Errorf("expected reasoning_content preserved on iteration 2")
+		}
+		if mediaReceipts != 2 {
+			t.Errorf("expected 2 DirectMedia receipts injected into tool results, got %d", mediaReceipts)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"choices": []map[string]any{{

@@ -221,10 +221,31 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 			if res.SideEffect != "" {
 				r.log.Info("tool side effect", "channel", in.ChannelID, "tool", call.Function.Name, "effect", res.SideEffect)
 			}
+			outText := res.TextForLLM
 			if len(res.DirectMedia) > 0 {
 				directMedia = append(directMedia, res.DirectMedia...)
+				desc := make([]string, 0, len(res.DirectMedia))
+				for _, dm := range res.DirectMedia {
+					lbl := dm.Filename
+					if dm.Caption != "" {
+						if lbl != "" {
+							lbl += " (" + dm.Caption + ")"
+						} else {
+							lbl = dm.Caption
+						}
+					}
+					if lbl == "" {
+						lbl = dm.MimeType
+					}
+					desc = append(desc, lbl)
+				}
+				mediaNotice := fmt.Sprintf("[System: %d image(s) generated and queued for direct delivery to this channel right after your reply: %s]", len(res.DirectMedia), strings.Join(desc, ", "))
+				if outText == "" {
+					outText = mediaNotice
+				} else {
+					outText += "\n" + mediaNotice
+				}
 			}
-			outText := res.TextForLLM
 			if outText == "" {
 				outText = "(ok)"
 			}

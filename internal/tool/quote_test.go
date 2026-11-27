@@ -65,8 +65,15 @@ func TestNormalizeTickerAndParseTencentQuote(t *testing.T) {
 		t.Fatalf("unexpected summary: %q", summary)
 	}
 	detail := parseTencentQuoteDetail(rawUS, "usSMH")
-	if detail == nil || detail.PE != "28.4" || detail.High52W != "460.00" || detail.Low52W != "280.10" || detail.TotalMktCap != "$250.5亿" {
+	if detail == nil || detail.PE != "28.4" || detail.High52W != "460.00" || detail.Low52W != "280.10" || detail.TotalMktCap != "$250.5亿" || detail.Turnover != "$5.20亿" {
 		t.Fatalf("unexpected rich US detail: %+v", detail)
+	}
+
+	// US indices must NOT emit bogus volume*index_points fields[37] as dollar turnover.
+	rawIXIC := `v_us.IXIC="200~纳斯达克~.IXIC~23986.00~23586.00~23958.00~3110000000~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~2026-11-27 11:40:40~400.31~1.70~24029.00~23691.00~0~0~74620478000000~0~0~0~0~0~0~0~0~0~0~27722.75~20690.25";`
+	ixic := parseTencentQuoteDetail(rawIXIC, "us.IXIC")
+	if ixic == nil || ixic.Turnover != "" {
+		t.Fatalf("expected empty turnover for US index us.IXIC, got %+v", ixic)
 	}
 
 	// Rich A-share parsing (turnover, PE, PB, market cap, volume ratio)

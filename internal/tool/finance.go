@@ -278,6 +278,22 @@ func (t *QuoteTool) execQuotes(ctx context.Context, args QuoteArgs) (ToolResult,
 		}
 	}
 
+	if chartMode != "none" {
+		if len(media) > 0 {
+			names := make([]string, len(media))
+			for i, m := range media {
+				if m.Caption != "" {
+					names[i] = m.Caption
+				} else {
+					names[i] = m.Filename
+				}
+			}
+			fmt.Fprintf(&b, "\n[图表已生成: 共 %d 张 (%s)，将在你回复后自动发送到群里]\n", len(media), strings.Join(names, "；"))
+		} else {
+			fmt.Fprintf(&b, "\n[图表未生成: chart_mode=%s 需要足够的有效 K 线数据（compare 模式至少需要 2 个标的）]\n", chartMode)
+		}
+	}
+
 	return ToolResult{
 		TextForLLM:  netutil.WrapExternalData("quote:"+strings.Join(rawList, ","), strings.TrimSpace(b.String())),
 		DirectMedia: media,
@@ -934,14 +950,22 @@ func parseTencentQuoteDetail(raw, sym string) *quoteSnapshot {
 		sn.Low52W = cleanNonZero(getField(fields, 49))
 	case "200": // US
 		sn.Market = "us"
+		isUSIndex := strings.HasPrefix(sym, "us.") || strings.HasPrefix(sn.Code, ".")
 		if v := parseFloatSafe(getField(fields, 6)); v > 0 {
-			sn.Volume = formatCompactVol(v) + "股"
+			unit := "股"
+			if isUSIndex {
+				unit = ""
+			}
+			sn.Volume = formatCompactVol(v) + unit
 		}
-		if amt := parseFloatSafe(getField(fields, 37)); amt > 0 {
-			if amt >= 1e8 {
-				sn.Turnover = fmt.Sprintf("$%.2f亿", amt/1e8)
-			} else if amt >= 1e4 {
-				sn.Turnover = fmt.Sprintf("$%.1f万", amt/1e4)
+		// Tencent fields[37] for US indices (e.g. .IXIC/.INX/.DJI) is volume * index_points, not dollar turnover.
+		if !isUSIndex {
+			if amt := parseFloatSafe(getField(fields, 37)); amt > 0 {
+				if amt >= 1e8 {
+					sn.Turnover = fmt.Sprintf("$%.2f亿", amt/1e8)
+				} else if amt >= 1e4 {
+					sn.Turnover = fmt.Sprintf("$%.1f万", amt/1e4)
+				}
 			}
 		}
 		if tr := cleanNonZero(getField(fields, 38)); tr != "" {

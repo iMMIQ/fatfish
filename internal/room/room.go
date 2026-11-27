@@ -1415,13 +1415,22 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 			})
 		}
 
-		// 2. Send DirectMedia (e.g. PNG charts from compute) if text succeeded.
+		// 2. Send DirectMedia (e.g. PNG charts from compute/quote) if text succeeded.
 		if status == model.DeliverySent {
 			retention := time.Duration(cfg.Frame.MediaRetentionHours) * time.Hour
-			for _, dm := range plan.DirectMedia {
+		mediaLoop:
+			for di, dm := range plan.DirectMedia {
+				if len(sent) > 0 || di > 0 {
+					select {
+					case <-time.After(400 * time.Millisecond):
+					case <-ctx.Done():
+						status = model.DeliveryPartial
+						break mediaLoop
+					}
+				}
 				if r.epoch.Load() != plan.Epoch {
 					status = model.DeliveryAbortedEpoch
-					break
+					break mediaLoop
 				}
 				pid, err := r.mgr.tr.SendImage(ctx, r.ch, dm.Data, dm.MimeType, transport.SendOptions{})
 				if err != nil {
