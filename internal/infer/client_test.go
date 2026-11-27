@@ -100,3 +100,48 @@ func TestEmbedBatchingASRAndChatCachedTokens(t *testing.T) {
 		t.Fatalf("Chat cached tokens: resp=%+v err=%v", resp, err)
 	}
 }
+
+func TestPrimaryAutomaticFallback(t *testing.T) {
+	var primaryHits, fallbackHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Model == "glm-5.4" {
+			primaryHits.Add(1)
+			http.Error(w, "upstream overloaded", http.StatusServiceUnavailable)
+			return
+		}
+		if req.Model == "glm-5.3-flash" {
+			fallbackHits.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"finish_reason": "stop",
+					"message":       map[string]any{"content": "fallback-ok"},
+				}},
+			})
+			return
+		}
+		http.Error(w, "unexpected model "+req.Model, http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	hub := NewHub(config.ModelsConfig{
+		Primary:         config.ModelEndpointConfig{BaseURL: srv.URL, Model: "glm-5.4", TimeoutSec: 5},
+		PrimaryFallback: config.ModelEndpointConfig{Model: "glm-5.3-flash"},
+	})
+
+	for i := 0; i < 4; i++ {
+		resp, err := hub.Chat(context.Background(), "primary", ChatRequest{
+			Messages: []ChatMessage{{Role: "user", Content: "hello"}},
+		})
+		if err != nil || resp.Content != "fallback-ok" {
+			t.Fatalf("call %d expected fallback-ok, got resp=%+v err=%v", i, resp, err)
+		}
+	}
+	if primaryHits.Load() != 3 || fallbackHits.Load() != 4 {
+		t.Fatalf("expected 3 primary hits (then circuit open) and 4 fallback hits, got primary=%d fallback=%d",
+			primaryHits.Load(), fallbackHits.Load())
+	}
+}

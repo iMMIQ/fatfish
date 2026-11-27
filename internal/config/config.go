@@ -56,13 +56,14 @@ type OneBotConfig struct {
 }
 
 type ModelsConfig struct {
-	Primary   ModelEndpointConfig `yaml:"primary"`
-	Fast      ModelEndpointConfig `yaml:"fast"`
-	Distill   ModelEndpointConfig `yaml:"distill"`
-	Embed     ModelEndpointConfig `yaml:"embed"`
-	Rerank    ModelEndpointConfig `yaml:"rerank"`
-	ASR       ModelEndpointConfig `yaml:"asr"`
-	Translate ModelEndpointConfig `yaml:"translate"`
+	Primary         ModelEndpointConfig `yaml:"primary"`
+	PrimaryFallback ModelEndpointConfig `yaml:"primary_fallback"`
+	Fast            ModelEndpointConfig `yaml:"fast"`
+	Distill         ModelEndpointConfig `yaml:"distill"`
+	Embed           ModelEndpointConfig `yaml:"embed"`
+	Rerank          ModelEndpointConfig `yaml:"rerank"`
+	ASR             ModelEndpointConfig `yaml:"asr"`
+	Translate       ModelEndpointConfig `yaml:"translate"`
 }
 
 type ModelEndpointConfig struct {
@@ -365,6 +366,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Models.Primary.TimeoutSec <= 0 {
 		cfg.Models.Primary.TimeoutSec = 90
+	}
+	if cfg.Models.PrimaryFallback.TimeoutSec <= 0 {
+		cfg.Models.PrimaryFallback.TimeoutSec = cfg.Models.Primary.TimeoutSec
 	}
 	if cfg.Models.Fast.TimeoutSec <= 0 {
 		cfg.Models.Fast.TimeoutSec = 20

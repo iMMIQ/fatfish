@@ -121,13 +121,14 @@ func NewHub(cfg config.ModelsConfig) *Hub {
 		client:   &http.Client{Transport: tr},
 		heavySem: make(chan struct{}, maxHeavy),
 		breakers: map[string]*CircuitBreaker{
-			"primary":   NewCircuitBreaker("primary", 3, 30*time.Second),
-			"fast":      NewCircuitBreaker("fast", 3, 30*time.Second),
-			"distill":   NewCircuitBreaker("distill", 3, 30*time.Second),
-			"embed":     NewCircuitBreaker("embed", 3, 30*time.Second),
-			"rerank":    NewCircuitBreaker("rerank", 3, 30*time.Second),
-			"asr":       NewCircuitBreaker("asr", 3, 30*time.Second),
-			"translate": NewCircuitBreaker("translate", 3, 30*time.Second),
+			"primary":          NewCircuitBreaker("primary", 3, 30*time.Second),
+			"primary_fallback": NewCircuitBreaker("primary_fallback", 3, 30*time.Second),
+			"fast":             NewCircuitBreaker("fast", 3, 30*time.Second),
+			"distill":          NewCircuitBreaker("distill", 3, 30*time.Second),
+			"embed":            NewCircuitBreaker("embed", 3, 30*time.Second),
+			"rerank":           NewCircuitBreaker("rerank", 3, 30*time.Second),
+			"asr":              NewCircuitBreaker("asr", 3, 30*time.Second),
+			"translate":        NewCircuitBreaker("translate", 3, 30*time.Second),
 		},
 	}
 	return h
@@ -142,7 +143,7 @@ func (h *Hub) UpdateConfig(cfg config.ModelsConfig) {
 
 // BreakerSnapshots returns live status for all capability circuit breakers.
 func (h *Hub) BreakerSnapshots() []BreakerSnapshot {
-	names := []string{"primary", "fast", "distill", "embed", "rerank", "asr", "translate"}
+	names := []string{"primary", "primary_fallback", "fast", "distill", "embed", "rerank", "asr", "translate"}
 	out := make([]BreakerSnapshot, 0, len(names))
 	for _, n := range names {
 		if cb := h.breakers[n]; cb != nil {
@@ -161,6 +162,19 @@ func (h *Hub) endpoint(role string) (config.ModelEndpointConfig, *CircuitBreaker
 	switch role {
 	case "primary":
 		ep = cfg.Primary
+	case "primary_fallback":
+		ep = cfg.PrimaryFallback
+		if ep.Model != "" {
+			if strings.TrimSpace(ep.BaseURL) == "" {
+				ep.BaseURL = cfg.Primary.BaseURL
+			}
+			if strings.TrimSpace(ep.APIKey) == "" {
+				ep.APIKey = cfg.Primary.APIKey
+			}
+			if ep.TimeoutSec <= 0 {
+				ep.TimeoutSec = cfg.Primary.TimeoutSec
+			}
+		}
 	case "fast":
 		ep = cfg.Fast
 		if !ep.IsEnabled() {
@@ -191,9 +205,24 @@ func (h *Hub) ModelKey(role string) string {
 	return role + "|" + strings.TrimRight(ep.BaseURL, "/") + "|" + ep.Model
 }
 
-// Chat sends a Chat Completions request to role ("primary" | "fast" | "distill").
-// Never silently strips images on error.
+// Chat sends a Chat Completions request to role ("primary" | "primary_fallback" | "fast" | "distill").
+// When role == "primary" fails (upstream error or open circuit) and primary_fallback is configured,
+// it transparently falls back to primary_fallback. Never silently strips images on error.
 func (h *Hub) Chat(ctx context.Context, role string, req ChatRequest) (*ChatResponse, error) {
+	resp, err := h.chatOnce(ctx, role, req)
+	if err != nil && role == "primary" && ctx.Err() == nil {
+		if _, _, fbErr := h.endpoint("primary_fallback"); fbErr == nil {
+			fbReq := req
+			fbReq.Model = "" // Use primary_fallback's configured model ID
+			if fbResp, err2 := h.chatOnce(ctx, "primary_fallback", fbReq); err2 == nil {
+				return fbResp, nil
+			}
+		}
+	}
+	return resp, err
+}
+
+func (h *Hub) chatOnce(ctx context.Context, role string, req ChatRequest) (*ChatResponse, error) {
 	ep, cb, err := h.endpoint(role)
 	if err != nil {
 		return nil, err
