@@ -1062,11 +1062,15 @@ func (r *Room) onSystemTrigger(ev model.SystemTriggerEvent) bool {
 		r.mgr.log.Info("skipping scheduled trigger while muted", "channel", r.ch, "schedule_id", ev.ScheduleID)
 		return false
 	}
+	prefix := "[Scheduled Trigger] "
+	if ev.Kind == "price_alert" {
+		prefix = "[Price Alert Trigger] "
+	}
 	trigMsg := model.Message{
 		ChannelID:  r.ch,
 		SenderID:   "system",
 		SenderName: "System",
-		Parts:      []model.Part{{Kind: model.PartText, Text: "[Scheduled Trigger] " + ev.Prompt}},
+		Parts:      []model.Part{{Kind: model.PartText, Text: prefix + ev.Prompt}},
 		CreatedAt:  ev.CreatedAt,
 	}
 	r.pendingMsgs = append(r.pendingMsgs, trigMsg)

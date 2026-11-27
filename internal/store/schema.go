@@ -201,17 +201,35 @@ CREATE TABLE IF NOT EXISTS sticker_uses (
 CREATE INDEX IF NOT EXISTS idx_sticker_uses_chan ON sticker_uses(channel_id, used_at DESC);
 
 CREATE TABLE IF NOT EXISTS schedules (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel_id  TEXT NOT NULL,
-    creator_id  TEXT NOT NULL,
-    kind        TEXT NOT NULL,
-    cron_expr   TEXT NOT NULL DEFAULT '',
-    next_run_at INTEGER NOT NULL,
-    prompt      TEXT NOT NULL,
-    enabled     INTEGER NOT NULL DEFAULT 1,
-    created_at  INTEGER NOT NULL
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id       TEXT NOT NULL,
+    creator_id       TEXT NOT NULL,
+    kind             TEXT NOT NULL,
+    cron_expr        TEXT NOT NULL DEFAULT '',
+    market_days_only TEXT NOT NULL DEFAULT '',
+    next_run_at      INTEGER NOT NULL,
+    prompt           TEXT NOT NULL,
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    created_at       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run_at);
+
+CREATE TABLE IF NOT EXISTS price_alerts (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id        TEXT NOT NULL,
+    creator_id        TEXT NOT NULL,
+    symbol            TEXT NOT NULL,
+    display_name      TEXT NOT NULL DEFAULT '',
+    market            TEXT NOT NULL DEFAULT '',
+    condition         TEXT NOT NULL,
+    threshold         REAL NOT NULL,
+    cooldown_min      INTEGER NOT NULL DEFAULT 0,
+    last_triggered_at INTEGER NOT NULL DEFAULT 0,
+    prompt            TEXT NOT NULL DEFAULT '',
+    enabled           INTEGER NOT NULL DEFAULT 1,
+    created_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_price_alerts_active ON price_alerts(enabled, channel_id);
 
 CREATE TABLE IF NOT EXISTS daily_digests (
     channel_id TEXT NOT NULL,

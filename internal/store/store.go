@@ -48,6 +48,7 @@ func Open(dataDir string, imageMaxDim, maxImageMiB int) (*Store, error) {
 	}
 	// Idempotent additive migrations for existing SQLite databases.
 	_, _ = writeDB.Exec(`ALTER TABLE profiles ADD COLUMN style_note TEXT NOT NULL DEFAULT ''`)
+	_, _ = writeDB.Exec(`ALTER TABLE schedules ADD COLUMN market_days_only TEXT NOT NULL DEFAULT ''`)
 
 	readDSN := buildDSN(dbPath, true)
 	readDB, err := sql.Open("sqlite", readDSN)
@@ -1716,9 +1717,9 @@ func (s *Store) CreateSchedule(ctx context.Context, sc *model.Schedule, maxPerCh
 	now := time.Now()
 	sc.CreatedAt = now
 	res, err := s.writeDB.ExecContext(ctx,
-		`INSERT INTO schedules (channel_id, creator_id, kind, cron_expr, next_run_at, prompt, enabled, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
-		string(sc.ChannelID), sc.CreatorID, sc.Kind, sc.CronExpr, sc.NextRunAt.UnixMilli(), sc.Prompt, now.UnixMilli(),
+		`INSERT INTO schedules (channel_id, creator_id, kind, cron_expr, market_days_only, next_run_at, prompt, enabled, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+		string(sc.ChannelID), sc.CreatorID, sc.Kind, sc.CronExpr, sc.MarketDaysOnly, sc.NextRunAt.UnixMilli(), sc.Prompt, now.UnixMilli(),
 	)
 	if err != nil {
 		return err
@@ -1729,7 +1730,7 @@ func (s *Store) CreateSchedule(ctx context.Context, sc *model.Schedule, maxPerCh
 }
 
 func (s *Store) ListSchedules(ctx context.Context, ch model.ChannelID, enabledOnly bool) ([]model.Schedule, error) {
-	q := `SELECT id, channel_id, creator_id, kind, cron_expr, next_run_at, prompt, enabled, created_at FROM schedules WHERE channel_id = ?`
+	q := `SELECT id, channel_id, creator_id, kind, cron_expr, market_days_only, next_run_at, prompt, enabled, created_at FROM schedules WHERE channel_id = ?`
 	if enabledOnly {
 		q += ` AND enabled = 1`
 	}
@@ -1744,7 +1745,7 @@ func (s *Store) ListSchedules(ctx context.Context, ch model.ChannelID, enabledOn
 
 func (s *Store) DueSchedules(ctx context.Context, now time.Time) ([]model.Schedule, error) {
 	rows, err := s.readDB.QueryContext(ctx,
-		`SELECT id, channel_id, creator_id, kind, cron_expr, next_run_at, prompt, enabled, created_at
+		`SELECT id, channel_id, creator_id, kind, cron_expr, market_days_only, next_run_at, prompt, enabled, created_at
 		 FROM schedules WHERE enabled = 1 AND next_run_at <= ? ORDER BY next_run_at ASC`,
 		now.UnixMilli(),
 	)
@@ -1793,7 +1794,7 @@ func scanSchedules(rows *sql.Rows) ([]model.Schedule, error) {
 		var chID string
 		var nextMs, createdMs int64
 		var en int
-		if err := rows.Scan(&sc.ID, &chID, &sc.CreatorID, &sc.Kind, &sc.CronExpr, &nextMs, &sc.Prompt, &en, &createdMs); err != nil {
+		if err := rows.Scan(&sc.ID, &chID, &sc.CreatorID, &sc.Kind, &sc.CronExpr, &sc.MarketDaysOnly, &nextMs, &sc.Prompt, &en, &createdMs); err != nil {
 			return nil, err
 		}
 		sc.ChannelID = model.ChannelID(chID)
@@ -1801,6 +1802,113 @@ func scanSchedules(rows *sql.Rows) ([]model.Schedule, error) {
 		sc.Enabled = en != 0
 		sc.CreatedAt = time.UnixMilli(createdMs)
 		out = append(out, sc)
+	}
+	return out, rows.Err()
+}
+
+// --- Zero-LLM Price Alerts ---
+
+func (s *Store) CreatePriceAlert(ctx context.Context, a *model.PriceAlert, maxPerChannel int) error {
+	if maxPerChannel <= 0 {
+		maxPerChannel = 20
+	}
+	var active int
+	_ = s.readDB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM price_alerts WHERE channel_id = ? AND enabled = 1`, string(a.ChannelID),
+	).Scan(&active)
+	if active >= maxPerChannel {
+		return fmt.Errorf("store: channel active price alert limit (%d) reached", maxPerChannel)
+	}
+	now := time.Now()
+	a.CreatedAt = now
+	res, err := s.writeDB.ExecContext(ctx,
+		`INSERT INTO price_alerts (channel_id, creator_id, symbol, display_name, market, condition, threshold, cooldown_min, last_triggered_at, prompt, enabled, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 1, ?)`,
+		string(a.ChannelID), a.CreatorID, a.Symbol, a.DisplayName, a.Market, a.Condition, a.Threshold, a.CooldownMin, a.Prompt, now.UnixMilli(),
+	)
+	if err != nil {
+		return err
+	}
+	a.ID, _ = res.LastInsertId()
+	a.Enabled = true
+	return nil
+}
+
+func (s *Store) ListPriceAlerts(ctx context.Context, ch model.ChannelID, enabledOnly bool) ([]model.PriceAlert, error) {
+	q := `SELECT id, channel_id, creator_id, symbol, display_name, market, condition, threshold, cooldown_min, last_triggered_at, prompt, enabled, created_at FROM price_alerts WHERE channel_id = ?`
+	if enabledOnly {
+		q += ` AND enabled = 1`
+	}
+	q += ` ORDER BY id ASC`
+	rows, err := s.readDB.QueryContext(ctx, q, string(ch))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanPriceAlerts(rows)
+}
+
+func (s *Store) AllEnabledPriceAlerts(ctx context.Context) ([]model.PriceAlert, error) {
+	rows, err := s.readDB.QueryContext(ctx,
+		`SELECT id, channel_id, creator_id, symbol, display_name, market, condition, threshold, cooldown_min, last_triggered_at, prompt, enabled, created_at
+		 FROM price_alerts WHERE enabled = 1 ORDER BY id ASC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanPriceAlerts(rows)
+}
+
+func (s *Store) MarkPriceAlertTriggered(ctx context.Context, id int64, triggeredAt time.Time, keepEnabled bool) error {
+	en := 0
+	if keepEnabled {
+		en = 1
+	}
+	_, err := s.writeDB.ExecContext(ctx,
+		`UPDATE price_alerts SET last_triggered_at = ?, enabled = ? WHERE id = ?`,
+		triggeredAt.UnixMilli(), en, id,
+	)
+	return err
+}
+
+func (s *Store) CancelPriceAlert(ctx context.Context, ch model.ChannelID, id int64, requesterID string, isAdmin bool) (bool, error) {
+	var res sql.Result
+	var err error
+	if isAdmin {
+		res, err = s.writeDB.ExecContext(ctx,
+			`UPDATE price_alerts SET enabled = 0 WHERE id = ? AND channel_id = ?`, id, string(ch))
+	} else {
+		res, err = s.writeDB.ExecContext(ctx,
+			`UPDATE price_alerts SET enabled = 0 WHERE id = ? AND channel_id = ? AND creator_id = ?`,
+			id, string(ch), requesterID,
+		)
+	}
+	if err != nil {
+		return false, err
+	}
+	aff, _ := res.RowsAffected()
+	return aff > 0, nil
+}
+
+func scanPriceAlerts(rows *sql.Rows) ([]model.PriceAlert, error) {
+	var out []model.PriceAlert
+	for rows.Next() {
+		var a model.PriceAlert
+		var chID string
+		var trigMs, createdMs int64
+		var en int
+		if err := rows.Scan(&a.ID, &chID, &a.CreatorID, &a.Symbol, &a.DisplayName, &a.Market, &a.Condition,
+			&a.Threshold, &a.CooldownMin, &trigMs, &a.Prompt, &en, &createdMs); err != nil {
+			return nil, err
+		}
+		a.ChannelID = model.ChannelID(chID)
+		if trigMs > 0 {
+			a.LastTriggeredAt = time.UnixMilli(trigMs)
+		}
+		a.Enabled = en != 0
+		a.CreatedAt = time.UnixMilli(createdMs)
+		out = append(out, a)
 	}
 	return out, rows.Err()
 }

@@ -113,7 +113,8 @@ func New(configPath string, enableTransport bool) (*App, error) {
 	// Register all 10 high-leverage built-in tools (SPEC 10.2).
 	webSearchTool := tool.NewWebSearchTool(cfg.Tools.SSRFAllowHosts)
 	readSourceTool := tool.NewReadSourceTool(hub, cfg.Tools.SSRFAllowHosts)
-	quoteTool := tool.NewQuoteTool(cfg.Tools.SSRFAllowHosts)
+	quoteTool := tool.NewQuoteTool(cfg.Tools.SSRFAllowHosts, computeTool.Renderer())
+	sched.SetPriceFetcher(quoteTool)
 	interactTool := tool.NewInteractTool(tr, cfg.Tools.AllowRelayChannels)
 	if err := registerBuiltins(reg, st, memSvc, stkEng, sched, computeTool, webSearchTool, readSourceTool, quoteTool, interactTool); err != nil {
 		_ = st.Close()

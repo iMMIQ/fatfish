@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,11 +22,10 @@ import (
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/xuri/excelize/v2"
-	"golang.org/x/text/encoding/simplifiedchinese"
-	"golang.org/x/text/transform"
 
 	"github.com/iMMIQ/fatfish/internal/infer"
 	"github.com/iMMIQ/fatfish/internal/netutil"
+	"github.com/iMMIQ/fatfish/internal/vec"
 )
 
 // --- 3. web_search ---
@@ -249,6 +249,8 @@ func (t *WebSearchTool) searchArxiv(ctx context.Context, q string, limit int) (s
 
 type ReadSourceArgs struct {
 	URL       string `json:"url" jsonschema:"required,description=URL to read (supports bilibili, b23.tv, arxiv, hf-mirror/huggingface, generic web pages, and .pdf/.xlsx/.docx/.txt files)"`
+	Query     string `json:"query,omitempty" jsonschema:"description=Optional question or keywords to semantically extract the most relevant sections from long financial reports, PDFs, or spreadsheets"`
+	Pages     string `json:"pages,omitempty" jsonschema:"description=Optional PDF page range e.g. '1-5' or '12-18' for targeted reading"`
 	Translate bool   `json:"translate,omitempty" jsonschema:"description=Optionally translate long foreign text to Simplified Chinese via internal translator"`
 }
 
@@ -311,10 +313,15 @@ func (t *ReadSourceTool) Execute(ctx context.Context, _ ToolContext, args ReadSo
 	case strings.Contains(host, "huggingface.co") || strings.Contains(host, "hf-mirror.com"):
 		content, err = t.readHuggingFace(ctx, u)
 	default:
-		content, err = t.readGenericOrDoc(ctx, rawURL)
+		firstPage, lastPage := parsePageRange(args.Pages)
+		content, err = t.readGenericOrDoc(ctx, rawURL, firstPage, lastPage)
 	}
 	if err != nil {
 		return ToolResult{}, err
+	}
+
+	if q := strings.TrimSpace(args.Query); q != "" && len([]rune(content)) > 5000 {
+		content = t.selectRelevantChunks(ctx, content, q, 6, 7500)
 	}
 
 	if args.Translate && t.hub != nil && len([]rune(content)) > 40 {
@@ -340,7 +347,7 @@ func (t *ReadSourceTool) readBilibili(ctx context.Context, rawURL string) (strin
 		bvid = bvidRe.FindString(finalURL)
 	}
 	if bvid == "" {
-		return t.readGenericOrDoc(ctx, rawURL)
+		return t.readGenericOrDoc(ctx, rawURL, 0, 0)
 	}
 
 	apiURL := "https://api.bilibili.com/x/web-interface/view?bvid=" + bvid
@@ -461,7 +468,7 @@ func (t *ReadSourceTool) readBilibili(ctx context.Context, rawURL string) (strin
 func (t *ReadSourceTool) readArxiv(ctx context.Context, rawURL string) (string, error) {
 	m := arxivIDRe.FindStringSubmatch(rawURL)
 	if len(m) < 2 {
-		return t.readGenericOrDoc(ctx, rawURL)
+		return t.readGenericOrDoc(ctx, rawURL, 0, 0)
 	}
 	id := m[1]
 	atomURL := "https://export.arxiv.org/api/query?id_list=" + id
@@ -480,7 +487,7 @@ func (t *ReadSourceTool) readArxiv(ctx context.Context, rawURL string) (string, 
 		} `xml:"entry"`
 	}
 	if err := xml.Unmarshal(body, &feed); err != nil || len(feed.Entries) == 0 {
-		return t.readGenericOrDoc(ctx, rawURL)
+		return t.readGenericOrDoc(ctx, rawURL, 0, 0)
 	}
 	e := feed.Entries[0]
 	authors := make([]string, 0, len(e.Authors))
@@ -508,7 +515,7 @@ func (t *ReadSourceTool) readHuggingFace(ctx context.Context, u *url.URL) (strin
 	repo := strings.Trim(u.Path, "/")
 	parts := strings.Split(repo, "/")
 	if len(parts) < 2 {
-		return t.readGenericOrDoc(ctx, u.String())
+		return t.readGenericOrDoc(ctx, u.String(), 0, 0)
 	}
 	repoID := parts[0] + "/" + parts[1]
 	metaBody, _, _, err := netutil.FetchLimited(ctx, t.httpClient(), "https://hf-mirror.com/api/models/"+repoID, 2<<20, nil)
@@ -528,7 +535,7 @@ func (t *ReadSourceTool) readHuggingFace(ctx context.Context, u *url.URL) (strin
 	return b.String(), nil
 }
 
-func (t *ReadSourceTool) readGenericOrDoc(ctx context.Context, rawURL string) (string, error) {
+func (t *ReadSourceTool) readGenericOrDoc(ctx context.Context, rawURL string, firstPage, lastPage int) (string, error) {
 	data, ct, code, err := netutil.FetchLimited(ctx, t.httpClient(), rawURL, 10<<20, nil)
 	if err != nil {
 		return "", err
@@ -544,7 +551,7 @@ func (t *ReadSourceTool) readGenericOrDoc(ctx context.Context, rawURL string) (s
 
 	switch {
 	case strings.Contains(lowCT, "application/pdf") || strings.HasSuffix(lowPath, ".pdf"):
-		return extractPDFText(ctx, data)
+		return extractPDFPages(ctx, data, firstPage, lastPage)
 	case strings.Contains(lowCT, "spreadsheetml") || strings.HasSuffix(lowPath, ".xlsx"):
 		return extractXLSXText(data)
 	case strings.Contains(lowCT, "wordprocessingml") || strings.HasSuffix(lowPath, ".docx"):
@@ -564,6 +571,155 @@ func (t *ReadSourceTool) readGenericOrDoc(ctx context.Context, rawURL string) (s
 	default:
 		return string(data), nil
 	}
+}
+
+func parsePageRange(spec string) (int, int) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return 0, 0
+	}
+	if parts := strings.SplitN(spec, "-", 2); len(parts) == 2 {
+		a, _ := strconv.Atoi(strings.TrimSpace(parts[0]))
+		b, _ := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if a > 0 && b >= a {
+			return a, b
+		}
+		if a > 0 {
+			return a, a + 5
+		}
+	}
+	if p, err := strconv.Atoi(spec); err == nil && p > 0 {
+		return p, p
+	}
+	return 0, 0
+}
+
+// selectRelevantChunks splits long documents (e.g., 100-page financial filings) into overlapping chunks
+// and ranks them against query using local rerank -> embed cosine -> lexical overlap fallback.
+func (t *ReadSourceTool) selectRelevantChunks(ctx context.Context, content, query string, topK, maxRunes int) string {
+	chunks := splitOverlappingChunks(content, 1000, 150, 64)
+	if len(chunks) <= topK {
+		return clipRunes(content, maxRunes)
+	}
+	type scored struct {
+		idx   int
+		score float64
+	}
+	scores := make([]scored, len(chunks))
+	for i := range chunks {
+		scores[i] = scored{idx: i, score: lexicalOverlapScore(chunks[i], query)}
+	}
+
+	ranked := false
+	if t.hub != nil {
+		if rres, err := t.hub.Rerank(ctx, query, chunks); err == nil && len(rres) > 0 {
+			for _, r := range rres {
+				if r.Index >= 0 && r.Index < len(scores) {
+					scores[r.Index].score = r.Score*0.85 + scores[r.Index].score*0.15
+				}
+			}
+			ranked = true
+		} else if embs, err := t.hub.Embed(ctx, append([]string{query}, chunks...)); err == nil && len(embs) == len(chunks)+1 {
+			qv := embs[0]
+			vec.NormalizeInPlace(qv)
+			for i := range chunks {
+				cv := embs[i+1]
+				vec.NormalizeInPlace(cv)
+				sim := float64(dotFloat32(qv, cv))
+				scores[i].score = sim*0.80 + scores[i].score*0.20
+			}
+			ranked = true
+		}
+	}
+	_ = ranked
+
+	sort.Slice(scores, func(i, j int) bool { return scores[i].score > scores[j].score })
+	if len(scores) > topK {
+		scores = scores[:topK]
+	}
+	// Restore original document reading order for selected top chunks.
+	sort.Slice(scores, func(i, j int) bool { return scores[i].idx < scores[j].idx })
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "[Document Semantic Excerpt for query=%q (%d/%d chunks selected)]\n", query, len(scores), len(chunks))
+	// Always include a compact opening header if chunk 0 wasn't already selected.
+	if scores[0].idx != 0 {
+		b.WriteString("--- [Opening Header] ---\n")
+		b.WriteString(clipRunes(chunks[0], 500) + "\n\n")
+	}
+	for _, sc := range scores {
+		fmt.Fprintf(&b, "--- [Section %d/%d] ---\n%s\n\n", sc.idx+1, len(chunks), chunks[sc.idx])
+	}
+	return clipRunes(strings.TrimSpace(b.String()), maxRunes)
+}
+
+func splitOverlappingChunks(s string, chunkRunes, overlap, maxChunks int) []string {
+	r := []rune(strings.TrimSpace(s))
+	if len(r) == 0 {
+		return nil
+	}
+	step := chunkRunes - overlap
+	if step < 100 {
+		step = 100
+	}
+	var out []string
+	for start := 0; start < len(r) && len(out) < maxChunks; start += step {
+		end := start + chunkRunes
+		if end > len(r) {
+			end = len(r)
+		}
+		out = append(out, strings.TrimSpace(string(r[start:end])))
+		if end == len(r) {
+			break
+		}
+	}
+	return out
+}
+
+func lexicalOverlapScore(chunk, query string) float64 {
+	cLow := strings.ToLower(chunk)
+	qLow := strings.ToLower(strings.TrimSpace(query))
+	if qLow == "" {
+		return 0
+	}
+	// Mix whitespace words + 2-char CJK bigrams for mixed CN/EN financial queries.
+	terms := make(map[string]struct{})
+	for _, tok := range strings.Fields(qLow) {
+		if len([]rune(tok)) >= 2 {
+			terms[tok] = struct{}{}
+		}
+		rs := []rune(tok)
+		for i := 0; i+1 < len(rs); i++ {
+			if rs[i] > 127 && rs[i+1] > 127 {
+				terms[string(rs[i:i+2])] = struct{}{}
+			}
+		}
+	}
+	if len(terms) == 0 {
+		if strings.Contains(cLow, qLow) {
+			return 1.0
+		}
+		return 0
+	}
+	hits := 0
+	for term := range terms {
+		if strings.Contains(cLow, term) {
+			hits++
+		}
+	}
+	return float64(hits) / float64(len(terms))
+}
+
+func dotFloat32(a, b []float32) float32 {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	var sum float32
+	for i := 0; i < n; i++ {
+		sum += a[i] * b[i]
+	}
+	return sum
 }
 
 func extractPDFText(ctx context.Context, pdfBytes []byte) (string, error) {
@@ -676,203 +832,10 @@ func extractDOCXText(docxBytes []byte) (string, error) {
 	return "", errors.New("docx: word/document.xml not found")
 }
 
-// --- 6. quote ---
-
-type QuoteArgs struct {
-	Symbol string `json:"symbol" jsonschema:"required,description=Stock or index ticker e.g. usNVDA, usSMH, hk00700, hkHSTECH, hkHSI, sh000001, sh600519, sz399006"`
-	Days   int    `json:"days,omitempty" jsonschema:"description=Optional number of daily K-line bars to fetch (default 15, max 60)"`
-}
-
-type QuoteTool struct {
-	mu     sync.RWMutex
-	client *http.Client
-}
-
-func NewQuoteTool(allowHosts []string) *QuoteTool {
-	return &QuoteTool{
-		client: netutil.NewSafeHTTPClient(netutil.SafeClientOptions{
-			Timeout:    10 * time.Second,
-			AllowHosts: allowHosts,
-		}),
-	}
-}
-
-func (t *QuoteTool) UpdateAllowHosts(allowHosts []string) {
-	cli := netutil.NewSafeHTTPClient(netutil.SafeClientOptions{Timeout: 10 * time.Second, AllowHosts: allowHosts})
-	t.mu.Lock()
-	t.client = cli
-	t.mu.Unlock()
-}
-
-func (t *QuoteTool) httpClient() *http.Client {
-	t.mu.RLock()
-	c := t.client
-	t.mu.RUnlock()
-	return c
-}
-
-func (t *QuoteTool) Name() string   { return "quote" }
-func (t *QuoteTool) ReadOnly() bool { return true }
-func (t *QuoteTool) Description() string {
-	return "Fetch real-time market quote and recent daily K-line data for US (usNVDA), HK (hk00700), and A-share (sh600519/sz000001) tickers."
-}
-
-func (t *QuoteTool) Execute(ctx context.Context, _ ToolContext, args QuoteArgs) (ToolResult, error) {
-	sym := normalizeTicker(args.Symbol)
-	if sym == "" {
-		return ToolResult{}, errors.New("quote: symbol is required")
-	}
-	days := args.Days
-	if days <= 0 {
-		days = 15
-	}
-	if days > 60 {
-		days = 60
-	}
-
-	// 1. Realtime quote from Tencent qt.gtimg.cn (GBK encoded).
-	qtURL := "https://qt.gtimg.cn/q=" + url.QueryEscape(sym)
-	raw, _, _, err := netutil.FetchLimited(ctx, t.httpClient(), qtURL, 512<<10, nil)
-	if err != nil {
-		return ToolResult{}, err
-	}
-	utf8Text, err := decodeGBK(raw)
-	if err != nil {
-		utf8Text = string(raw)
-	}
-
-	var b strings.Builder
-	summary, quoteCode := parseTencentQuote(utf8Text)
-	if summary != "" {
-		b.WriteString(summary + "\n")
-	} else {
-		return ToolResult{}, fmt.Errorf("quote: no market data returned for %q", sym)
-	}
-
-	// 2. Daily K-line bars (up to 60 days).
-	// For US tickers, Tencent fqkline requires the exchange suffix (e.g. usSMH.OQ) returned in quoteCode.
-	klSym := sym
-	if strings.HasPrefix(sym, "us") && strings.Contains(quoteCode, ".") {
-		klSym = "us" + quoteCode
-	}
-	klURL := fmt.Sprintf("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s,day,,,%d,qfq", url.QueryEscape(klSym), days)
-	if klRaw, _, _, kerr := netutil.FetchLimited(ctx, t.httpClient(), klURL, 2<<20, nil); kerr == nil {
-		if klLines := parseTencentKline(klRaw, klSym); len(klLines) > 0 {
-			b.WriteString("\nRecent Daily K-line (date, open, close, high, low, vol):\n")
-			b.WriteString(strings.Join(klLines, "\n"))
-		}
-	}
-
-	return ToolResult{TextForLLM: netutil.WrapExternalData("quote:"+sym, b.String())}, nil
-}
-
-func normalizeTicker(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return ""
-	}
-	low := strings.ToLower(s)
-	// Common index aliases (Chinese & bare English).
-	switch low {
-	case "hstech", "恒生科技", "恒生科技指数", "恒科":
-		return "hkHSTECH"
-	case "hsi", "恒生指数", "恒指":
-		return "hkHSI"
-	case "hscei", "国企指数", "恒生国企":
-		return "hkHSCEI"
-	case "上证", "上证指数", "大盘", "sse":
-		return "sh000001"
-	case "深证", "深证成指":
-		return "sz399001"
-	case "创业板", "创业板指":
-		return "sz399006"
-	case "科创50", "科创板":
-		return "sh000688"
-	case "沪深300", "csi300":
-		return "sh000300"
-	}
-	if strings.HasPrefix(low, "us") {
-		return "us" + strings.ToUpper(s[2:])
-	}
-	if strings.HasPrefix(low, "hk") {
-		rest := s[2:]
-		if isAllDigits(rest) {
-			return "hk" + rest
-		}
-		// HK indices like hkHSTECH / hkHSI / hkHSCEI are case-sensitive on qt.gtimg.cn.
-		return "hk" + strings.ToUpper(rest)
-	}
-	if strings.HasPrefix(low, "sh") || strings.HasPrefix(low, "sz") {
-		return low
-	}
-	// Bare 6-digit A-share or bare US ticker heuristic.
-	if len(s) == 6 && isAllDigits(s) {
-		if strings.HasPrefix(s, "6") {
-			return "sh" + s
-		}
-		return "sz" + s
-	}
-	if len(s) == 5 && isAllDigits(s) {
-		return "hk" + s
-	}
-	return "us" + strings.ToUpper(s)
-}
-
-func decodeGBK(b []byte) (string, error) {
-	reader := transform.NewReader(bytes.NewReader(b), simplifiedchinese.GBK.NewDecoder())
-	out, err := io.ReadAll(reader)
-	return string(out), err
-}
-
-func parseTencentQuote(raw string) (summary string, code string) {
-	start := strings.IndexByte(raw, '"')
-	end := strings.LastIndexByte(raw, '"')
-	if start < 0 || end <= start {
-		return "", ""
-	}
-	fields := strings.Split(raw[start+1:end], "~")
-	if len(fields) < 35 {
-		return "", ""
-	}
-	name, code, price, prevClose, open, pct, high, low := fields[1], fields[2], fields[3], fields[4], fields[5], fields[32], fields[33], fields[34]
-	return fmt.Sprintf("%s (%s): Price=%s | Change=%s%% | Open=%s | PrevClose=%s | High=%s | Low=%s",
-		name, code, price, pct, open, prevClose, high, low), code
-}
-
-func parseTencentKline(raw []byte, sym string) []string {
-	var parsed struct {
-		Data map[string]map[string]json.RawMessage `json:"data"`
-	}
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return nil
-	}
-	stock := parsed.Data[sym]
-	if stock == nil {
-		for _, v := range parsed.Data {
-			stock = v
-			break
-		}
-	}
-	if stock == nil {
-		return nil
-	}
-	var bars [][]any
-	for _, k := range []string{"qfqday", "day"} {
-		if r, ok := stock[k]; ok && json.Unmarshal(r, &bars) == nil && len(bars) > 0 {
-			break
-		}
-	}
-	var lines []string
-	for _, bar := range bars {
-		if len(bar) < 6 {
-			continue
-		}
-		lines = append(lines, fmt.Sprintf("%v | O:%v C:%v H:%v L:%v V:%v", bar[0], bar[1], bar[2], bar[3], bar[4], bar[5]))
-	}
-	return lines
-}
-
 func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
 	for _, r := range s {
 		if r < '0' || r > '9' {
 			return false
@@ -888,6 +851,3 @@ func clipRunes(s string, max int) string {
 	}
 	return string(r[:max]) + "\n...(truncated)"
 }
-
-// Keep strconv referenced if needed in helper extensions.
-var _ = strconv.Itoa

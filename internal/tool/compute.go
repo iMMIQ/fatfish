@@ -57,7 +57,7 @@ func (t *ComputeTool) Renderer() *ChartRenderer { return t.renderer }
 func (t *ComputeTool) Name() string             { return "compute" }
 func (t *ComputeTool) ReadOnly() bool           { return true }
 func (t *ComputeTool) Description() string {
-	return "Execute pure-Go Starlark calculations with preloaded math, json, time, stats (mean/median/stdev/percentile/corr/linreg), finance (pmt/irr/npv/cagr/drawdown), and chart (line/bar/pie/scatter/kline PNG)."
+	return "Execute pure-Go Starlark calculations with preloaded math, json, time, stats (mean/median/stdev/percentile/corr/linreg), finance (pmt/npv/irr/xirr/cagr/drawdown/dca/volatility/sharpe/sortino/sma/ema/rsi/macd/bollinger/bs_option), and chart (line/bar/pie/scatter/kline/compare PNG)."
 }
 
 // ValidateStarlarkAST inspects the parsed AST before execution to block single-step & exponential OOM DoS
@@ -585,11 +585,22 @@ func financeModule() *starlarkstruct.Module {
 	return &starlarkstruct.Module{
 		Name: "finance",
 		Members: starlark.StringDict{
-			"pmt":      starlark.NewBuiltin("finance.pmt", slFinPMT),
-			"npv":      starlark.NewBuiltin("finance.npv", slFinNPV),
-			"irr":      starlark.NewBuiltin("finance.irr", slFinIRR),
-			"cagr":     starlark.NewBuiltin("finance.cagr", slFinCAGR),
-			"drawdown": starlark.NewBuiltin("finance.drawdown", slFinDrawdown),
+			"pmt":        starlark.NewBuiltin("finance.pmt", slFinPMT),
+			"npv":        starlark.NewBuiltin("finance.npv", slFinNPV),
+			"irr":        starlark.NewBuiltin("finance.irr", slFinIRR),
+			"xirr":       starlark.NewBuiltin("finance.xirr", slFinXIRR),
+			"cagr":       starlark.NewBuiltin("finance.cagr", slFinCAGR),
+			"drawdown":   starlark.NewBuiltin("finance.drawdown", slFinDrawdown),
+			"dca":        starlark.NewBuiltin("finance.dca", slFinDCA),
+			"volatility": starlark.NewBuiltin("finance.volatility", slFinVolatility),
+			"sharpe":     starlark.NewBuiltin("finance.sharpe", slFinSharpe),
+			"sortino":    starlark.NewBuiltin("finance.sortino", slFinSortino),
+			"sma":        starlark.NewBuiltin("finance.sma", slFinSMA),
+			"ema":        starlark.NewBuiltin("finance.ema", slFinEMA),
+			"rsi":        starlark.NewBuiltin("finance.rsi", slFinRSI),
+			"macd":       starlark.NewBuiltin("finance.macd", slFinMACD),
+			"bollinger":  starlark.NewBuiltin("finance.bollinger", slFinBollinger),
+			"bs_option":  starlark.NewBuiltin("finance.bs_option", slFinBSOption),
 		},
 	}
 }
@@ -650,23 +661,140 @@ func slFinIRR(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwar
 	if err != nil || len(cfs) < 2 {
 		return nil, errors.New("finance.irr: >=2 cashflows required")
 	}
-	r := 0.1
-	for iter := 0; iter < 100; iter++ {
-		var npv, dnpv float64
+	times := make([]float64, len(cfs))
+	for i := range cfs {
+		times[i] = float64(i)
+	}
+	r, err := solveRate(cfs, times)
+	if err != nil {
+		return nil, fmt.Errorf("finance.irr: %w", err)
+	}
+	return starlark.Float(r), nil
+}
+
+func slFinXIRR(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var cfVal, dtVal starlark.Value
+	if err := starlark.UnpackPositionalArgs("xirr", args, kwargs, 2, &cfVal, &dtVal); err != nil {
+		return nil, err
+	}
+	cfs, err := toFloatSlice(cfVal)
+	if err != nil || len(cfs) < 2 {
+		return nil, errors.New("finance.xirr: >=2 cashflows required")
+	}
+	dateStrs, err := toStringSlice(dtVal)
+	if err != nil || len(dateStrs) != len(cfs) {
+		return nil, errors.New("finance.xirr: dates list must match cashflows length (YYYY-MM-DD)")
+	}
+	dates := make([]time.Time, len(dateStrs))
+	for i, s := range dateStrs {
+		t, err := time.Parse("2006-01-02", strings.TrimSpace(s))
+		if err != nil {
+			return nil, fmt.Errorf("finance.xirr: invalid date %q (want YYYY-MM-DD)", s)
+		}
+		dates[i] = t
+	}
+	t0 := dates[0]
+	years := make([]float64, len(dates))
+	for i, d := range dates {
+		years[i] = d.Sub(t0).Hours() / (24.0 * 365.0)
+	}
+	r, err := solveRate(cfs, years)
+	if err != nil {
+		return nil, fmt.Errorf("finance.xirr: %w", err)
+	}
+	return starlark.Float(r), nil
+}
+
+// solveRate solves sum(cf_i / (1+r)^t_i) = 0 using guarded Newton-Raphson with bisection fallback.
+func solveRate(cfs, times []float64) (float64, error) {
+	hasPos, hasNeg := false, false
+	for _, cf := range cfs {
+		if cf > 0 {
+			hasPos = true
+		} else if cf < 0 {
+			hasNeg = true
+		}
+	}
+	if !hasPos || !hasNeg {
+		return 0, errors.New("cashflows must contain at least one positive and one negative value")
+	}
+	eval := func(r float64) (npv, dnpv float64) {
 		for i, cf := range cfs {
-			t := float64(i)
+			t := times[i]
 			denom := math.Pow(1+r, t)
+			if math.IsNaN(denom) || math.IsInf(denom, 0) || denom == 0 {
+				return math.NaN(), math.NaN()
+			}
 			npv += cf / denom
-			if i > 0 {
+			if t != 0 {
 				dnpv -= t * cf / (denom * (1 + r))
 			}
 		}
-		if math.Abs(npv) < 1e-9 || dnpv == 0 {
-			break
-		}
-		r -= npv / dnpv
+		return npv, dnpv
 	}
-	return starlark.Float(r), nil
+
+	// Try guarded Newton-Raphson from a few sensible initial guesses.
+	for _, guess := range []float64{0.1, 0.0, 0.5, -0.3} {
+		r := guess
+		for iter := 0; iter < 80; iter++ {
+			npv, dnpv := eval(r)
+			if math.IsNaN(npv) || math.IsInf(npv, 0) {
+				break
+			}
+			if math.Abs(npv) < 1e-8 {
+				return r, nil
+			}
+			if math.IsNaN(dnpv) || math.Abs(dnpv) < 1e-12 {
+				break
+			}
+			step := npv / dnpv
+			if step > 1.0 {
+				step = 1.0
+			} else if step < -1.0 {
+				step = -1.0
+			}
+			next := r - step
+			if next <= -0.9999 {
+				next = -0.999
+			} else if next > 1000 {
+				next = 1000
+			}
+			r = next
+		}
+	}
+
+	// Bisection fallback across progressive brackets.
+	grid := []float64{-0.99, -0.9, -0.7, -0.5, -0.2, 0.0, 0.1, 0.3, 0.8, 2.0, 5.0, 20.0, 100.0}
+	for i := 0; i < len(grid)-1; i++ {
+		lo, hi := grid[i], grid[i+1]
+		fLo, _ := eval(lo)
+		fHi, _ := eval(hi)
+		if math.IsNaN(fLo) || math.IsNaN(fHi) {
+			continue
+		}
+		if fLo == 0 {
+			return lo, nil
+		}
+		if fHi == 0 {
+			return hi, nil
+		}
+		if (fLo < 0 && fHi > 0) || (fLo > 0 && fHi < 0) {
+			for iter := 0; iter < 120; iter++ {
+				mid := 0.5 * (lo + hi)
+				fMid, _ := eval(mid)
+				if math.Abs(fMid) < 1e-8 || (hi-lo) < 1e-10 {
+					return mid, nil
+				}
+				if (fLo < 0 && fMid < 0) || (fLo > 0 && fMid > 0) {
+					lo, fLo = mid, fMid
+				} else {
+					hi = mid
+				}
+			}
+			return 0.5 * (lo + hi), nil
+		}
+	}
+	return 0, errors.New("failed to converge on a valid rate")
 }
 
 func slFinCAGR(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
@@ -715,6 +843,369 @@ func slFinDrawdown(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple,
 		}
 	}
 	return starlark.Float(maxDD), nil
+}
+
+func slFinDCA(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var seq, amtVal starlark.Value
+	if err := starlark.UnpackPositionalArgs("dca", args, kwargs, 2, &seq, &amtVal); err != nil {
+		return nil, err
+	}
+	prices, err := toFloatSlice(seq)
+	if err != nil || len(prices) == 0 {
+		return nil, errors.New("finance.dca: non-empty price series required")
+	}
+	amount, err := toFloat(amtVal)
+	if err != nil || amount <= 0 {
+		return nil, errors.New("finance.dca: positive amount per period required")
+	}
+	var totalInvested, shares, peakVal, maxDD float64
+	for _, p := range prices {
+		if p <= 0 {
+			return nil, errors.New("finance.dca: all prices must be > 0")
+		}
+		totalInvested += amount
+		shares += amount / p
+		val := shares * p
+		if val > peakVal {
+			peakVal = val
+		}
+		if peakVal > 0 {
+			if dd := (peakVal - val) / peakVal; dd > maxDD {
+				maxDD = dd
+			}
+		}
+	}
+	finalVal := shares * prices[len(prices)-1]
+	avgCost := totalInvested / shares
+	totalRet := (finalVal - totalInvested) / totalInvested
+	d := starlark.NewDict(6)
+	_ = d.SetKey(starlark.String("total_invested"), starlark.Float(totalInvested))
+	_ = d.SetKey(starlark.String("shares"), starlark.Float(shares))
+	_ = d.SetKey(starlark.String("final_value"), starlark.Float(finalVal))
+	_ = d.SetKey(starlark.String("avg_cost"), starlark.Float(avgCost))
+	_ = d.SetKey(starlark.String("total_return"), starlark.Float(totalRet))
+	_ = d.SetKey(starlark.String("max_drawdown"), starlark.Float(maxDD))
+	return d, nil
+}
+
+func slFinVolatility(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var seq starlark.Value
+	var annVal starlark.Value = starlark.Float(252)
+	if err := starlark.UnpackArgs("volatility", args, kwargs, "prices", &seq, "annualize?", &annVal); err != nil {
+		return nil, err
+	}
+	prices, err := toFloatSlice(seq)
+	if err != nil || len(prices) < 3 {
+		return nil, errors.New("finance.volatility: >=3 prices required")
+	}
+	ann, err := toFloat(annVal)
+	if err != nil || ann <= 0 {
+		ann = 252
+	}
+	rets := make([]float64, 0, len(prices)-1)
+	for i := 1; i < len(prices); i++ {
+		if prices[i-1] <= 0 || prices[i] <= 0 {
+			return nil, errors.New("finance.volatility: prices must be > 0")
+		}
+		rets = append(rets, math.Log(prices[i]/prices[i-1]))
+	}
+	return starlark.Float(sampleStdev(rets) * math.Sqrt(ann)), nil
+}
+
+func slFinSharpe(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var seq starlark.Value
+	var rfVal starlark.Value = starlark.Float(0)
+	var annVal starlark.Value = starlark.Float(252)
+	if err := starlark.UnpackArgs("sharpe", args, kwargs, "returns", &seq, "rf?", &rfVal, "annualize?", &annVal); err != nil {
+		return nil, err
+	}
+	rets, err := toFloatSlice(seq)
+	if err != nil || len(rets) < 2 {
+		return nil, errors.New("finance.sharpe: >=2 period returns required")
+	}
+	rf, _ := toFloat(rfVal)
+	ann, _ := toFloat(annVal)
+	if ann <= 0 {
+		ann = 252
+	}
+	rfPer := rf / ann
+	excess := make([]float64, len(rets))
+	for i, r := range rets {
+		excess[i] = r - rfPer
+	}
+	sd := sampleStdev(excess)
+	if sd == 0 {
+		return starlark.Float(0), nil
+	}
+	return starlark.Float(meanSlice(excess) / sd * math.Sqrt(ann)), nil
+}
+
+func slFinSortino(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var seq starlark.Value
+	var rfVal starlark.Value = starlark.Float(0)
+	var annVal starlark.Value = starlark.Float(252)
+	if err := starlark.UnpackArgs("sortino", args, kwargs, "returns", &seq, "rf?", &rfVal, "annualize?", &annVal); err != nil {
+		return nil, err
+	}
+	rets, err := toFloatSlice(seq)
+	if err != nil || len(rets) < 2 {
+		return nil, errors.New("finance.sortino: >=2 period returns required")
+	}
+	rf, _ := toFloat(rfVal)
+	ann, _ := toFloat(annVal)
+	if ann <= 0 {
+		ann = 252
+	}
+	rfPer := rf / ann
+	var sumEx, sumDown2 float64
+	for _, r := range rets {
+		ex := r - rfPer
+		sumEx += ex
+		if ex < 0 {
+			sumDown2 += ex * ex
+		}
+	}
+	downDev := math.Sqrt(sumDown2 / float64(len(rets)))
+	if downDev == 0 {
+		return starlark.Float(0), nil
+	}
+	return starlark.Float((sumEx / float64(len(rets))) / downDev * math.Sqrt(ann)), nil
+}
+
+func slFinSMA(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var seq starlark.Value
+	var win int
+	if err := starlark.UnpackPositionalArgs("sma", args, kwargs, 2, &seq, &win); err != nil {
+		return nil, err
+	}
+	prices, err := toFloatSlice(seq)
+	if err != nil || win <= 0 || len(prices) < win {
+		return nil, errors.New("finance.sma: valid price list with len >= window required")
+	}
+	res := make([]starlark.Value, 0, len(prices)-win+1)
+	sum := 0.0
+	for i, p := range prices {
+		sum += p
+		if i >= win {
+			sum -= prices[i-win]
+		}
+		if i+1 >= win {
+			res = append(res, starlark.Float(sum/float64(win)))
+		}
+	}
+	return starlark.NewList(res), nil
+}
+
+func slFinEMA(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var seq starlark.Value
+	var win int
+	if err := starlark.UnpackPositionalArgs("ema", args, kwargs, 2, &seq, &win); err != nil {
+		return nil, err
+	}
+	prices, err := toFloatSlice(seq)
+	if err != nil || win <= 0 || len(prices) == 0 {
+		return nil, errors.New("finance.ema: non-empty price list and positive window required")
+	}
+	emas := calcEMASlice(prices, win)
+	res := make([]starlark.Value, len(emas))
+	for i, v := range emas {
+		res[i] = starlark.Float(v)
+	}
+	return starlark.NewList(res), nil
+}
+
+func slFinRSI(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var seq starlark.Value
+	period := 14
+	if err := starlark.UnpackArgs("rsi", args, kwargs, "prices", &seq, "period?", &period); err != nil {
+		return nil, err
+	}
+	prices, err := toFloatSlice(seq)
+	if err != nil || period <= 0 || len(prices) <= period {
+		return nil, errors.New("finance.rsi: len(prices) must be > period")
+	}
+	return starlark.Float(calcWilderRSI(prices, period)), nil
+}
+
+func slFinMACD(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var seq starlark.Value
+	fast, slow, signal := 12, 26, 9
+	if err := starlark.UnpackArgs("macd", args, kwargs, "prices", &seq, "fast?", &fast, "slow?", &slow, "signal?", &signal); err != nil {
+		return nil, err
+	}
+	prices, err := toFloatSlice(seq)
+	if err != nil || len(prices) < 2 || fast <= 0 || slow <= 0 || signal <= 0 {
+		return nil, errors.New("finance.macd: >=2 prices and positive periods required")
+	}
+	eFast := calcEMASlice(prices, fast)
+	eSlow := calcEMASlice(prices, slow)
+	dif := make([]float64, len(prices))
+	for i := range prices {
+		dif[i] = eFast[i] - eSlow[i]
+	}
+	dea := calcEMASlice(dif, signal)
+	hist := make([]float64, len(prices))
+	for i := range prices {
+		hist[i] = 2 * (dif[i] - dea[i])
+	}
+	last := len(prices) - 1
+	d := starlark.NewDict(3)
+	_ = d.SetKey(starlark.String("dif"), starlark.Float(dif[last]))
+	_ = d.SetKey(starlark.String("dea"), starlark.Float(dea[last]))
+	_ = d.SetKey(starlark.String("hist"), starlark.Float(hist[last]))
+	return d, nil
+}
+
+func slFinBollinger(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var seq starlark.Value
+	window := 20
+	var kVal starlark.Value = starlark.Float(2.0)
+	if err := starlark.UnpackArgs("bollinger", args, kwargs, "prices", &seq, "window?", &window, "k?", &kVal); err != nil {
+		return nil, err
+	}
+	prices, err := toFloatSlice(seq)
+	if err != nil || window < 2 || len(prices) < window {
+		return nil, errors.New("finance.bollinger: len(prices) must be >= window (>=2)")
+	}
+	k, _ := toFloat(kVal)
+	if k <= 0 {
+		k = 2.0
+	}
+	tail := prices[len(prices)-window:]
+	mid := meanSlice(tail)
+	var sum2 float64
+	for _, x := range tail {
+		d := x - mid
+		sum2 += d * d
+	}
+	sd := math.Sqrt(sum2 / float64(window))
+	upper := mid + k*sd
+	lower := mid - k*sd
+	bw := 0.0
+	if mid != 0 {
+		bw = (upper - lower) / mid
+	}
+	d := starlark.NewDict(4)
+	_ = d.SetKey(starlark.String("upper"), starlark.Float(upper))
+	_ = d.SetKey(starlark.String("mid"), starlark.Float(mid))
+	_ = d.SetKey(starlark.String("lower"), starlark.Float(lower))
+	_ = d.SetKey(starlark.String("bandwidth"), starlark.Float(bw))
+	return d, nil
+}
+
+func slFinBSOption(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var sVal, kVal, tVal, rVal, sigVal starlark.Value
+	kind := "call"
+	if err := starlark.UnpackArgs("bs_option", args, kwargs,
+		"S", &sVal, "K", &kVal, "T", &tVal, "r", &rVal, "sigma", &sigVal, "kind?", &kind); err != nil {
+		return nil, err
+	}
+	S, err1 := toFloat(sVal)
+	K, err2 := toFloat(kVal)
+	T, err3 := toFloat(tVal)
+	r, err4 := toFloat(rVal)
+	sigma, err5 := toFloat(sigVal)
+	if err1 != nil || err2 != nil || err3 != nil || err4 != nil || err5 != nil {
+		return nil, errors.New("finance.bs_option: S, K, T, r, sigma must be numeric")
+	}
+	if S <= 0 || K <= 0 || T <= 0 || sigma <= 0 {
+		return nil, errors.New("finance.bs_option: S, K, T, sigma must be > 0")
+	}
+	sqrtT := math.Sqrt(T)
+	d1 := (math.Log(S/K) + (r+0.5*sigma*sigma)*T) / (sigma * sqrtT)
+	d2 := d1 - sigma*sqrtT
+	nd1 := stdNormCDF(d1)
+	nd2 := stdNormCDF(d2)
+	pdf1 := stdNormPDF(d1)
+	disc := math.Exp(-r * T)
+
+	var price, delta, theta, rho float64
+	if strings.ToLower(strings.TrimSpace(kind)) == "put" {
+		price = K*disc*stdNormCDF(-d2) - S*stdNormCDF(-d1)
+		delta = nd1 - 1.0
+		theta = (-S*pdf1*sigma/(2*sqrtT) + r*K*disc*stdNormCDF(-d2)) / 365.0
+		rho = -K * T * disc * stdNormCDF(-d2) / 100.0
+	} else {
+		price = S*nd1 - K*disc*nd2
+		delta = nd1
+		theta = (-S*pdf1*sigma/(2*sqrtT) - r*K*disc*nd2) / 365.0
+		rho = K * T * disc * nd2 / 100.0
+	}
+	gamma := pdf1 / (S * sigma * sqrtT)
+	vega := S * pdf1 * sqrtT / 100.0
+
+	d := starlark.NewDict(6)
+	_ = d.SetKey(starlark.String("price"), starlark.Float(price))
+	_ = d.SetKey(starlark.String("delta"), starlark.Float(delta))
+	_ = d.SetKey(starlark.String("gamma"), starlark.Float(gamma))
+	_ = d.SetKey(starlark.String("theta"), starlark.Float(theta))
+	_ = d.SetKey(starlark.String("vega"), starlark.Float(vega))
+	_ = d.SetKey(starlark.String("rho"), starlark.Float(rho))
+	return d, nil
+}
+
+func calcEMASlice(xs []float64, window int) []float64 {
+	out := make([]float64, len(xs))
+	k := 2.0 / float64(window+1)
+	out[0] = xs[0]
+	for i := 1; i < len(xs); i++ {
+		out[i] = xs[i]*k + out[i-1]*(1-k)
+	}
+	return out
+}
+
+func calcWilderRSI(prices []float64, period int) float64 {
+	if len(prices) <= period || period <= 0 {
+		return math.NaN()
+	}
+	var avgGain, avgLoss float64
+	for i := 1; i <= period; i++ {
+		diff := prices[i] - prices[i-1]
+		if diff > 0 {
+			avgGain += diff
+		} else {
+			avgLoss -= diff
+		}
+	}
+	avgGain /= float64(period)
+	avgLoss /= float64(period)
+	for i := period + 1; i < len(prices); i++ {
+		diff := prices[i] - prices[i-1]
+		gain, loss := 0.0, 0.0
+		if diff > 0 {
+			gain = diff
+		} else {
+			loss = -diff
+		}
+		avgGain = (avgGain*float64(period-1) + gain) / float64(period)
+		avgLoss = (avgLoss*float64(period-1) + loss) / float64(period)
+	}
+	if avgLoss == 0 {
+		return 100.0
+	}
+	rs := avgGain / avgLoss
+	return 100.0 - 100.0/(1.0+rs)
+}
+
+func sampleStdev(xs []float64) float64 {
+	if len(xs) < 2 {
+		return 0
+	}
+	m := meanSlice(xs)
+	var sum float64
+	for _, x := range xs {
+		d := x - m
+		sum += d * d
+	}
+	return math.Sqrt(sum / float64(len(xs)-1))
+}
+
+func stdNormCDF(x float64) float64 {
+	return 0.5 * math.Erfc(-x/math.Sqrt2)
+}
+
+func stdNormPDF(x float64) float64 {
+	return math.Exp(-0.5*x*x) / math.Sqrt(2*math.Pi)
 }
 
 // --- Preloaded Go-native chart module ---
@@ -804,7 +1295,11 @@ func (t *ComputeTool) chartModule(charts *[]model.DirectMedia) *starlarkstruct.M
 			h, _ := toFloat(idx.Index(2))
 			l, _ := toFloat(idx.Index(3))
 			c, _ := toFloat(idx.Index(4))
-			candles = append(candles, Candle{Label: lbl, Open: o, High: h, Low: l, Close: c})
+			vol := 0.0
+			if idx.Len() >= 6 {
+				vol, _ = toFloat(idx.Index(5))
+			}
+			candles = append(candles, Candle{Label: lbl, Open: o, High: h, Low: l, Close: c, Volume: vol})
 		}
 		pngBytes, err := t.renderer.RenderKline(title, candles)
 		if err != nil {
@@ -812,6 +1307,28 @@ func (t *ComputeTool) chartModule(charts *[]model.DirectMedia) *starlarkstruct.M
 		}
 		*charts = append(*charts, model.DirectMedia{Data: pngBytes, MimeType: "image/png", Filename: "kline.png", Caption: title})
 		return starlark.String(fmt.Sprintf("rendered kline chart (%d bytes)", len(pngBytes))), nil
+	}
+
+	compareFn := func(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+		if err := checkCap(); err != nil {
+			return nil, err
+		}
+		var title string
+		var labelsVal, dataVal starlark.Value
+		if err := starlark.UnpackArgs("chart.compare", args, kwargs, "title", &title, "labels", &labelsVal, "data", &dataVal); err != nil {
+			return nil, err
+		}
+		labels, _ := toStringSlice(labelsVal)
+		series, err := toSeriesSlice(dataVal)
+		if err != nil {
+			return nil, err
+		}
+		pngBytes, err := t.renderer.RenderCompare(title, labels, series)
+		if err != nil {
+			return nil, err
+		}
+		*charts = append(*charts, model.DirectMedia{Data: pngBytes, MimeType: "image/png", Filename: "compare.png", Caption: title})
+		return starlark.String(fmt.Sprintf("rendered compare chart (%d bytes)", len(pngBytes))), nil
 	}
 
 	return &starlarkstruct.Module{
@@ -822,6 +1339,7 @@ func (t *ComputeTool) chartModule(charts *[]model.DirectMedia) *starlarkstruct.M
 			"scatter": starlark.NewBuiltin("chart.scatter", makeSeriesFn("scatter")),
 			"pie":     starlark.NewBuiltin("chart.pie", pieFn),
 			"kline":   starlark.NewBuiltin("chart.kline", klineFn),
+			"compare": starlark.NewBuiltin("chart.compare", compareFn),
 		},
 	}
 }

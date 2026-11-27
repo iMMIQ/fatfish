@@ -157,12 +157,17 @@ func (t *NoteTool) Execute(ctx context.Context, tc ToolContext, args NoteArgs) (
 // --- 7. schedule ---
 
 type ScheduleArgs struct {
-	Action   string `json:"action" jsonschema:"required,enum=create,enum=list,enum=cancel,description=Action to perform"`
-	Kind     string `json:"kind,omitempty" jsonschema:"enum=once,enum=cron,description=Schedule kind for create"`
-	RunAt    string `json:"run_at,omitempty" jsonschema:"description=Time for once schedule (RFC3339, YYYY-MM-DD HH:MM, or duration like 30m)"`
-	CronExpr string `json:"cron_expr,omitempty" jsonschema:"description=Standard 5-field cron expression (minimum interval 5m)"`
-	Prompt   string `json:"prompt,omitempty" jsonschema:"description=Reminder or task prompt to trigger in this channel"`
-	ID       int64  `json:"id,omitempty" jsonschema:"description=Schedule ID for cancel"`
+	Action         string  `json:"action" jsonschema:"required,enum=create,enum=list,enum=cancel,description=Action to perform"`
+	Kind           string  `json:"kind,omitempty" jsonschema:"enum=once,enum=cron,enum=price_alert,description=Task kind: once (one-shot reminder), cron (recurring schedule), or price_alert (zero-LLM market price/change trigger)"`
+	RunAt          string  `json:"run_at,omitempty" jsonschema:"description=Time for once schedule (RFC3339, YYYY-MM-DD HH:MM, or duration like 30m)"`
+	CronExpr       string  `json:"cron_expr,omitempty" jsonschema:"description=Standard 5-field cron expression (minimum interval 5m)"`
+	MarketDaysOnly string  `json:"market_days_only,omitempty" jsonschema:"enum=none,enum=cn,enum=hk,enum=us,description=Optional trading-day filter for cron market briefings (skips weekends and market holidays)"`
+	Symbol         string  `json:"symbol,omitempty" jsonschema:"description=Ticker or name for kind=price_alert e.g. usNVDA, sh600519, BTC, 黄金, 茅台"`
+	Condition      string  `json:"condition,omitempty" jsonschema:"enum=above,enum=below,enum=pct_up,enum=pct_down,enum=pct_abs,description=Trigger condition for kind=price_alert: above/below price, or pct_up/pct_down/pct_abs daily % move"`
+	Threshold      float64 `json:"threshold,omitempty" jsonschema:"description=Target price (for above/below) or % magnitude e.g. 3.0 for 3% move (for pct_*)"`
+	CooldownMin    int     `json:"cooldown_min,omitempty" jsonschema:"description=For kind=price_alert: 0 (default) auto-disables after one trigger; >0 repeats with cooldown minutes"`
+	Prompt         string  `json:"prompt,omitempty" jsonschema:"description=Reminder prompt or alert note to trigger in this channel"`
+	ID             int64   `json:"id,omitempty" jsonschema:"description=Schedule or price_alert ID for cancel (set kind=price_alert to cancel a price alert)"`
 }
 
 type ScheduleTool struct {
@@ -177,18 +182,36 @@ func NewScheduleTool(sc *cron.Scheduler, st *store.Store) *ScheduleTool {
 func (t *ScheduleTool) Name() string   { return "schedule" }
 func (t *ScheduleTool) ReadOnly() bool { return false }
 func (t *ScheduleTool) Description() string {
-	return "Create, list, or cancel channel-scoped one-shot or recurring reminders/tasks."
+	return "Create, list, or cancel channel-scoped one-shot/cron reminders (with optional CN/HK/US trading-day filter) and zero-LLM market price/change alerts."
 }
 
 func (t *ScheduleTool) Execute(ctx context.Context, tc ToolContext, args ScheduleArgs) (ToolResult, error) {
 	switch strings.ToLower(strings.TrimSpace(args.Action)) {
 	case "create":
-		sc, err := t.sched.CreateSchedule(ctx, tc.ChannelID, tc.SenderID, args.Kind, args.CronExpr, args.RunAt, args.Prompt)
+		if strings.ToLower(strings.TrimSpace(args.Kind)) == "price_alert" {
+			alert, err := t.sched.CreatePriceAlert(ctx, tc.ChannelID, tc.SenderID, args.Symbol, args.Condition, args.Threshold, args.CooldownMin, args.Prompt)
+			if err != nil {
+				return ToolResult{}, err
+			}
+			mode := "one-shot"
+			if alert.CooldownMin > 0 {
+				mode = fmt.Sprintf("cooldown=%dm", alert.CooldownMin)
+			}
+			return ToolResult{
+				TextForLLM: fmt.Sprintf("Created price alert #%d: %s (%s, market=%s) %s %g (%s)",
+					alert.ID, alert.DisplayName, alert.Symbol, alert.Market, alert.Condition, alert.Threshold, mode),
+			}, nil
+		}
+		sc, err := t.sched.CreateScheduleWithMarket(ctx, tc.ChannelID, tc.SenderID, args.Kind, args.CronExpr, args.RunAt, args.Prompt, args.MarketDaysOnly)
 		if err != nil {
 			return ToolResult{}, err
 		}
+		mktInfo := ""
+		if sc.MarketDaysOnly != "" {
+			mktInfo = fmt.Sprintf(", market_days_only=%s", sc.MarketDaysOnly)
+		}
 		return ToolResult{
-			TextForLLM: fmt.Sprintf("Created schedule #%d (%s), next run: %s", sc.ID, sc.Kind, sc.NextRunAt.Format(time.RFC3339)),
+			TextForLLM: fmt.Sprintf("Created schedule #%d (%s%s), next run: %s", sc.ID, sc.Kind, mktInfo, sc.NextRunAt.Format(time.RFC3339)),
 		}, nil
 
 	case "list":
@@ -196,19 +219,42 @@ func (t *ScheduleTool) Execute(ctx context.Context, tc ToolContext, args Schedul
 		if err != nil {
 			return ToolResult{}, err
 		}
-		if len(list) == 0 {
-			return ToolResult{TextForLLM: "(no active schedules in this channel)"}, nil
+		alerts, _ := t.store.ListPriceAlerts(ctx, tc.ChannelID, true)
+		if len(list) == 0 && len(alerts) == 0 {
+			return ToolResult{TextForLLM: "(no active schedules or price alerts in this channel)"}, nil
 		}
-		lines := make([]string, 0, len(list))
+		lines := make([]string, 0, len(list)+len(alerts))
 		for _, sc := range list {
-			lines = append(lines, fmt.Sprintf("#%d [%s %s] next=%s creator=%s prompt=%q",
-				sc.ID, sc.Kind, sc.CronExpr, sc.NextRunAt.Format("2006-01-02 15:04"), sc.CreatorID, sc.Prompt))
+			mkt := ""
+			if sc.MarketDaysOnly != "" {
+				mkt = " mkt=" + sc.MarketDaysOnly
+			}
+			lines = append(lines, fmt.Sprintf("schedule #%d [%s %s%s] next=%s creator=%s prompt=%q",
+				sc.ID, sc.Kind, sc.CronExpr, mkt, sc.NextRunAt.Format("2006-01-02 15:04"), sc.CreatorID, sc.Prompt))
+		}
+		for _, a := range alerts {
+			cd := "once"
+			if a.CooldownMin > 0 {
+				cd = fmt.Sprintf("cd=%dm", a.CooldownMin)
+			}
+			lines = append(lines, fmt.Sprintf("price_alert #%d [%s (%s) %s %g %s] creator=%s prompt=%q",
+				a.ID, a.DisplayName, a.Symbol, a.Condition, a.Threshold, cd, a.CreatorID, a.Prompt))
 		}
 		return ToolResult{TextForLLM: strings.Join(lines, "\n")}, nil
 
 	case "cancel":
 		if args.ID <= 0 {
 			return ToolResult{}, errors.New("schedule.cancel requires positive id")
+		}
+		if strings.ToLower(strings.TrimSpace(args.Kind)) == "price_alert" {
+			ok, err := t.store.CancelPriceAlert(ctx, tc.ChannelID, args.ID, tc.SenderID, tc.IsAdmin)
+			if err != nil {
+				return ToolResult{}, err
+			}
+			if !ok {
+				return ToolResult{TextForLLM: fmt.Sprintf("Price alert #%d not found or permission denied.", args.ID)}, nil
+			}
+			return ToolResult{TextForLLM: fmt.Sprintf("Cancelled price alert #%d.", args.ID)}, nil
 		}
 		ok, err := t.store.CancelSchedule(ctx, tc.ChannelID, args.ID, tc.SenderID, tc.IsAdmin)
 		if err != nil {

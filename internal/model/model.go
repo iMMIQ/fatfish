@@ -343,15 +343,33 @@ type Sticker struct {
 
 // Schedule represents a persistent channel-scoped one-shot or cron task.
 type Schedule struct {
-	ID        int64     `json:"id"`
-	ChannelID ChannelID `json:"channel_id"`
-	CreatorID string    `json:"creator_id"`
-	Kind      string    `json:"kind"` // "once" | "cron"
-	CronExpr  string    `json:"cron_expr"`
-	NextRunAt time.Time `json:"next_run_at"`
-	Prompt    string    `json:"prompt"`
-	Enabled   bool      `json:"enabled"`
-	CreatedAt time.Time `json:"created_at"`
+	ID             int64     `json:"id"`
+	ChannelID      ChannelID `json:"channel_id"`
+	CreatorID      string    `json:"creator_id"`
+	Kind           string    `json:"kind"` // "once" | "cron"
+	CronExpr       string    `json:"cron_expr"`
+	MarketDaysOnly string    `json:"market_days_only,omitempty"` // "" | "cn" | "hk" | "us"
+	NextRunAt      time.Time `json:"next_run_at"`
+	Prompt         string    `json:"prompt"`
+	Enabled        bool      `json:"enabled"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+// PriceAlert represents a zero-LLM channel-scoped market price or daily-change alert.
+type PriceAlert struct {
+	ID              int64     `json:"id"`
+	ChannelID       ChannelID `json:"channel_id"`
+	CreatorID       string    `json:"creator_id"`
+	Symbol          string    `json:"symbol"`
+	DisplayName     string    `json:"display_name"`
+	Market          string    `json:"market"` // "cn" | "hk" | "us" | "crypto" | "fx" | "fund"
+	Condition       string    `json:"condition"` // "above" | "below" | "pct_up" | "pct_down" | "pct_abs"
+	Threshold       float64   `json:"threshold"`
+	CooldownMin     int       `json:"cooldown_min"` // 0 = one-shot auto-disable after firing
+	LastTriggeredAt time.Time `json:"last_triggered_at,omitempty"`
+	Prompt          string    `json:"prompt"`
+	Enabled         bool      `json:"enabled"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // DailyDigest stores a channel's daily activity summary.

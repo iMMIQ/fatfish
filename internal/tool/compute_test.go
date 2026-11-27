@@ -113,3 +113,53 @@ for i in range(6):
 		t.Fatalf("expected error when exceeding max charts per compute call")
 	}
 }
+
+func TestEnhancedFinanceAndCompareChart(t *testing.T) {
+	fontPath := filepath.Join("..", "..", "assets", "fonts", "NotoSansSC-Regular.ttf")
+	ct := NewComputeTool(fontPath, 500000, 3)
+
+	res, err := ct.Execute(context.Background(), ToolContext{}, ComputeArgs{
+		Code: `
+irr = finance.irr([-1000, 300, 400, 500])
+xirr = finance.xirr([-1000, 1210], ["2024-01-01", "2026-01-01"])
+dca = finance.dca([10.0, 8.0, 12.0, 10.0], 1000)
+prices = [100, 102, 101, 105, 107, 106, 110, 112, 111, 115, 118, 117, 120, 122, 125, 123, 126, 128, 130, 132, 135]
+vol = finance.volatility(prices)
+rets = [(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, len(prices))]
+sh = finance.sharpe(rets, rf=0.02)
+so = finance.sortino(rets, rf=0.02)
+sma5 = finance.sma(prices, 5)
+ema5 = finance.ema(prices, 5)
+rsi = finance.rsi(prices, 14)
+macd = finance.macd(prices)
+bb = finance.bollinger(prices, 20)
+call = finance.bs_option(S=100, K=100, T=1.0, r=0.05, sigma=0.2, kind="call")
+put = finance.bs_option(S=100, K=100, T=1.0, r=0.05, sigma=0.2, kind="put")
+parity_err = abs((call["price"] - put["price"]) - (100 - 100 * math.exp(-0.05)))
+
+chart.compare(title="多标的对比", labels=["D1", "D2", "D3", "D4"], data={"A": [100, 105, 103, 112], "B": [50, 48, 52, 55]})
+print("irr=", round(irr, 4), "xirr=", round(xirr, 4), "dca_ret=", round(dca["total_return"], 4))
+print("vol=", round(vol, 4), "sharpe=", round(sh, 2), "sortino=", round(so, 2))
+print("sma_len=", len(sma5), "ema_len=", len(ema5), "rsi=", round(rsi, 2), "macd_dif=", round(macd["dif"], 2), "bb_mid=", round(bb["mid"], 2))
+print("call=", round(call["price"], 2), "delta=", round(call["delta"], 3), "parity_err=", round(parity_err, 6))
+`,
+	})
+	if err != nil {
+		t.Fatalf("enhanced finance compute failed: %v", err)
+	}
+	for _, want := range []string{"irr= 0.089", "xirr= 0.0999", "sma_len= 17", "ema_len= 21", "call= 10.45", "parity_err= 0.0"} {
+		if !strings.Contains(res.TextForLLM, want) {
+			t.Fatalf("expected %q in output, got:\n%s", want, res.TextForLLM)
+		}
+	}
+	if len(res.DirectMedia) != 1 || res.DirectMedia[0].Filename != "compare.png" {
+		t.Fatalf("expected compare.png direct media, got %+v", res.DirectMedia)
+	}
+
+	// Non-sign-changing cashflows must fail cleanly instead of returning garbage/NaN.
+	if _, err := ct.Execute(context.Background(), ToolContext{}, ComputeArgs{
+		Code: `print(finance.irr([100, 200, 300]))`,
+	}); err == nil {
+		t.Fatal("expected finance.irr to reject all-positive cashflows")
+	}
+}

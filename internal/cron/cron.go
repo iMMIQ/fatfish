@@ -55,10 +55,12 @@ type Scheduler struct {
 	mu            sync.RWMutex
 	roomMediaMiB  int
 	totalMediaMiB int
+	priceFetcher  PriceFetcher
 
 	distillBusy atomic.Bool
 	digestBusy  atomic.Bool
 	maintBusy   atomic.Bool
+	alertBusy   atomic.Bool
 }
 
 // SetMemoryHooks attaches optional in-process incremental memory distillation and channel filtering.
@@ -171,9 +173,23 @@ func (s *Scheduler) ValidateCron(expr string) (robfigcron.Schedule, error) {
 
 // CreateSchedule creates a validated one-shot or recurring schedule for a channel.
 func (s *Scheduler) CreateSchedule(ctx context.Context, ch model.ChannelID, creatorID, kind, cronExpr, runAtRFC3339, prompt string) (*model.Schedule, error) {
+	return s.CreateScheduleWithMarket(ctx, ch, creatorID, kind, cronExpr, runAtRFC3339, prompt, "")
+}
+
+// CreateScheduleWithMarket creates a validated schedule with optional market_days_only filter ("cn"|"hk"|"us").
+func (s *Scheduler) CreateScheduleWithMarket(ctx context.Context, ch model.ChannelID, creatorID, kind, cronExpr, runAtRFC3339, prompt, marketDaysOnly string) (*model.Schedule, error) {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		return nil, errors.New("cron: prompt is required")
+	}
+	mkt := strings.ToLower(strings.TrimSpace(marketDaysOnly))
+	if mkt == "none" {
+		mkt = ""
+	}
+	switch mkt {
+	case "", "cn", "hk", "us":
+	default:
+		return nil, fmt.Errorf("cron: invalid market_days_only %q (use cn|hk|us)", marketDaysOnly)
 	}
 	var nextRun time.Time
 	switch strings.ToLower(strings.TrimSpace(kind)) {
@@ -203,13 +219,14 @@ func (s *Scheduler) CreateSchedule(ctx context.Context, ch model.ChannelID, crea
 	}
 
 	sc := &model.Schedule{
-		ChannelID: ch,
-		CreatorID: creatorID,
-		Kind:      kind,
-		CronExpr:  strings.TrimSpace(cronExpr),
-		NextRunAt: nextRun,
-		Prompt:    prompt,
-		Enabled:   true,
+		ChannelID:      ch,
+		CreatorID:      creatorID,
+		Kind:           kind,
+		CronExpr:       strings.TrimSpace(cronExpr),
+		MarketDaysOnly: mkt,
+		NextRunAt:      nextRun,
+		Prompt:         prompt,
+		Enabled:        true,
 	}
 	if err := s.store.CreateSchedule(ctx, sc, s.maxPerChannel); err != nil {
 		return nil, err
@@ -222,9 +239,11 @@ func (s *Scheduler) CreateSchedule(ctx context.Context, ch model.ChannelID, crea
 // background jobs to finish before returning.
 func (s *Scheduler) Start(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
+	alertTicker := time.NewTicker(60 * time.Second)
 	distillTicker := time.NewTicker(1 * time.Hour)
 	maintTicker := time.NewTicker(6 * time.Hour)
 	defer ticker.Stop()
+	defer alertTicker.Stop()
 	defer distillTicker.Stop()
 	defer maintTicker.Stop()
 
@@ -243,6 +262,15 @@ func (s *Scheduler) Start(ctx context.Context) {
 					defer wg.Done()
 					defer s.digestBusy.Store(false)
 					s.maybeRunDailyDigests(ctx, ts)
+				}(now)
+			}
+		case now := <-alertTicker.C:
+			if s.alertBusy.CompareAndSwap(false, true) {
+				wg.Add(1)
+				go func(ts time.Time) {
+					defer wg.Done()
+					defer s.alertBusy.Store(false)
+					s.CheckPriceAlerts(ctx, ts)
 				}(now)
 			}
 		case <-distillTicker.C:
@@ -359,6 +387,9 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 		}
 
 		if s.chanFilter != nil && !s.chanFilter.ChannelAllowed(sc.ChannelID) {
+			continue
+		}
+		if sc.MarketDaysOnly != "" && !IsTradingDay(sc.MarketDaysOnly, now) {
 			continue
 		}
 		if s.dispatcher != nil {
