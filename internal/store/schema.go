@@ -52,6 +52,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     sender_id  UNINDEXED,
     created_at UNINDEXED,
     content='',
+    contentless_delete=1,
     tokenize='unicode61'
 );
 
@@ -139,7 +140,7 @@ CREATE TABLE IF NOT EXISTS episodes (
 CREATE INDEX IF NOT EXISTS idx_episodes_chan_ts ON episodes(channel_id, end_ts DESC);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
-    tokens, channel_id UNINDEXED, content='', tokenize='unicode61'
+    tokens, channel_id UNINDEXED, content='', contentless_delete=1, tokenize='unicode61'
 );
 
 CREATE TABLE IF NOT EXISTS profiles (
@@ -188,7 +189,7 @@ CREATE TABLE IF NOT EXISTS stickers (
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS stickers_fts USING fts5(
-    tokens, pack_id UNINDEXED, content='', tokenize='unicode61'
+    tokens, pack_id UNINDEXED, content='', contentless_delete=1, tokenize='unicode61'
 );
 
 CREATE TABLE IF NOT EXISTS sticker_uses (

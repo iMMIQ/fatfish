@@ -57,6 +57,19 @@ func TestTokenizeCJKAndFTS5(t *testing.T) {
 	if len(hits) != 1 || hits[0].ChannelID != ch1 {
 		t.Fatalf("expected 1 channel-isolated hit in ch1, got %+v", hits)
 	}
+
+	// Verify contentless FTS5 RebuildFTS and PatchMessageParts work cleanly.
+	m1.Parts = append(m1.Parts, model.Part{Kind: model.PartAudio, Transcript: "语音转写测试", ASRStatus: "ok"})
+	if err := st.PatchMessageParts(ctx, m1); err != nil {
+		t.Fatalf("PatchMessageParts: %v", err)
+	}
+	if err := st.RebuildFTS(ctx); err != nil {
+		t.Fatalf("RebuildFTS: %v", err)
+	}
+	hits2, err := st.SearchMessagesFTS(ctx, ch1, "语音转写", nil, 0, 0, 10)
+	if err != nil || len(hits2) != 1 {
+		t.Fatalf("SearchMessagesFTS after Patch+Rebuild: hits=%+v err=%v", hits2, err)
+	}
 }
 
 func TestBlobStoreCanonicalAndChannelMediaOwnership(t *testing.T) {

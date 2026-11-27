@@ -1800,7 +1800,7 @@ func (s *Store) RebuildFTS(ctx context.Context) error {
 	defer tx.Rollback()
 
 	for _, tbl := range []string{"messages_fts", "episodes_fts", "stickers_fts"} {
-		if _, err := tx.ExecContext(ctx, "DELETE FROM "+tbl); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO "+tbl+"("+tbl+") VALUES('delete-all')"); err != nil {
 			return err
 		}
 	}

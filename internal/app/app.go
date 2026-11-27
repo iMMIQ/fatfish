@@ -113,11 +113,13 @@ func New(configPath string, enableTransport bool) (*App, error) {
 		return nil, err
 	}
 
-	// Connect MCP servers with persistent mcp_tool_cache fallback so tool declarations never flap.
+	// Connect MCP servers only for live runtime (serve), skipping network calls during offline CLI commands.
 	mcpBridge := tool.NewMCPBridge(st, logger)
-	initCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	mcpBridge.InitAndRegister(initCtx, cfg.MCP.Servers, reg)
-	cancel()
+	if enableTransport && len(cfg.MCP.Servers) > 0 {
+		initCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		mcpBridge.InitAndRegister(initCtx, cfg.MCP.Servers, reg)
+		cancel()
+	}
 
 	// Freeze sorted OpenAI tool declarations for 100% KV Prefix Cache stability.
 	reg.Freeze()
