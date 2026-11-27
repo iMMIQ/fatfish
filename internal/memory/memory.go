@@ -330,13 +330,17 @@ type EpisodeExtraction struct {
 	} `json:"candidate_lore"`
 }
 
-// PartitionWindows groups messages into episodes separated by >15m silence or >100 valid messages.
-func PartitionWindows(msgs []model.Message, maxGap time.Duration, maxMsgs int) [][]model.Message {
+// PartitionWindows groups messages into meaningful conversational episodes separated by >maxGap silence
+// or >=maxMsgs valid messages, skipping noisy short fragments (<minMsgs).
+func PartitionWindows(msgs []model.Message, maxGap time.Duration, maxMsgs, minMsgs int) [][]model.Message {
 	if maxGap <= 0 {
-		maxGap = 15 * time.Minute
+		maxGap = 30 * time.Minute
 	}
 	if maxMsgs <= 0 {
-		maxMsgs = 100
+		maxMsgs = 150
+	}
+	if minMsgs <= 0 {
+		minMsgs = 8
 	}
 	var windows [][]model.Message
 	var cur []model.Message
@@ -349,7 +353,7 @@ func PartitionWindows(msgs []model.Message, maxGap time.Duration, maxMsgs int) [
 		if len(cur) > 0 {
 			gap := m.CreatedAt.Sub(cur[len(cur)-1].CreatedAt)
 			if gap > maxGap || len(cur) >= maxMsgs {
-				if len(cur) >= 3 {
+				if len(cur) >= minMsgs {
 					windows = append(windows, cur)
 				}
 				cur = nil
@@ -357,17 +361,29 @@ func PartitionWindows(msgs []model.Message, maxGap time.Duration, maxMsgs int) [
 		}
 		cur = append(cur, m)
 	}
-	if len(cur) >= 3 {
+	if len(cur) >= minMsgs {
 		windows = append(windows, cur)
 	}
 	return windows
 }
 
-// DistillChannel performs resumable offline distillation for one channel up to maxEpisodes.
-func (s *Service) DistillChannel(ctx context.Context, ch model.ChannelID, maxEpisodes, concurrency int, role string) (int, error) {
+// DistillOptions configures offline L0 -> L1/L2 memory distillation.
+type DistillOptions struct {
+	ChannelID   model.ChannelID
+	MaxEpisodes int
+	Concurrency int
+	Role        string
+	SinceDays   int // When >0, only distill messages from the last N days
+}
+
+// DistillChannel performs resumable offline distillation for one channel up to opts.MaxEpisodes.
+func (s *Service) DistillChannel(ctx context.Context, opts DistillOptions) (int, error) {
+	ch := opts.ChannelID
+	concurrency := opts.Concurrency
 	if concurrency <= 0 {
 		concurrency = 1
 	}
+	role := opts.Role
 	if role == "" {
 		role = "distill"
 	}
@@ -375,13 +391,23 @@ func (s *Service) DistillChannel(ctx context.Context, ch model.ChannelID, maxEpi
 	if err != nil {
 		return 0, err
 	}
-	msgs, err := s.store.MessagesAfterSeq(ctx, ch, afterSeq, 5000)
+	msgs, err := s.store.MessagesAfterSeq(ctx, ch, afterSeq, 100000)
 	if err != nil {
 		return 0, err
 	}
-	windows := PartitionWindows(msgs, 15*time.Minute, 100)
-	if maxEpisodes > 0 && len(windows) > maxEpisodes {
-		windows = windows[:maxEpisodes]
+	if opts.SinceDays > 0 {
+		cutoff := time.Now().AddDate(0, 0, -opts.SinceDays)
+		filtered := msgs[:0]
+		for _, m := range msgs {
+			if !m.CreatedAt.Before(cutoff) {
+				filtered = append(filtered, m)
+			}
+		}
+		msgs = filtered
+	}
+	windows := PartitionWindows(msgs, 30*time.Minute, 150, 8)
+	if opts.MaxEpisodes > 0 && len(windows) > opts.MaxEpisodes {
+		windows = windows[:opts.MaxEpisodes]
 	}
 	if len(windows) == 0 {
 		return 0, nil
@@ -394,18 +420,24 @@ func (s *Service) DistillChannel(ctx context.Context, ch model.ChannelID, maxEpi
 	created := 0
 	var maxSeqDone int64 = afterSeq
 
-	for _, w := range windows {
+	for idx, w := range windows {
 		win := w
+		winNo := idx + 1
+		totalWins := len(windows)
 		g.Go(func() error {
 			ep, err := s.DistillWindow(gctx, ch, win, role)
 			if err != nil {
-				s.log.Warn("distill window failed", "channel", ch, "err", err)
+				s.log.Warn("distill window failed", "channel", ch, "window", winNo, "err", err)
 				return nil
 			}
 			mu.Lock()
 			created++
 			if ep.EndSeq > maxSeqDone {
 				maxSeqDone = ep.EndSeq
+			}
+			if created%10 == 0 || winNo == totalWins {
+				_ = s.store.SetDistillCheckpoint(ctx, ch, maxSeqDone)
+				s.log.Info("distill progress", "channel", ch, "done", created, "total_windows", totalWins, "checkpoint_seq", maxSeqDone)
 			}
 			mu.Unlock()
 			return nil
@@ -427,11 +459,11 @@ func (s *Service) DistillWindow(ctx context.Context, ch model.ChannelID, win []m
 		return nil, fmt.Errorf("memory: empty window")
 	}
 	transcript := formatMessages(win)
-	sysPrompt := `Extract a structured JSON summary of this chat episode.
+	sysPrompt := `Extract a concise structured JSON summary of this chat episode in the primary language of the chat (e.g. Simplified Chinese).
 Rules:
 1. Key every participant strictly by their immutable member_id shown in parentheses, NEVER by nickname.
 2. Separate jokes/sarcasm/shitposting into candidate_jokes or candidate_lore; NEVER record sarcasm as candidate_facts.
-3. Output ONLY valid JSON matching:
+3. Output ONLY valid compact JSON matching:
 {"topic":"...","summary":"...","participants":[{"id":"...","role_in_topic":"..."}],"notable_quotes":["..."],"candidate_facts":[{"member_id":"...","fact":"...","serious":true}],"candidate_jokes":[{"member_id":"...","joke":"..."}],"candidate_lore":[{"term":"...","meaning":"..."}]}`
 
 	resp, err := s.hub.Chat(ctx, role, infer.ChatRequest{
@@ -439,7 +471,9 @@ Rules:
 			{Role: "system", Content: sysPrompt},
 			{Role: "user", Content: transcript},
 		},
-		ResponseFormat: map[string]any{"type": "json_object"},
+		MaxTokens:          1024,
+		ResponseFormat:     map[string]any{"type": "json_object"},
+		ChatTemplateKwargs: map[string]any{"enable_thinking": false},
 	})
 	if err != nil {
 		return nil, err

@@ -893,7 +893,9 @@ func (r *Room) runProactiveGate(ctx context.Context, trig triggerState) string {
 			{Role: "system", Content: `Decide whether the bot should chime in naturally in this group chat. Output JSON: {"action":"reply"|"ignore"|"react","emoji_id":"optional"}`},
 			{Role: "user", Content: strings.Join(lines, "\n")},
 		},
-		ResponseFormat: map[string]any{"type": "json_object"},
+		MaxTokens:          128,
+		ResponseFormat:     map[string]any{"type": "json_object"},
+		ChatTemplateKwargs: map[string]any{"enable_thinking": false},
 	})
 	if err != nil {
 		return "ignore"

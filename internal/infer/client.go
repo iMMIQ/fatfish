@@ -63,13 +63,14 @@ type ToolFunctionDefinition struct {
 }
 
 type ChatRequest struct {
-	Model          string           `json:"model"`
-	Messages       []ChatMessage    `json:"messages"`
-	Tools          []ToolDefinition `json:"tools,omitempty"`
-	ToolChoice     any              `json:"tool_choice,omitempty"`
-	Temperature    *float64         `json:"temperature,omitempty"`
-	MaxTokens      int              `json:"max_tokens,omitempty"`
-	ResponseFormat map[string]any   `json:"response_format,omitempty"`
+	Model              string           `json:"model"`
+	Messages           []ChatMessage    `json:"messages"`
+	Tools              []ToolDefinition `json:"tools,omitempty"`
+	ToolChoice         any              `json:"tool_choice,omitempty"`
+	Temperature        *float64         `json:"temperature,omitempty"`
+	MaxTokens          int              `json:"max_tokens,omitempty"`
+	ResponseFormat     map[string]any   `json:"response_format,omitempty"`
+	ChatTemplateKwargs map[string]any   `json:"chat_template_kwargs,omitempty"`
 }
 
 type ChatUsage struct {

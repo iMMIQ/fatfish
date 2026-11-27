@@ -10,6 +10,7 @@ import (
 
 	"github.com/iMMIQ/fatfish/internal/app"
 	"github.com/iMMIQ/fatfish/internal/ingest"
+	"github.com/iMMIQ/fatfish/internal/memory"
 	"github.com/iMMIQ/fatfish/internal/model"
 	"github.com/iMMIQ/fatfish/internal/sticker"
 )
@@ -124,9 +125,10 @@ func cmdIngest(args []string) error {
 func cmdDistill(args []string) error {
 	fs := flag.NewFlagSet("distill", flag.ExitOnError)
 	cfgPath := fs.String("c", "configs/fatfish.example.yaml", "path to YAML config")
-	channel := fs.String("channel", "", "optional canonical channel_id (defaults to all channels)")
-	limit := fs.Int("limit", 20, "max episodes per channel")
-	concurrency := fs.Int("concurrency", 1, "worker concurrency")
+	channel := fs.String("channel", "", "optional canonical channel_id (defaults to all allowed channels)")
+	limit := fs.Int("limit", 0, "max episodes per channel (0 = unlimited)")
+	concurrency := fs.Int("concurrency", 2, "worker concurrency")
+	sinceDays := fs.Int("since-days", 0, "only distill messages from the last N days (0 = all)")
 	role := fs.String("role", "distill", "model role (distill|fast|primary)")
 	_ = fs.Parse(args)
 
@@ -146,18 +148,29 @@ func cmdDistill(args []string) error {
 			return err
 		}
 		for _, c := range chs {
+			if !application.Policy.ChannelAllowed(c.ChannelID) {
+				continue
+			}
 			targets = append(targets, c.ChannelID)
 		}
 	}
 
 	total := 0
 	for _, ch := range targets {
-		n, err := application.Memory.DistillChannel(ctx, ch, *limit, *concurrency, *role)
+		n, err := application.Memory.DistillChannel(ctx, memory.DistillOptions{
+			ChannelID:   ch,
+			MaxEpisodes: *limit,
+			Concurrency: *concurrency,
+			Role:        *role,
+			SinceDays:   *sinceDays,
+		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "channel %s distill error: %v\n", ch, err)
 			continue
 		}
-		fmt.Printf("Distilled channel %s: +%d episode(s)\n", ch, n)
+		if n > 0 {
+			fmt.Printf("Distilled channel %s: +%d episode(s)\n", ch, n)
+		}
 		total += n
 	}
 	fmt.Printf("Total distilled episodes: %d\n", total)
