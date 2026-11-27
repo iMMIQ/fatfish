@@ -313,11 +313,16 @@ type senderStamp struct {
 	at     time.Time
 }
 
+type parsedLinkItem struct {
+	canonicalURL string
+	previewText  string
+}
+
 type perceptionResult struct {
 	parts       []model.Part
 	changed     bool
 	imageKB     int
-	parsedLinks []string
+	parsedLinks []parsedLinkItem
 }
 
 type plusOneAction int
@@ -738,18 +743,21 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 	}
 
 	// Proactive link parsing candidate: when a group member sends a link without explicitly triggering a reply,
-	// wait bounded for link parsing and then let fatfish decide via proactive gate whether to reply, react, or ignore.
+	// wait bounded for link parsing, always send the plain-text parsed preview for fresh links,
+	// and (when proactive_reply is enabled) let fatfish decide via proactive gate whether to also comment/react/stay silent.
+	msgCntAtIngress := r.msgCount.Load()
 	linkCooldownOK := time.Since(r.lastLinkProactive) >= time.Duration(cfg.LinkParser.CooldownSec)*time.Second
 	linkProactiveCandidate := r.ch.IsGroup() &&
 		hasLinkCandidate &&
 		!shouldReply &&
-		cfg.LinkParser.ProactiveReply &&
 		linkCooldownOK &&
 		(!isNight || cfg.LinkParser.NightProactive) &&
 		!(r.pendingTrigger != nil && !r.pendingTrigger.proactive)
 
 	// Wait bounded for perception if this message triggers, joins an active turn, or is a proactive link candidate.
+	linkPreviewReady := false
 	linkProactiveTriggered := false
+	var freshLinkPreviews []string
 	if perceptionCh != nil && (shouldReply || r.pendingTrigger != nil || linkProactiveCandidate) {
 		waitDur := time.Duration(cfg.Policy.MediaWaitSec * float64(time.Second))
 		if hasAudio {
@@ -774,10 +782,18 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 			}
 			if len(res.parsedLinks) > 0 {
 				dedupTTL := time.Duration(cfg.LinkParser.DedupTTLSec) * time.Second
-				isFresh := r.markFreshLinks(res.parsedLinks, now, dedupTTL)
-				if linkProactiveCandidate && isFresh {
-					linkProactiveTriggered = true
-					shouldReply = true
+				fresh := r.collectFreshLinks(res.parsedLinks, now, dedupTTL)
+				if linkProactiveCandidate && len(fresh) > 0 {
+					for _, item := range fresh {
+						if t := strings.TrimSpace(item.previewText); t != "" {
+							freshLinkPreviews = append(freshLinkPreviews, t)
+						}
+					}
+					linkPreviewReady = len(freshLinkPreviews) > 0
+					if cfg.LinkParser.ProactiveReply {
+						linkProactiveTriggered = true
+						shouldReply = true
+					}
 				}
 			}
 		case <-time.After(waitDur):
@@ -788,6 +804,42 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 	r.pendingMsgs = append(r.pendingMsgs, cloneMessage(*msg))
 	if len(r.pendingMsgs) > 60 {
 		r.pendingMsgs = r.pendingMsgs[len(r.pendingMsgs)-60:]
+	}
+
+	// Deterministic plain-text preview delivery for proactive links (before optional fatfish commentary).
+	if linkPreviewReady && r.mgr.tr != nil && !r.isMuted(now) {
+		previewBody := strings.Join(freshLinkPreviews, "\n---\n")
+		sendOpts := transport.SendOptions{}
+		if cfg.Policy.SmartReplyDecoration && int(r.msgCount.Load()-msgCntAtIngress) > 0 {
+			sendOpts.ReplyToMsgID = msg.PlatformMsgID
+		}
+		sctx, scancel := context.WithTimeout(ctx, 4*time.Second)
+		pid, serr := r.mgr.tr.SendText(sctx, r.ch, previewBody, sendOpts)
+		scancel()
+		if errors.Is(serr, transport.ErrRiskMuted) {
+			r.engageMute(ctx, cfg)
+			return 0, false
+		}
+		if serr == nil {
+			r.lastLinkProactive = time.Now()
+			botMsg := model.Message{
+				ChannelID:     r.ch,
+				PlatformMsgID: pid,
+				SenderID:      r.mgr.tr.SelfID(),
+				SenderName:    r.botDisplayName(cfg),
+				FromBot:       true,
+				Parts:         []model.Part{{Kind: model.PartText, Text: previewBody}},
+				CreatedAt:     time.Now(),
+			}
+			_ = r.mgr.store.AppendMessage(ctx, &botMsg)
+			r.pendingMsgs = append(r.pendingMsgs, botMsg)
+			if len(r.pendingMsgs) > 60 {
+				r.pendingMsgs = r.pendingMsgs[len(r.pendingMsgs)-60:]
+			}
+			r.mgr.log.Info("link preview sent", "channel", r.ch, "count", len(freshLinkPreviews))
+		} else {
+			r.mgr.log.Warn("link preview send failed", "channel", r.ch, "err", serr)
+		}
 	}
 
 	if !shouldReply {
@@ -1027,7 +1079,7 @@ func (r *Room) runPerception(msg *model.Message, cfg *config.Config) perceptionR
 	}
 
 	// Proactive link parsing (Tier-1 extractors + generic web pages) with bounded timeout & shared cache.
-	var parsedLinks []string
+	var parsedLinks []parsedLinkItem
 	if r.mgr.parser != nil && cfg.LinkParser.Enabled && !linkChannelDisabled(cfg.LinkParser.DisabledChannels, r.ch) {
 		alreadyHasLink := false
 		for _, p := range msg.Parts {
@@ -1056,7 +1108,10 @@ func (r *Room) runPerception(msg *model.Message, cfg *config.Config) perceptionR
 					Summary: res.Summary,
 					Text:    compact,
 				})
-				parsedLinks = append(parsedLinks, res.CanonicalURL)
+				parsedLinks = append(parsedLinks, parsedLinkItem{
+					canonicalURL: res.CanonicalURL,
+					previewText:  res.FormatForGroupText(),
+				})
 				changed = true
 			}
 		}
@@ -1069,7 +1124,7 @@ func (r *Room) runPerception(msg *model.Message, cfg *config.Config) perceptionR
 	return perceptionResult{parts: partsOut, changed: changed, imageKB: maxImageKB, parsedLinks: parsedLinks}
 }
 
-func (r *Room) markFreshLinks(canonURLs []string, now time.Time, ttl time.Duration) bool {
+func (r *Room) collectFreshLinks(items []parsedLinkItem, now time.Time, ttl time.Duration) []parsedLinkItem {
 	if ttl <= 0 {
 		ttl = 30 * time.Minute
 	}
@@ -1079,14 +1134,14 @@ func (r *Room) markFreshLinks(canonURLs []string, now time.Time, ttl time.Durati
 			delete(r.recentLinks, u)
 		}
 	}
-	fresh := false
-	for _, u := range canonURLs {
-		if u == "" {
+	var fresh []parsedLinkItem
+	for _, it := range items {
+		if it.canonicalURL == "" {
 			continue
 		}
-		if ts, ok := r.recentLinks[u]; !ok || now.Sub(ts) >= ttl {
-			fresh = true
-			r.recentLinks[u] = now
+		if ts, ok := r.recentLinks[it.canonicalURL]; !ok || now.Sub(ts) >= ttl {
+			fresh = append(fresh, it)
+			r.recentLinks[it.canonicalURL] = now
 		}
 	}
 	return fresh
@@ -1420,7 +1475,7 @@ func (r *Room) runTurnWorker(
 	} else if trig.kind == "poke_bystander" {
 		userPayload.Text += "\n[提示: 这是群友之间互戳，不是戳你；觉得有节目效果就随口吃瓜调侃一句，没必要接就回复 [[skip]]。]"
 	} else if trig.kind == "link" {
-		userPayload.Text += "\n[提示: 群友刚发了链接，系统已自动解析出上方内容。用纯文本简洁提炼核心看点或按你的性格自然点评一两句（不要机械复读原始链接，不要写冗长模板）；觉得没必要接话可直接输出 [[skip]]。]"
+		userPayload.Text += "\n[提示: 系统已将这条链接的纯文本基础解析发到群里了，不要重复复读标题和播放量等基础信息；只按你的性格顺口吐槽、接梗或补一句有意思的点评，觉得解析本身已经够清楚、没必要再补话就直接输出 [[skip]]。]"
 	}
 	out, err := r.mgr.runner.Run(ctx, agent.TurnInput{
 		ChannelID:    r.ch,
@@ -1807,10 +1862,10 @@ func (r *Room) runProactiveGate(ctx context.Context, trig triggerState, cfg *con
 
 只输出严格 JSON：{"action":"reply"|"react"|"ignore","emoji_id":"数字ID或空字符串"}`, botName)
 	if trig.kind == "link" {
-		gatePrompt = fmt.Sprintf(`你是群友“%s”，正在看群聊。群友刚发了一条链接（系统已自动解析出标题/作者/摘要附在消息里）。判断对这条链接应该怎么反应：
-- "reply"：链接内容有看点、信息量或值得帮群友用纯文本简短提炼要点/吐槽搭话（优先推荐，尤其是视频、文章、论文、项目、推文等有实质内容的链接）。
-- "react"：链接标题和内容已经一目了然没必要多嘴，或者悄悄贴个表情表态更自然。
-- "ignore"：明显是无意义广告、重复水帖、私密事务或解析内容残缺无价值，保持潜水。
+		gatePrompt = fmt.Sprintf(`你是群友“%s”，正在看群聊。群友刚发了一条链接，系统已经把纯文本解析发到群里了。现在判断你本人要不要顺手再接一句：
+- "reply"：这个内容真的很有梗/好玩/引起你的兴趣，适合按你的性格顺口吐槽或补充一句点评（不要为了回复而回复）。
+- "react"：不需要再发文字了，悄悄给群友原消息贴一个 QQ 表情表态（比如笑哭、吃瓜、赞）更有活人感。
+- "ignore"：解析文本本身已经够清楚了，没必要额外多嘴，保持潜水。
 
 若选 "react"，emoji_id 必须从以下数字 ID 中选一个：
 76(赞), 66(爱心), 182(笑哭), 179(doge/狗头), 271(吃瓜), 357(裂开/无语), 424(续火/热闹), 181(戳一戳), 319(比心)

@@ -101,6 +101,84 @@ func (r *Result) CompactForContext(maxRunes int) string {
 	return clipRunesCompact(strings.TrimSpace(b.String()), maxRunes)
 }
 
+// FormatForGroupText renders a clean, concise, risk-safe plain-text link summary for proactive group output.
+// It intentionally avoids echoing raw URLs to minimize QQ outbound link risk control.
+func (r *Result) FormatForGroupText() string {
+	if r == nil {
+		return ""
+	}
+	tag := platformLabel(r.Platform)
+	var lines []string
+
+	if r.Platform == "twitter" {
+		head := tag
+		if r.Author != "" {
+			head += " " + r.Author
+		} else if r.Title != "" {
+			head += " " + r.Title
+		}
+		lines = append(lines, head)
+		if r.Stats != "" {
+			lines = append(lines, r.Stats)
+		}
+		if s := strings.TrimSpace(r.Summary); s != "" {
+			lines = append(lines, clipRunesCompact(s, 220))
+		}
+		return strings.TrimSpace(strings.Join(lines, "\n"))
+	}
+
+	title := strings.TrimSpace(r.Title)
+	if title != "" {
+		lines = append(lines, tag+" "+clipRunesCompact(title, 90))
+	} else {
+		lines = append(lines, tag)
+	}
+
+	var meta []string
+	if r.Author != "" {
+		if r.Platform == "bilibili" {
+			meta = append(meta, "UP: "+r.Author)
+		} else if r.Platform == "weixin" {
+			meta = append(meta, "公众号: "+r.Author)
+		} else {
+			meta = append(meta, r.Author)
+		}
+	}
+	if r.Stats != "" {
+		meta = append(meta, r.Stats)
+	}
+	if r.PublishedAt != "" && r.Platform != "github" {
+		meta = append(meta, r.PublishedAt)
+	}
+	if len(meta) > 0 {
+		lines = append(lines, strings.Join(meta, " | "))
+	}
+
+	if s := strings.TrimSpace(r.Summary); s != "" {
+		lines = append(lines, clipRunesCompact(s, 200))
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func platformLabel(p string) string {
+	switch strings.ToLower(strings.TrimSpace(p)) {
+	case "bilibili":
+		return "【B站】"
+	case "github":
+		return "【GitHub】"
+	case "arxiv":
+		return "【arXiv】"
+	case "huggingface":
+		return "【HuggingFace】"
+	case "twitter":
+		return "【X】"
+	case "weixin":
+		return "【公众号】"
+	default:
+		return "【网页】"
+	}
+}
+
 // FormatForReadSource returns the detailed text view used by the read_source agent tool.
 func (r *Result) FormatForReadSource() string {
 	if r == nil {

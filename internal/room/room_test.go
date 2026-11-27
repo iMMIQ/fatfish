@@ -488,7 +488,7 @@ tools:
 
 	ch := model.MakeChannelID("onebot", "10001", model.ChannelGroup, "54321")
 
-	// 1. Group member drops a link without @bot -> parsed proactively, fast gate says "reply", primary receives parsed content and replies.
+	// 1. Group member drops a link without @bot -> always sends plain-text preview, then fast gate says "reply" -> primary also comments.
 	mgr.Dispatch(&model.Message{
 		ChannelID:     ch,
 		PlatformMsgID: "m1",
@@ -499,11 +499,11 @@ tools:
 	})
 
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && tr.sentTexts.Load() < 1 {
+	for time.Now().Before(deadline) && tr.sentTexts.Load() < 2 {
 		time.Sleep(25 * time.Millisecond)
 	}
-	if tr.sentTexts.Load() != 1 || gateCalls.Load() != 1 || primaryCalls.Load() != 1 {
-		t.Fatalf("expected 1 gate + 1 primary + 1 sent text, got gate=%d primary=%d sent=%d",
+	if tr.sentTexts.Load() != 2 || gateCalls.Load() != 1 || primaryCalls.Load() != 1 {
+		t.Fatalf("expected 1 preview + 1 gate + 1 primary reply (2 sent), got gate=%d primary=%d sent=%d",
 			gateCalls.Load(), primaryCalls.Load(), tr.sentTexts.Load())
 	}
 	mu.Lock()
@@ -516,7 +516,7 @@ tools:
 		t.Fatalf("primary prompt should include external_data wrapped link parse, got: %s", pp)
 	}
 
-	// 2. Duplicate same URL within dedup_ttl_sec must NOT re-trigger proactive gate/reply.
+	// 2. Duplicate same URL within dedup_ttl_sec must NOT re-send preview or re-trigger gate/reply.
 	mgr.Dispatch(&model.Message{
 		ChannelID:     ch,
 		PlatformMsgID: "m2",
@@ -526,11 +526,11 @@ tools:
 		CreatedAt:     time.Now(),
 	})
 	time.Sleep(250 * time.Millisecond)
-	if gateCalls.Load() != 1 || primaryCalls.Load() != 1 {
-		t.Fatalf("duplicate URL should be deduped, got gate=%d primary=%d", gateCalls.Load(), primaryCalls.Load())
+	if gateCalls.Load() != 1 || primaryCalls.Load() != 1 || tr.sentTexts.Load() != 2 {
+		t.Fatalf("duplicate URL should be deduped, got gate=%d primary=%d sent=%d", gateCalls.Load(), primaryCalls.Load(), tr.sentTexts.Load())
 	}
 
-	// 3. New URL when fatfish fast gate decides "ignore" -> 0 primary call, 0 sent text, yet L0 message still enriched.
+	// 3. New URL when fatfish fast gate decides "ignore" -> preview STILL sent (+1 sent), 0 extra primary call, L0 enriched.
 	gateAction.Store("ignore")
 	mgr.Dispatch(&model.Message{
 		ChannelID:     ch,
@@ -545,8 +545,8 @@ tools:
 		time.Sleep(25 * time.Millisecond)
 	}
 	time.Sleep(150 * time.Millisecond)
-	if gateCalls.Load() != 2 || primaryCalls.Load() != 1 || tr.sentTexts.Load() != 1 {
-		t.Fatalf("gate=ignore should not call primary or send text: gate=%d primary=%d sent=%d",
+	if gateCalls.Load() != 2 || primaryCalls.Load() != 1 || tr.sentTexts.Load() != 3 {
+		t.Fatalf("gate=ignore should still send preview but skip primary commentary: gate=%d primary=%d sent=%d",
 			gateCalls.Load(), primaryCalls.Load(), tr.sentTexts.Load())
 	}
 	saved, err := st.GetMessageByPlatformID(context.Background(), ch, "m3")
@@ -554,7 +554,7 @@ tools:
 		t.Fatalf("ignored link should still be patched into L0 history, got: %+v err=%v", saved, err)
 	}
 
-	// 4. Explicit @bot with link must run ONCE (mention turn, skipping proactive gate) -> zero double reply.
+	// 4. Explicit @bot with link must run ONCE (mention turn, skipping standalone preview & proactive gate) -> zero double reply.
 	mgr.Dispatch(&model.Message{
 		ChannelID:     ch,
 		PlatformMsgID: "m4",
@@ -565,11 +565,11 @@ tools:
 		CreatedAt:     time.Now(),
 	})
 	deadline = time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && tr.sentTexts.Load() < 2 {
+	for time.Now().Before(deadline) && tr.sentTexts.Load() < 4 {
 		time.Sleep(25 * time.Millisecond)
 	}
 	time.Sleep(150 * time.Millisecond)
-	if gateCalls.Load() != 2 || primaryCalls.Load() != 2 || tr.sentTexts.Load() != 2 {
+	if gateCalls.Load() != 2 || primaryCalls.Load() != 2 || tr.sentTexts.Load() != 4 {
 		t.Fatalf("explicit @bot + link must bypass proactive gate and send exactly 1 reply: gate=%d primary=%d sent=%d",
 			gateCalls.Load(), primaryCalls.Load(), tr.sentTexts.Load())
 	}
