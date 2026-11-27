@@ -26,3 +26,9 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o fatfish ./cmd/fatfish
 
 - [Detailed System Design Specification](docs/SPEC.md)
 - [Generic Ingest Format (JSONL & Sticker Packs)](docs/INGEST_FORMAT.md)
+
+## License
+
+`fatfish` is licensed under the **GNU Lesser General Public License v3.0 or later (`LGPL-3.0-or-later`)**. See [LICENSE](LICENSE) ([COPYING.LESSER](COPYING.LESSER)) and [COPYING](COPYING) for the full license texts.
+
+Bundled third-party assets retain their respective licenses (e.g. Noto Sans SC under SIL OFL 1.1; HTMX under BSD-2-Clause).
