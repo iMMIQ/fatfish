@@ -85,8 +85,9 @@ func MessagesJSONL(ctx context.Context, st *store.Store, path string) (Report, e
 	})
 
 	rep := Report{Total: len(lines)}
+	msgs := make([]*model.Message, 0, len(lines))
 	for _, it := range lines {
-		msg := &model.Message{
+		msgs = append(msgs, &model.Message{
 			ChannelID:     model.ChannelID(it.ChannelID),
 			PlatformMsgID: it.PlatformMsgID,
 			SenderID:      it.SenderID,
@@ -94,18 +95,12 @@ func MessagesJSONL(ctx context.Context, st *store.Store, path string) (Report, e
 			FromBot:       it.FromBot,
 			Parts:         it.Parts,
 			CreatedAt:     time.UnixMilli(it.CreatedAtMs),
-		}
-		ins, err := st.IngestMessage(ctx, msg)
-		if err != nil {
-			return rep, err
-		}
-		if ins {
-			rep.Inserted++
-		} else {
-			rep.Skipped++
-		}
+		})
 	}
-	return rep, nil
+	ins, skp, err := st.IngestMessagesBatch(ctx, msgs)
+	rep.Inserted = ins
+	rep.Skipped = skp
+	return rep, err
 }
 
 // StickerDir imports a generic sticker pack directory with optional manifest.jsonl.
