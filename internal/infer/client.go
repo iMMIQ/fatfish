@@ -85,6 +85,8 @@ type ChatResponse struct {
 	ReasoningContent string
 	ToolCalls        []ToolCall
 	FinishReason     string
+	ModelUsed        string
+	FallbackUsed     bool
 	Usage            ChatUsage
 	LatencyMs        int64
 }
@@ -215,6 +217,7 @@ func (h *Hub) Chat(ctx context.Context, role string, req ChatRequest) (*ChatResp
 			fbReq := req
 			fbReq.Model = "" // Use primary_fallback's configured model ID
 			if fbResp, err2 := h.chatOnce(ctx, "primary_fallback", fbReq); err2 == nil {
+				fbResp.FallbackUsed = true
 				return fbResp, nil
 			}
 		}
@@ -329,6 +332,7 @@ func (h *Hub) chatOnce(ctx context.Context, role string, req ChatRequest) (*Chat
 		ReasoningContent: ch.Message.ReasoningContent,
 		ToolCalls:        ch.Message.ToolCalls,
 		FinishReason:     ch.FinishReason,
+		ModelUsed:        req.Model,
 		Usage: ChatUsage{
 			PromptTokens:     parsed.Usage.PromptTokens,
 			CachedTokens:     cached,

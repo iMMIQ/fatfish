@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -316,6 +317,28 @@ func (s *Service) recallHybridMemory(ctx context.Context, opts RecallOptions) (R
 	}
 
 	if len(sections) == 0 {
+		// Cold-start fallback: when L1/L2 memory is empty for this channel/sender,
+		// surface recent L0 raw messages so the bot still recognizes active members.
+		var senderIDs []string
+		if strings.TrimSpace(opts.Sender) != "" {
+			senderIDs, _ = s.store.ResolveMembersByAlias(ctx, opts.ChannelID, opts.Sender)
+		}
+		fbLimit := opts.Limit
+		if fbLimit > 10 {
+			fbLimit = 10
+		}
+		var rawMsgs []model.Message
+		if strings.TrimSpace(opts.Query) != "" || len(senderIDs) > 0 {
+			rawMsgs, _ = s.store.SearchMessagesFTS(ctx, opts.ChannelID, opts.Query, senderIDs, opts.SinceMs, opts.UntilMs, fbLimit)
+			// If query keywords were conversational (e.g. "do you know me") and matched nothing,
+			// retry filtered strictly by senderIDs to fetch their recent history in this channel.
+			if len(rawMsgs) == 0 && len(senderIDs) > 0 && strings.TrimSpace(opts.Query) != "" {
+				rawMsgs, _ = s.store.SearchMessagesFTS(ctx, opts.ChannelID, "", senderIDs, opts.SinceMs, opts.UntilMs, fbLimit)
+			}
+		}
+		if len(rawMsgs) > 0 {
+			return RecallResult{Summary: "[Raw Message Fallback]\n" + formatMessages(rawMsgs)}, nil
+		}
 		return RecallResult{Summary: "(no memory records found for this channel)"}, nil
 	}
 	return RecallResult{Summary: strings.Join(sections, "\n\n")}, nil
@@ -345,19 +368,46 @@ type EpisodeExtraction struct {
 }
 
 // PartitionWindows groups messages into meaningful conversational episodes separated by >maxGap silence
-// or >=maxMsgs valid messages, skipping noisy short fragments (<minMsgs).
+// or >=maxMsgs valid messages, skipping noisy short fragments (<minMsgs) and media-only spam windows.
 func PartitionWindows(msgs []model.Message, maxGap time.Duration, maxMsgs, minMsgs int) [][]model.Message {
 	if maxGap <= 0 {
 		maxGap = 30 * time.Minute
 	}
 	if maxMsgs <= 0 {
-		maxMsgs = 150
+		maxMsgs = 100
 	}
 	if minMsgs <= 0 {
 		minMsgs = 8
 	}
+	minTextMsgs := minMsgs/2 + 1
+	if minTextMsgs > 5 {
+		minTextMsgs = 5
+	}
+	hasSubstantiveText := func(m model.Message) bool {
+		for _, p := range m.Parts {
+			if p.Kind == model.PartText && len([]rune(strings.TrimSpace(p.Text))) > 1 {
+				return true
+			}
+			if p.Kind == model.PartAudio && len([]rune(strings.TrimSpace(p.Transcript))) > 1 {
+				return true
+			}
+			if p.Kind == model.PartCard && strings.TrimSpace(p.Title) != "" {
+				return true
+			}
+		}
+		return false
+	}
+
 	var windows [][]model.Message
 	var cur []model.Message
+	curText := 0
+	flush := func() {
+		if len(cur) >= minMsgs && curText >= minTextMsgs {
+			windows = append(windows, cur)
+		}
+		cur = nil
+		curText = 0
+	}
 	for _, m := range msgs {
 		txt := strings.TrimSpace(m.PlainText())
 		// Filter out single-char/pure-noise lines unless carrying media.
@@ -367,17 +417,15 @@ func PartitionWindows(msgs []model.Message, maxGap time.Duration, maxMsgs, minMs
 		if len(cur) > 0 {
 			gap := m.CreatedAt.Sub(cur[len(cur)-1].CreatedAt)
 			if gap > maxGap || len(cur) >= maxMsgs {
-				if len(cur) >= minMsgs {
-					windows = append(windows, cur)
-				}
-				cur = nil
+				flush()
 			}
 		}
 		cur = append(cur, m)
+		if hasSubstantiveText(m) {
+			curText++
+		}
 	}
-	if len(cur) >= minMsgs {
-		windows = append(windows, cur)
-	}
+	flush()
 	return windows
 }
 
@@ -419,7 +467,7 @@ func (s *Service) DistillChannel(ctx context.Context, opts DistillOptions) (int,
 		}
 		msgs = filtered
 	}
-	windows := PartitionWindows(msgs, 30*time.Minute, 150, 8)
+	windows := PartitionWindows(msgs, 30*time.Minute, 100, 8)
 	if opts.MaxEpisodes > 0 && len(windows) > opts.MaxEpisodes {
 		windows = windows[:opts.MaxEpisodes]
 	}
@@ -432,26 +480,37 @@ func (s *Service) DistillChannel(ctx context.Context, opts DistillOptions) (int,
 
 	var mu sync.Mutex
 	created := 0
-	var maxSeqDone int64 = afterSeq
+	winDone := make([]bool, len(windows))
+	contiguousIdx := 0
+	var contiguousSeq int64 = afterSeq
 
 	for idx, w := range windows {
+		winIdx := idx
 		win := w
 		winNo := idx + 1
 		totalWins := len(windows)
 		g.Go(func() error {
-			ep, err := s.DistillWindow(gctx, ch, win, role)
+			ep, err := s.distillWindowWithRetry(gctx, ch, win, role)
 			if err != nil {
 				s.log.Warn("distill window failed", "channel", ch, "window", winNo, "err", err)
 				return nil
 			}
 			mu.Lock()
 			created++
-			if ep.EndSeq > maxSeqDone {
-				maxSeqDone = ep.EndSeq
+			winDone[winIdx] = true
+			for contiguousIdx < len(windows) && winDone[contiguousIdx] {
+				endSeq := windows[contiguousIdx][len(windows[contiguousIdx])-1].Seq
+				if endSeq > contiguousSeq {
+					contiguousSeq = endSeq
+				}
+				contiguousIdx++
 			}
+			_ = ep
 			if created%10 == 0 || winNo == totalWins {
-				_ = s.store.SetDistillCheckpoint(ctx, ch, maxSeqDone)
-				s.log.Info("distill progress", "channel", ch, "done", created, "total_windows", totalWins, "checkpoint_seq", maxSeqDone)
+				if contiguousSeq > afterSeq {
+					_ = s.store.SetDistillCheckpoint(ctx, ch, contiguousSeq)
+				}
+				s.log.Info("distill progress", "channel", ch, "done", created, "total_windows", totalWins, "checkpoint_seq", contiguousSeq)
 			}
 			mu.Unlock()
 			return nil
@@ -460,10 +519,41 @@ func (s *Service) DistillChannel(ctx context.Context, opts DistillOptions) (int,
 	if err := g.Wait(); err != nil {
 		return created, err
 	}
-	if maxSeqDone > afterSeq {
-		_ = s.store.SetDistillCheckpoint(ctx, ch, maxSeqDone)
+	if contiguousSeq > afterSeq {
+		_ = s.store.SetDistillCheckpoint(ctx, ch, contiguousSeq)
 	}
 	return created, nil
+}
+
+// distillWindowWithRetry backs off when the distill circuit breaker is open instead of
+// stampeding through remaining windows, and retries transient timeouts once.
+func (s *Service) distillWindowWithRetry(ctx context.Context, ch model.ChannelID, win []model.Message, role string) (*model.Episode, error) {
+	const maxAttempts = 4
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		ep, err := s.DistillWindow(ctx, ch, win, role)
+		if err == nil {
+			return ep, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		var wait time.Duration
+		if errors.Is(err, infer.ErrCircuitOpen) {
+			wait = 31 * time.Second
+		} else if attempt <= 2 {
+			wait = 5 * time.Second
+		} else {
+			break
+		}
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return nil, lastErr
 }
 
 // DistillWindow summarizes a single message window into an L1 Episode and updates L2 profiles/lore
@@ -477,8 +567,9 @@ func (s *Service) DistillWindow(ctx context.Context, ch model.ChannelID, win []m
 Rules:
 1. Key every participant strictly by their immutable member_id shown in parentheses, NEVER by nickname.
 2. Separate jokes/sarcasm/shitposting into candidate_jokes or candidate_lore; NEVER record sarcasm as candidate_facts.
-3. Keep arrays compact (at most 5 items each) so the JSON stays concise and valid.
-4. Output ONLY valid compact JSON matching:
+3. Never extract candidate_facts or candidate_jokes for the bot itself.
+4. Keep arrays compact (at most 5 items each) so the JSON stays concise and valid.
+5. Output ONLY valid compact JSON matching:
 {"topic":"...","summary":"...","participants":[{"id":"...","role_in_topic":"..."}],"notable_quotes":["..."],"candidate_facts":[{"member_id":"...","fact":"...","serious":true}],"candidate_jokes":[{"member_id":"...","joke":"..."}],"candidate_lore":[{"term":"...","meaning":"..."}]}`
 
 	resp, err := s.hub.Chat(ctx, role, infer.ChatRequest{
@@ -537,15 +628,26 @@ Rules:
 		s.mu.Unlock()
 	}
 
+	// Identify bot self IDs so the bot never pollutes member profiles with its own persona/history.
+	botIDs := make(map[string]bool)
+	if _, botID, _, _, ok := model.ParseChannelID(ch); ok && botID != "" {
+		botIDs[botID] = true
+	}
+	for _, m := range win {
+		if m.FromBot && m.SenderID != "" {
+			botIDs[m.SenderID] = true
+		}
+	}
+
 	// Merge L2 Candidate Facts & Jokes with anti-sarcasm corroboration (>=2 distinct episodes).
 	for _, cf := range ext.CandidateFacts {
-		if cf.MemberID == "" || strings.TrimSpace(cf.Fact) == "" {
+		if cf.MemberID == "" || botIDs[cf.MemberID] || strings.TrimSpace(cf.Fact) == "" {
 			continue
 		}
 		_ = s.MergeCandidateFact(ctx, ch, cf.MemberID, cf.Fact, ep.ID, cf.Serious)
 	}
 	for _, cj := range ext.CandidateJokes {
-		if cj.MemberID == "" || strings.TrimSpace(cj.Joke) == "" {
+		if cj.MemberID == "" || botIDs[cj.MemberID] || strings.TrimSpace(cj.Joke) == "" {
 			continue
 		}
 		_ = s.AddProfileJoke(ctx, ch, cj.MemberID, cj.Joke, ep.ID)

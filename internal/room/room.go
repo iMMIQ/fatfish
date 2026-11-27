@@ -858,6 +858,7 @@ func (r *Room) executeTurn(trig triggerState) {
 
 	// Stale-drop check #1 (before generation).
 	if r.isStale(trig, cfg) {
+		r.mgr.log.Info("turn dropped stale", "channel", r.ch, "trigger", trig.kind, "stage", "pre_gen")
 		return
 	}
 
@@ -873,6 +874,7 @@ func (r *Room) executeTurn(trig triggerState) {
 				_ = r.mgr.tr.SendReaction(ctx, r.ch, trig.msg.PlatformMsgID, emoji)
 			}
 			r.lastProactive = time.Now()
+			r.mgr.log.Info("proactive gate reacted", "channel", r.ch, "emoji", emoji)
 			return
 		}
 	}
@@ -952,6 +954,7 @@ func (r *Room) executeTurn(trig triggerState) {
 
 	// Abort if /reset happened or channel moved on while LLM was thinking.
 	if r.epoch.Load() != startEpoch || r.isStale(trig, cfg) {
+		r.mgr.log.Info("turn dropped stale", "channel", r.ch, "trigger", trig.kind, "stage", "post_gen")
 		return
 	}
 
@@ -983,10 +986,10 @@ func (r *Room) executeTurn(trig triggerState) {
 		PokeAfterReply: pokeAfter,
 	}
 
-	r.deliverPlan(ctx, seg, plan, out.NewFrames, trig, cfg)
+	r.deliverPlan(ctx, seg, plan, out.NewFrames, out.Stats, trig, cfg)
 }
 
-func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan model.TurnPlan, newFrames []frame.StoredFramePayload, trig triggerState, cfg *config.Config) {
+func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan model.TurnPlan, newFrames []frame.StoredFramePayload, stats agent.TurnStats, trig triggerState, cfg *config.Config) {
 	delID, _ := r.mgr.store.CreateDelivery(ctx, plan)
 	var sent []model.SentItem
 	status := model.DeliverySent
@@ -1169,6 +1172,27 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 	}
 
 	_ = r.mgr.store.UpdateDelivery(ctx, delID, status, sent)
+
+	hitPct := 0.0
+	if stats.PromptTokens > 0 {
+		hitPct = float64(stats.CachedTokens) * 100.0 / float64(stats.PromptTokens)
+	}
+	r.mgr.log.Info("turn delivered",
+		"channel", r.ch,
+		"trigger", trig.kind,
+		"status", status,
+		"model", stats.ModelUsed,
+		"fallback", stats.FallbackUsed,
+		"iters", stats.Iterations,
+		"tools", strings.Join(stats.ToolNames, ","),
+		"prompt_tok", stats.PromptTokens,
+		"cached_tok", stats.CachedTokens,
+		"cache_hit_pct", fmt.Sprintf("%.1f%%", hitPct),
+		"comp_tok", stats.CompletionTokens,
+		"latency_ms", stats.TotalLatencyMs,
+		"bubbles", len(sent),
+		"sticker", plan.StickerIntent != "",
+	)
 
 	// Invariant (SPEC Section 3): ONLY delivered turns enter the FrozenFrame timeline.
 	if len(sent) > 0 || r.mgr.tr == nil {

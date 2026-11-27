@@ -67,7 +67,7 @@ func (t *WebSearchTool) httpClient() *http.Client {
 func (t *WebSearchTool) Name() string   { return "web_search" }
 func (t *WebSearchTool) ReadOnly() bool { return true }
 func (t *WebSearchTool) Description() string {
-	return "Fallback web/code/paper search across bing, baidu, github, hf_mirror, and arxiv."
+	return "Fallback web search (bing/baidu) and specialized github/hf_mirror/arxiv search. Prefer MCP web_search_prime for general web queries when available."
 }
 
 func (t *WebSearchTool) Execute(ctx context.Context, _ ToolContext, args WebSearchArgs) (ToolResult, error) {
@@ -660,7 +660,7 @@ func extractDOCXText(docxBytes []byte) (string, error) {
 // --- 6. quote ---
 
 type QuoteArgs struct {
-	Symbol string `json:"symbol" jsonschema:"required,description=Stock ticker e.g. usNVDA, usAAPL, hk00700, sh600519, sz000001"`
+	Symbol string `json:"symbol" jsonschema:"required,description=Stock or index ticker e.g. usNVDA, usSMH, hk00700, hkHSTECH, hkHSI, sh000001, sh600519, sz399006"`
 	Days   int    `json:"days,omitempty" jsonschema:"description=Optional number of daily K-line bars to fetch (default 15, max 60)"`
 }
 
@@ -723,16 +723,22 @@ func (t *QuoteTool) Execute(ctx context.Context, _ ToolContext, args QuoteArgs) 
 	}
 
 	var b strings.Builder
-	if summary := parseTencentQuote(utf8Text); summary != "" {
+	summary, quoteCode := parseTencentQuote(utf8Text)
+	if summary != "" {
 		b.WriteString(summary + "\n")
 	} else {
 		return ToolResult{}, fmt.Errorf("quote: no market data returned for %q", sym)
 	}
 
 	// 2. Daily K-line bars (up to 60 days).
-	klURL := fmt.Sprintf("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s,day,,,%d,qfq", url.QueryEscape(sym), days)
+	// For US tickers, Tencent fqkline requires the exchange suffix (e.g. usSMH.OQ) returned in quoteCode.
+	klSym := sym
+	if strings.HasPrefix(sym, "us") && strings.Contains(quoteCode, ".") {
+		klSym = "us" + quoteCode
+	}
+	klURL := fmt.Sprintf("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s,day,,,%d,qfq", url.QueryEscape(klSym), days)
 	if klRaw, _, _, kerr := netutil.FetchLimited(ctx, t.httpClient(), klURL, 2<<20, nil); kerr == nil {
-		if klLines := parseTencentKline(klRaw, sym); len(klLines) > 0 {
+		if klLines := parseTencentKline(klRaw, klSym); len(klLines) > 0 {
 			b.WriteString("\nRecent Daily K-line (date, open, close, high, low, vol):\n")
 			b.WriteString(strings.Join(klLines, "\n"))
 		}
@@ -747,10 +753,37 @@ func normalizeTicker(s string) string {
 		return ""
 	}
 	low := strings.ToLower(s)
+	// Common index aliases (Chinese & bare English).
+	switch low {
+	case "hstech", "恒生科技", "恒生科技指数", "恒科":
+		return "hkHSTECH"
+	case "hsi", "恒生指数", "恒指":
+		return "hkHSI"
+	case "hscei", "国企指数", "恒生国企":
+		return "hkHSCEI"
+	case "上证", "上证指数", "大盘", "sse":
+		return "sh000001"
+	case "深证", "深证成指":
+		return "sz399001"
+	case "创业板", "创业板指":
+		return "sz399006"
+	case "科创50", "科创板":
+		return "sh000688"
+	case "沪深300", "csi300":
+		return "sh000300"
+	}
 	if strings.HasPrefix(low, "us") {
 		return "us" + strings.ToUpper(s[2:])
 	}
-	if strings.HasPrefix(low, "hk") || strings.HasPrefix(low, "sh") || strings.HasPrefix(low, "sz") {
+	if strings.HasPrefix(low, "hk") {
+		rest := s[2:]
+		if isAllDigits(rest) {
+			return "hk" + rest
+		}
+		// HK indices like hkHSTECH / hkHSI / hkHSCEI are case-sensitive on qt.gtimg.cn.
+		return "hk" + strings.ToUpper(rest)
+	}
+	if strings.HasPrefix(low, "sh") || strings.HasPrefix(low, "sz") {
 		return low
 	}
 	// Bare 6-digit A-share or bare US ticker heuristic.
@@ -772,19 +805,19 @@ func decodeGBK(b []byte) (string, error) {
 	return string(out), err
 }
 
-func parseTencentQuote(raw string) string {
+func parseTencentQuote(raw string) (summary string, code string) {
 	start := strings.IndexByte(raw, '"')
 	end := strings.LastIndexByte(raw, '"')
 	if start < 0 || end <= start {
-		return ""
+		return "", ""
 	}
 	fields := strings.Split(raw[start+1:end], "~")
 	if len(fields) < 35 {
-		return ""
+		return "", ""
 	}
 	name, code, price, prevClose, open, pct, high, low := fields[1], fields[2], fields[3], fields[4], fields[5], fields[32], fields[33], fields[34]
 	return fmt.Sprintf("%s (%s): Price=%s | Change=%s%% | Open=%s | PrevClose=%s | High=%s | Low=%s",
-		name, code, price, pct, open, prevClose, high, low)
+		name, code, price, pct, open, prevClose, high, low), code
 }
 
 func parseTencentKline(raw []byte, sym string) []string {

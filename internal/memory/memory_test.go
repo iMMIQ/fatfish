@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/iMMIQ/fatfish/internal/model"
 	"github.com/iMMIQ/fatfish/internal/store"
@@ -96,5 +97,71 @@ func TestProfileDecayAndCap(t *testing.T) {
 	}
 	if out[0].Text != "fact_a" {
 		t.Fatalf("expected freshest confirmed fact_a ranked first, got %q", out[0].Text)
+	}
+}
+
+func TestPartitionWindowsFiltersMediaSpamAndRecallFallback(t *testing.T) {
+	now := time.Now()
+	ch := model.MakeChannelID("onebot", "10001", model.ChannelGroup, "88888")
+
+	// 12 pure-image messages should NOT produce an episode window.
+	var spam []model.Message
+	for i := 0; i < 12; i++ {
+		spam = append(spam, model.Message{
+			ChannelID: ch,
+			Seq:       int64(i + 1),
+			SenderID:  "u1",
+			Parts:     []model.Part{{Kind: model.PartImage, MediaID: "m1"}},
+			CreatedAt: now.Add(time.Duration(i) * time.Second),
+		})
+	}
+	if wins := PartitionWindows(spam, 30*time.Minute, 100, 8); len(wins) != 0 {
+		t.Fatalf("expected pure-media spam to produce 0 windows, got %d", len(wins))
+	}
+
+	// 8 substantive text messages should produce 1 window.
+	var realChat []model.Message
+	for i := 0; i < 8; i++ {
+		realChat = append(realChat, model.Message{
+			ChannelID: ch,
+			Seq:       int64(i + 1),
+			SenderID:  "u1",
+			Parts:     []model.Part{{Kind: model.PartText, Text: "discussion message line"}},
+			CreatedAt: now.Add(time.Duration(i) * time.Second),
+		})
+	}
+	if wins := PartitionWindows(realChat, 30*time.Minute, 100, 8); len(wins) != 1 {
+		t.Fatalf("expected substantive chat to produce 1 window, got %d", len(wins))
+	}
+
+	// Recall(mode="memory") cold-start fallback to L0 raw history by sender.
+	st, err := store.Open(t.TempDir(), 512, 5)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	_ = st.UpsertMember(ctx, model.Member{ChannelID: ch, MemberID: "u42", DisplayName: "Alice", UpdatedAt: now})
+	_ = st.AppendMessage(ctx, &model.Message{
+		ChannelID:  ch,
+		SenderID:   "u42",
+		SenderName: "Alice",
+		Parts:      []model.Part{{Kind: model.PartText, Text: "booked flight to Kyoto next week"}},
+		CreatedAt:  now,
+	})
+
+	svc := NewService(st, nil, 4, nil)
+	res, err := svc.Recall(ctx, RecallOptions{
+		ChannelID: ch,
+		Mode:      "memory",
+		Query:     "do you recognize me",
+		Sender:    "Alice",
+		Limit:     10,
+	})
+	if err != nil {
+		t.Fatalf("Recall: %v", err)
+	}
+	if !strings.Contains(res.Summary, "[Raw Message Fallback]") || !strings.Contains(res.Summary, "Kyoto") {
+		t.Fatalf("expected cold-start L0 raw fallback for sender, got %q", res.Summary)
 	}
 }

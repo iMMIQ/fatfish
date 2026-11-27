@@ -60,6 +60,18 @@ type TurnInput struct {
 	TriggerKind  string
 }
 
+// TurnStats summarizes inference telemetry across all iterations of a turn.
+type TurnStats struct {
+	ModelUsed        string
+	FallbackUsed     bool
+	Iterations       int
+	ToolNames        []string
+	PromptTokens     int
+	CachedTokens     int
+	CompletionTokens int
+	TotalLatencyMs   int64
+}
+
 // TurnOutput returns the text reply, direct media, optional async sticker intent,
 // and the newly generated FrozenFrames ready to be persisted after delivery succeeds.
 type TurnOutput struct {
@@ -67,6 +79,7 @@ type TurnOutput struct {
 	DirectMedia   []model.DirectMedia
 	StickerIntent string
 	NewFrames     []frame.StoredFramePayload
+	Stats         TurnStats
 }
 
 // Run executes the agent loop and returns a TurnOutput without mutating the public timeline yet
@@ -99,6 +112,7 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 	}
 
 	var finalText string
+	var stats TurnStats
 	for iter := 1; iter <= maxToolIterations; iter++ {
 		req := infer.ChatRequest{
 			Messages: msgs,
@@ -109,12 +123,29 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 			return nil, err
 		}
 
+		stats.Iterations = iter
+		if resp.ModelUsed != "" {
+			stats.ModelUsed = resp.ModelUsed
+		}
+		if resp.FallbackUsed {
+			stats.FallbackUsed = true
+		}
+		stats.PromptTokens += resp.Usage.PromptTokens
+		stats.CachedTokens += resp.Usage.CachedTokens
+		stats.CompletionTokens += resp.Usage.CompletionTokens
+		stats.TotalLatencyMs += resp.LatencyMs
+
+		metricModelKey := modelKey
+		if resp.FallbackUsed {
+			metricModelKey = r.hub.ModelKey("primary_fallback")
+		}
+
 		// Record KV telemetry & first-attempt calibrator sample.
 		if r.store != nil {
 			_ = r.store.RecordKVMetric(ctx, model.KVMetric{
 				ChannelID:        in.ChannelID,
 				SegmentID:        in.Segment.ID,
-				ModelID:          modelKey,
+				ModelID:          metricModelKey,
 				Attempt:          iter,
 				PromptTokens:     resp.Usage.PromptTokens,
 				CachedTokens:     resp.Usage.CachedTokens,
@@ -124,7 +155,7 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 				CreatedAt:        time.Now(),
 			})
 		}
-		if iter == 1 && resp.Usage.PromptTokens > 0 {
+		if iter == 1 && !resp.FallbackUsed && resp.Usage.PromptTokens > 0 {
 			r.frames.RecordCalibratorSample(ctx, modelKey, estTokens, resp.Usage.PromptTokens, imgCount)
 		}
 
@@ -149,6 +180,7 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 		// Execute tool calls: parallel via errgroup when all calls in this batch are ReadOnly.
 		results := r.executeToolBatch(ctx, tc, resp.ToolCalls)
 		for i, call := range resp.ToolCalls {
+			stats.ToolNames = append(stats.ToolNames, call.Function.Name)
 			res := results[i]
 			if len(res.DirectMedia) > 0 {
 				directMedia = append(directMedia, res.DirectMedia...)
@@ -187,6 +219,7 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 		DirectMedia:   directMedia,
 		StickerIntent: stickerIntent,
 		NewFrames:     newFrames,
+		Stats:         stats,
 	}, nil
 }
 

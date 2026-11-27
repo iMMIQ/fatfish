@@ -436,6 +436,9 @@ func FormatUserTurnWithLimits(msgs []model.Message, loc *time.Location, newMembe
 				}
 			}
 		}
+		if len(parts) == 0 && m.MentionedBot {
+			parts = append(parts, "[@了你]")
+		}
 		if len(parts) > 0 {
 			lines = append(lines, fmt.Sprintf("[%s] %s(%s): %s", ts, m.SenderName, m.SenderID, strings.Join(parts, " ")))
 		}
