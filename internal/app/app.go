@@ -83,6 +83,7 @@ func New(configPath string, enableTransport bool) (*App, error) {
 	hub := infer.NewHub(cfg.Models)
 	fb := frame.NewBuilder(st, cfg.Frame)
 	memSvc := memory.NewService(st, hub, cfg.Models.Embed.Dim, logger)
+	memSvc.SetIgnoredBots(cfg.Policy.IgnoredBots)
 	stkEng := sticker.NewEngine(st, hub, cfg.Sticker, cfg.Models.Embed.Dim, logger)
 
 	var tr transport.Transport
@@ -179,6 +180,7 @@ func New(configPath string, enableTransport bool) (*App, error) {
 		}
 		hub.UpdateConfig(newCfg.Models)
 		fb.UpdateConfig(newCfg.Frame)
+		memSvc.SetIgnoredBots(newCfg.Policy.IgnoredBots)
 		stkEng.UpdateConfig(newCfg.Sticker)
 		sched.SetMediaQuotas(newCfg.Frame.RoomMediaMiB, newCfg.Frame.TotalMediaMiB)
 		sched.UpdateConfig(newCfg.Location(), newCfg.Tools.MaxSchedulesPerChannel, newCfg.Tools.MinCronIntervalMinutes)

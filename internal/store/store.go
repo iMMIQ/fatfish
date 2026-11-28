@@ -1415,12 +1415,64 @@ func (s *Store) ListProfiles(ctx context.Context, ch model.ChannelID, limit int)
 
 func (s *Store) UpsertLore(ctx context.Context, entry model.LoreEntry) error {
 	now := time.Now().UnixMilli()
+	conf := entry.Confidence
+	if conf <= 0 {
+		conf = 0.45
+	}
 	_, err := s.writeDB.ExecContext(ctx,
 		`INSERT INTO lore (channel_id, term, meaning, confidence, updated_at) VALUES (?, ?, ?, ?, ?)
-		 ON CONFLICT(channel_id, term) DO UPDATE SET meaning = excluded.meaning, confidence = MAX(confidence, excluded.confidence), updated_at = excluded.updated_at`,
-		string(entry.ChannelID), entry.Term, entry.Meaning, entry.Confidence, now,
+		 ON CONFLICT(channel_id, term) DO UPDATE SET
+		   meaning = excluded.meaning,
+		   confidence = MIN(0.95, MAX(confidence, excluded.confidence) + 0.15),
+		   updated_at = excluded.updated_at`,
+		string(entry.ChannelID), entry.Term, entry.Meaning, conf, now,
 	)
 	return err
+}
+
+// PruneStaleLore removes uncorroborated (confidence < 0.55) lore older than expireLowConfDays
+// and caps each channel to at most maxPerChannel entries ordered by confidence & recency.
+func (s *Store) PruneStaleLore(ctx context.Context, maxPerChannel, expireLowConfDays int) (int64, error) {
+	var total int64
+	if expireLowConfDays > 0 {
+		cutoff := time.Now().AddDate(0, 0, -expireLowConfDays).UnixMilli()
+		res, err := s.writeDB.ExecContext(ctx,
+			`DELETE FROM lore WHERE confidence < 0.55 AND updated_at < ?`, cutoff)
+		if err != nil {
+			return 0, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			total += n
+		}
+	}
+	if maxPerChannel > 0 {
+		rows, err := s.readDB.QueryContext(ctx,
+			`SELECT channel_id FROM lore GROUP BY channel_id HAVING COUNT(*) > ?`, maxPerChannel)
+		if err != nil {
+			return total, err
+		}
+		var overChs []string
+		for rows.Next() {
+			var ch string
+			if rows.Scan(&ch) == nil {
+				overChs = append(overChs, ch)
+			}
+		}
+		rows.Close()
+		for _, ch := range overChs {
+			res, err := s.writeDB.ExecContext(ctx,
+				`DELETE FROM lore WHERE channel_id = ? AND id NOT IN (
+				   SELECT id FROM lore WHERE channel_id = ? ORDER BY confidence DESC, updated_at DESC LIMIT ?
+				 )`, ch, ch, maxPerChannel)
+			if err != nil {
+				return total, err
+			}
+			if n, _ := res.RowsAffected(); n > 0 {
+				total += n
+			}
+		}
+	}
+	return total, nil
 }
 
 func (s *Store) ListLore(ctx context.Context, ch model.ChannelID, limit int) ([]model.LoreEntry, error) {

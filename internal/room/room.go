@@ -265,10 +265,16 @@ type Room struct {
 
 	epoch             atomic.Int64
 	muteUntilNano     atomic.Int64 // UnixNano; atomic so actor & turn worker share safely
+	consecRiskHits    atomic.Int32 // consecutive risk/rate-limit hits for tiered backoff
+	lastRiskAtNano    atomic.Int64
 	msgCount          atomic.Uint64
 	lastProactive     time.Time
 	lastLinkProactive time.Time
 	lastPlusOne       time.Time
+	lastPokeReply     time.Time
+	lastReversePoke   time.Time
+	outMu             sync.Mutex
+	outSent           []time.Time // rolling 60s outbound message timestamps (group rate-limit guard)
 	recentLinks       map[string]time.Time // per-channel canonical URL dedup map (actor-owned)
 	seenInSegment     map[string]bool      // tracks members already introduced in active segment
 	lastSegID      int64
@@ -362,15 +368,126 @@ func (r *Room) isMuted(now time.Time) bool {
 	return until > 0 && now.UnixNano() < until
 }
 
-func (r *Room) engageMute(ctx context.Context, cfg *config.Config) {
-	sec := cfg.Policy.MuteBackoffSec
-	if sec <= 0 {
-		sec = 1800
+func (r *Room) pruneOutboundLocked(now time.Time) {
+	cutoff := now.Add(-60 * time.Second)
+	kept := r.outSent[:0]
+	for _, ts := range r.outSent {
+		if ts.After(cutoff) {
+			kept = append(kept, ts)
+		}
 	}
-	until := time.Now().Add(time.Duration(sec) * time.Second)
+	r.outSent = kept
+}
+
+func (r *Room) recentOutboundCount(now time.Time) int {
+	r.outMu.Lock()
+	r.pruneOutboundLocked(now)
+	n := len(r.outSent)
+	r.outMu.Unlock()
+	return n
+}
+
+func (r *Room) recordOutbound(now time.Time) {
+	r.outMu.Lock()
+	r.pruneOutboundLocked(now)
+	r.outSent = append(r.outSent, now)
+	r.outMu.Unlock()
+}
+
+func (r *Room) outboundRemaining(now time.Time, maxPerMin int) int {
+	if !r.ch.IsGroup() || maxPerMin <= 0 {
+		return 999
+	}
+	return maxPerMin - r.recentOutboundCount(now)
+}
+
+func (r *Room) waitForOutboundSlot(ctx context.Context, maxPerMin int, maxWait time.Duration) bool {
+	if !r.ch.IsGroup() || maxPerMin <= 0 {
+		return true
+	}
+	for {
+		now := time.Now()
+		r.outMu.Lock()
+		r.pruneOutboundLocked(now)
+		if len(r.outSent) < maxPerMin {
+			r.outMu.Unlock()
+			return true
+		}
+		wait := r.outSent[0].Add(61 * time.Second).Sub(now)
+		r.outMu.Unlock()
+		if wait <= 0 {
+			continue
+		}
+		if wait > maxWait {
+			return false
+		}
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
+func (r *Room) engageMute(ctx context.Context, cfg *config.Config) {
+	now := time.Now()
+	if prev := r.lastRiskAtNano.Load(); prev > 0 && now.Sub(time.Unix(0, prev)) > 15*time.Minute {
+		r.consecRiskHits.Store(0)
+	}
+	r.lastRiskAtNano.Store(now.UnixNano())
+	hits := r.consecRiskHits.Add(1)
+
+	fullSec := cfg.Policy.MuteBackoffSec
+	if fullSec <= 0 {
+		fullSec = 1800
+	}
+	rlSec := cfg.Policy.RateLimitBackoffSec
+	if rlSec <= 0 {
+		rlSec = 75
+	}
+	maxPerMin := cfg.Policy.MaxMsgsPerMin
+	if maxPerMin <= 0 {
+		maxPerMin = 8
+	}
+
+	recentOut := r.recentOutboundCount(now)
+	sec := fullSec
+	reason := "risk_mute"
+	// High outbound volume within 60s indicates platform per-minute group rate limit (e.g. QQ 10 msgs/min)
+	// rather than a real admin mute: apply tiered backoff (75s -> 5m -> full mute_backoff_sec).
+	threshold := maxPerMin - 3
+	if threshold < 5 {
+		threshold = 5
+	}
+	if r.ch.IsGroup() && recentOut >= threshold {
+		reason = "rate_limit"
+		switch hits {
+		case 1:
+			sec = rlSec
+		case 2:
+			sec = 300
+			if sec < rlSec {
+				sec = rlSec
+			}
+			if sec > fullSec {
+				sec = fullSec
+			}
+		default:
+			sec = fullSec
+		}
+	}
+
+	until := now.Add(time.Duration(sec) * time.Second)
 	r.muteUntilNano.Store(until.UnixNano())
 	_ = r.mgr.store.SetChannelMuteUntil(ctx, r.ch, until)
-	r.mgr.log.Warn("risk/mute detected, engaging backoff", "channel", r.ch, "until", until)
+	r.mgr.log.Warn("risk/mute detected, engaging backoff",
+		"channel", r.ch,
+		"reason", reason,
+		"recent_outbound_60s", recentOut,
+		"consec_hits", hits,
+		"backoff_sec", sec,
+		"until", until,
+	)
 }
 
 func (r *Room) stop() {
@@ -566,6 +683,8 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		if r.mgr.tr != nil {
 			if _, err := r.mgr.tr.SendText(ctx, r.ch, <-replyCh, transport.SendOptions{}); errors.Is(err, transport.ErrRiskMuted) {
 				r.engageMute(ctx, cfg)
+			} else if err == nil {
+				r.recordOutbound(time.Now())
 			}
 		}
 		return 0, false
@@ -585,6 +704,8 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 			if err == nil && out != "" && r.mgr.tr != nil {
 				if _, serr := r.mgr.tr.SendText(tctx, r.ch, out, transport.SendOptions{ReplyToMsgID: replyTo}); errors.Is(serr, transport.ErrRiskMuted) {
 					r.engageMute(tctx, cfg)
+				} else if serr == nil {
+					r.recordOutbound(time.Now())
 				}
 			}
 		}()
@@ -661,8 +782,16 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		default: // "bot_only"
 			pokedForPolicy = msg.PokedBot
 		}
-		// Only reverse-poke when the bot itself was poked, with a humanlike 1.0~2.5s delay.
-		if msg.PokedBot && pokedForPolicy && cfg.Policy.Poke.ReverseProb > 0 && rand.Float64() < cfg.Policy.Poke.ReverseProb && r.mgr.tr != nil {
+		// Enforce per-channel direct-poke reply cooldown so rapid poke storms coalesce instead of spamming QQ rate limits.
+		if msg.PokedBot && pokedForPolicy && r.ch.IsGroup() && cfg.Policy.Poke.CooldownSec > 0 {
+			if !r.lastPokeReply.IsZero() && now.Sub(r.lastPokeReply) < time.Duration(cfg.Policy.Poke.CooldownSec)*time.Second {
+				pokedForPolicy = false
+			}
+		}
+		// Only reverse-poke when the bot itself was poked, with a humanlike 1.0~2.5s delay and 10s anti-spam cooldown.
+		reverseOK := r.lastReversePoke.IsZero() || now.Sub(r.lastReversePoke) >= 10*time.Second
+		if msg.PokedBot && pokedForPolicy && reverseOK && cfg.Policy.Poke.ReverseProb > 0 && rand.Float64() < cfg.Policy.Poke.ReverseProb && r.mgr.tr != nil {
+			r.lastReversePoke = now
 			expEpoch := r.epoch.Load()
 			delay := time.Duration((1.0 + rand.Float64()*1.5) * float64(time.Second))
 			r.mgr.wg.Add(1)
@@ -807,7 +936,7 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 	}
 
 	// Deterministic plain-text preview delivery for proactive links (before optional fatfish commentary).
-	if linkPreviewReady && r.mgr.tr != nil && !r.isMuted(now) {
+	if linkPreviewReady && r.mgr.tr != nil && !r.isMuted(now) && r.outboundRemaining(now, cfg.Policy.MaxMsgsPerMin) >= 2 {
 		previewBody := strings.Join(freshLinkPreviews, "\n---\n")
 		sendOpts := transport.SendOptions{}
 		if cfg.Policy.SmartReplyDecoration && int(r.msgCount.Load()-msgCntAtIngress) > 0 {
@@ -821,6 +950,7 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 			return 0, false
 		}
 		if serr == nil {
+			r.recordOutbound(time.Now())
 			r.lastLinkProactive = time.Now()
 			botMsg := model.Message{
 				ChannelID:     r.ch,
@@ -909,9 +1039,16 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		}
 		return 0, true
 	}
-	// Direct poke / +1 break wakes immediately.
-	if pokedForPolicy || plusOneBreakTriggered {
+	// +1 break wakes immediately; direct poke coalesces rapid poke bursts briefly before waking.
+	if plusOneBreakTriggered {
 		return 0, true
+	}
+	if pokedForPolicy {
+		d := cfg.Policy.ExplicitDebounceSec
+		if d <= 0 {
+			d = 0.8
+		}
+		return time.Duration(d * float64(time.Second)), true
 	}
 	// DMs, thread continuations, and proactive triggers debounce over input_debounce_sec.
 	return time.Duration(cfg.Policy.InputDebounceSec * float64(time.Second)), true
@@ -1222,11 +1359,12 @@ func (r *Room) tryPlusOne(ctx context.Context, msg *model.Message, cfg *config.C
 	r.plusOneUsers = make(map[string]struct{})
 	if roll < cfg.Policy.PlusOne.RepeatProb {
 		r.lastPlusOne = time.Now()
-		if r.mgr.tr != nil {
+		if r.mgr.tr != nil && r.outboundRemaining(time.Now(), cfg.Policy.MaxMsgsPerMin) >= 2 {
 			pid, err := r.mgr.tr.SendText(ctx, r.ch, txt, transport.SendOptions{})
 			if errors.Is(err, transport.ErrRiskMuted) {
 				r.engageMute(ctx, cfg)
 			} else if err == nil {
+				r.recordOutbound(time.Now())
 				botMsg := model.Message{
 					ChannelID:     r.ch,
 					PlatformMsgID: pid,
@@ -1302,6 +1440,9 @@ func (r *Room) startTurn(trig triggerState) {
 	turnCtx, cancel := context.WithCancel(r.mgr.shutdownCtx)
 	r.turnActive = true
 	r.turnCancel = cancel
+	if trig.kind == "poke" {
+		r.lastPokeReply = time.Now()
+	}
 
 	r.mgr.wg.Add(1)
 	go func() {
@@ -1339,6 +1480,8 @@ func (r *Room) applyTurnOutcome(out turnOutcome) {
 	if out.committed {
 		if out.trig.kind == "link" {
 			r.lastLinkProactive = time.Now()
+		} else if out.trig.kind == "poke" {
+			r.lastPokeReply = time.Now()
 		} else if out.trig.proactive {
 			r.lastProactive = time.Now()
 		}
@@ -1562,6 +1705,21 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 		// Transition ledger planned -> sending before outbound transport calls (SPEC §3).
 		_ = r.mgr.store.UpdateDelivery(ctx, delID, model.DeliverySending, nil)
 
+		// Per-channel group rate-limit protection: collapse multi-bubbles into 1 when 60s quota is tight,
+		// and wait briefly if the rolling window is currently full so we stay below QQ's 10 msgs/min hard cap.
+		maxPerMin := cfg.Policy.MaxMsgsPerMin
+		if r.ch.IsGroup() && maxPerMin > 0 {
+			rem := r.outboundRemaining(time.Now(), maxPerMin)
+			needed := len(plan.Bubbles) + len(plan.DirectMedia)
+			if len(plan.Bubbles) > 1 && rem <= needed {
+				plan.Bubbles = []string{strings.Join(plan.Bubbles, "\n")}
+				r.mgr.log.Info("collapsed bubbles for rate-limit headroom", "channel", r.ch, "remaining", rem, "needed", needed)
+			}
+			if rem <= 0 {
+				_ = r.waitForOutboundSlot(ctx, maxPerMin, 15*time.Second)
+			}
+		}
+
 		// 1. Send text bubbles with natural pacing and live epoch/risk guards.
 	bubbleLoop:
 		for i, b := range plan.Bubbles {
@@ -1586,6 +1744,9 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 					break bubbleLoop
 				}
 			}
+			if r.ch.IsGroup() && maxPerMin > 0 && r.outboundRemaining(time.Now(), maxPerMin) <= 0 {
+				_ = r.waitForOutboundSlot(ctx, maxPerMin, 15*time.Second)
+			}
 			opts := transport.SendOptions{}
 			if i == 0 {
 				opts.ReplyToMsgID = plan.ReplyToMsgID
@@ -1603,6 +1764,7 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 				}
 				break bubbleLoop
 			}
+			r.recordOutbound(time.Now())
 			sent = append(sent, model.SentItem{
 				Kind:          "text",
 				PlatformMsgID: pid,
@@ -1638,6 +1800,9 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 					status = model.DeliveryAbortedEpoch
 					break mediaLoop
 				}
+				if r.ch.IsGroup() && maxPerMin > 0 && r.outboundRemaining(time.Now(), maxPerMin) <= 0 {
+					_ = r.waitForOutboundSlot(ctx, maxPerMin, 15*time.Second)
+				}
 				pid, err := r.mgr.tr.SendImage(ctx, r.ch, dm.Data, dm.MimeType, transport.SendOptions{})
 				if err != nil {
 					if errors.Is(err, transport.ErrRiskMuted) {
@@ -1650,6 +1815,7 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 					}
 					break
 				}
+				r.recordOutbound(time.Now())
 				mediaID := dm.MediaID
 				sha := dm.SHA256
 				mime := dm.MimeType
@@ -1687,8 +1853,9 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 			}
 		}
 
-		// 3. Zero-latency post-ACK async reaction sticker (only if not muted/aborted).
-		if status == model.DeliverySent && plan.StickerIntent != "" && r.mgr.stickers != nil {
+		// 3. Zero-latency post-ACK async reaction sticker (only if not muted/aborted and rate-limit headroom allows).
+		stickerRoomOK := !r.ch.IsGroup() || strings.TrimSpace(plan.RawText) == "" || r.outboundRemaining(time.Now(), maxPerMin) >= 2
+		if status == model.DeliverySent && plan.StickerIntent != "" && r.mgr.stickers != nil && stickerRoomOK {
 			stickerDispatched = true
 			ctxQ := trig.msg.PlainText() + " -> " + plan.RawText
 			hasPrecedingText := strings.TrimSpace(plan.RawText) != ""
@@ -1711,6 +1878,9 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 						if r.epoch.Load() != plan.Epoch {
 							return context.Canceled
 						}
+						if r.ch.IsGroup() && maxPerMin > 0 && r.outboundRemaining(time.Now(), maxPerMin) <= 0 {
+							return nil // Drop optional reaction sticker if quota became tight during delay
+						}
 					}
 					mime := sticker.MimeTypeFor(st)
 					pid, err := r.mgr.tr.SendImage(sctx, r.ch, imgBytes, mime, transport.SendOptions{})
@@ -1720,6 +1890,7 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 						}
 						return err
 					}
+					r.recordOutbound(time.Now())
 					// Record sent reaction sticker into public L0 media timeline (SPEC §9).
 					_ = r.mgr.store.AppendMessage(sctx, &model.Message{
 						ChannelID:     r.ch,
@@ -1765,6 +1936,11 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 	}
 
 	_ = r.mgr.store.UpdateDelivery(ctx, delID, status, sent)
+	if status == model.DeliverySent && r.consecRiskHits.Load() > 0 {
+		if last := r.lastRiskAtNano.Load(); last > 0 && time.Since(time.Unix(0, last)) > 5*time.Minute {
+			r.consecRiskHits.Store(0)
+		}
+	}
 
 	hitPct := 0.0
 	if stats.PromptTokens > 0 {
@@ -2044,7 +2220,7 @@ func (r *Room) generateSegmentSummary(ctx context.Context, seg *store.SegmentRec
 }
 
 func (r *Room) summarizeClosedSegment(seg *store.SegmentRecord) {
-	ctx, cancel := context.WithTimeout(r.mgr.shutdownCtx, 60*time.Second)
+	ctx, cancel := context.WithTimeout(r.mgr.shutdownCtx, 90*time.Second)
 	defer cancel()
 	// Backfill segment summary if inline summarization timed out or was skipped.
 	if strings.TrimSpace(seg.SummaryText) == "" {
@@ -2054,16 +2230,20 @@ func (r *Room) summarizeClosedSegment(seg *store.SegmentRecord) {
 	}
 
 	// Online L1 Episode & L2 Profile/Lore distillation on segment close (SPEC §6.2 & §8).
-	// Duplicate/overlapping windows are guarded by HasOverlappingEpisode inside DistillWindow.
+	// Prefer local "distill" role (longer timeout, zero cloud cost) when configured, falling back to "fast".
 	if r.mgr.memory != nil {
+		role := "fast"
+		if cfg := r.mgr.cfgMgr.Get(); cfg != nil && cfg.Models.Distill.IsEnabled() {
+			role = "distill"
+		}
 		endTS := seg.LastActiveAt
 		if endTS.Before(seg.CreatedAt) {
 			endTS = time.Now()
 		}
 		segMsgs, merr := r.mgr.store.MessagesInRange(ctx, seg.ChannelID, seg.CreatedAt.Add(-time.Minute), endTS.Add(time.Minute), 200)
 		if merr == nil && len(segMsgs) >= 3 {
-			if _, derr := r.mgr.memory.DistillWindow(ctx, seg.ChannelID, segMsgs, "fast"); derr != nil {
-				r.mgr.log.Warn("online segment distill failed", "channel", seg.ChannelID, "segment", seg.ID, "err", derr)
+			if _, derr := r.mgr.memory.DistillWindow(ctx, seg.ChannelID, segMsgs, role); derr != nil {
+				r.mgr.log.Warn("online segment distill failed", "channel", seg.ChannelID, "segment", seg.ID, "role", role, "err", derr)
 			}
 		}
 	}

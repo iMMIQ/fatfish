@@ -111,6 +111,8 @@ policy:
   thread_max_turns: 3
   thread_min_interval_sec: 4.0
   mute_backoff_sec: 1800
+  rate_limit_backoff_sec: 75
+  max_msgs_per_min: 8
   smart_reply_decoration: true
   split_newline_bubbles: true
   max_reply_bubbles: 4
@@ -124,6 +126,7 @@ policy:
     cooldown_sec: 180
   poke:
     mode: "bot_only" # bot_only | all | ignore
+    cooldown_sec: 15
     reverse_prob: 0.0
     other_poke_reply_prob: 0.15
     after_reply_prob: 0.15
@@ -164,6 +167,7 @@ sticker:
   recent_window: 30
   mmr_lambda: 0.7
   async_send_timeout_sec: 15
+  max_send_mib: 5
   auto_collect: false
 
 tools:

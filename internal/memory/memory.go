@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"golang.org/x/sync/errgroup"
 
@@ -28,10 +29,11 @@ type Service struct {
 	log   *slog.Logger
 	dim   int
 
-	mu         sync.RWMutex
-	epIndex    *vec.FlatF16Index // key: "ep:<id>"
-	epChannels map[string]model.ChannelID
-	profileMu  sync.Mutex // Serializes L2 profile read-modify-write across concurrent distill workers
+	mu          sync.RWMutex
+	epIndex     *vec.FlatF16Index // key: "ep:<id>"
+	epChannels  map[string]model.ChannelID
+	ignoredBots map[string]struct{}
+	profileMu   sync.Mutex // Serializes L2 profile read-modify-write across concurrent distill workers
 }
 
 func NewService(st *store.Store, hub *infer.Hub, dim int, logger *slog.Logger) *Service {
@@ -42,13 +44,37 @@ func NewService(st *store.Store, hub *infer.Hub, dim int, logger *slog.Logger) *
 		logger = slog.Default()
 	}
 	return &Service{
-		store:      st,
-		hub:        hub,
-		log:        logger,
-		dim:        dim,
-		epIndex:    vec.NewFlatF16Index(dim, 0.0), // diverse episodes -> alpha=0
-		epChannels: make(map[string]model.ChannelID),
+		store:       st,
+		hub:         hub,
+		log:         logger,
+		dim:         dim,
+		epIndex:     vec.NewFlatF16Index(dim, 0.0), // diverse episodes -> alpha=0
+		epChannels:  make(map[string]model.ChannelID),
+		ignoredBots: make(map[string]struct{}),
 	}
+}
+
+// SetIgnoredBots configures external bot sender IDs excluded from L2 profile/lore distillation.
+func (s *Service) SetIgnoredBots(ids []string) {
+	m := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if t := strings.TrimSpace(id); t != "" {
+			m[t] = struct{}{}
+		}
+	}
+	s.mu.Lock()
+	s.ignoredBots = m
+	s.mu.Unlock()
+}
+
+func (s *Service) ignoredBotsCopy() map[string]bool {
+	s.mu.RLock()
+	out := make(map[string]bool, len(s.ignoredBots))
+	for id := range s.ignoredBots {
+		out[id] = true
+	}
+	s.mu.RUnlock()
+	return out
 }
 
 // LoadIndex loads resident float16 episode vectors from SQLite into RAM.
@@ -88,7 +114,26 @@ func (s *Service) BuildSnapshotWithTime(ctx context.Context, ch model.ChannelID,
 	}
 	localNow := now.In(loc)
 
-	lore, _ := s.store.ListLore(ctx, ch, 15)
+	rawLore, _ := s.store.ListLore(ctx, ch, 30)
+	var lore, fallbackLore []model.LoreEntry
+	for _, l := range rawLore {
+		if l.Confidence >= 0.55 {
+			lore = append(lore, l)
+		} else {
+			fallbackLore = append(fallbackLore, l)
+		}
+	}
+	if len(lore) < 5 {
+		for _, l := range fallbackLore {
+			lore = append(lore, l)
+			if len(lore) >= 15 {
+				break
+			}
+		}
+	}
+	if len(lore) > 15 {
+		lore = lore[:15]
+	}
 	notes, _ := s.store.ListNotes(ctx, ch, true)
 	names, _ := s.store.GetMemberNames(ctx, ch)
 
@@ -652,15 +697,42 @@ func (s *Service) DistillWindow(ctx context.Context, ch model.ChannelID, win []m
 			return nil, nil
 		}
 	}
-	transcript := formatMessages(win)
-	sysPrompt := `Extract a concise structured JSON summary of this chat episode in the primary language of the chat (e.g. Simplified Chinese).
+	// Identify bot self IDs and configured ignored_bots so bots never pollute member profiles or lore.
+	botIDs := s.ignoredBotsCopy()
+	if _, botID, _, _, ok := model.ParseChannelID(ch); ok && botID != "" {
+		botIDs[botID] = true
+	}
+	for _, m := range win {
+		if m.FromBot && m.SenderID != "" {
+			botIDs[m.SenderID] = true
+		}
+	}
+
+	// Exclude noisy external bots (e.g. quote bots) from distill transcript when human messages exist.
+	distillMsgs := win
+	if len(botIDs) > 0 {
+		var filtered []model.Message
+		for _, m := range win {
+			if !m.FromBot && botIDs[m.SenderID] {
+				continue
+			}
+			filtered = append(filtered, m)
+		}
+		if len(filtered) >= 3 {
+			distillMsgs = filtered
+		}
+	}
+	transcript := formatMessages(distillMsgs)
+	sysPrompt := `Extract a concise structured JSON summary of this chat episode STRICTLY in Simplified Chinese (keep English only for proper acronyms/tickers).
 Rules:
 1. Key every participant strictly by their immutable member_id shown in parentheses, NEVER by nickname.
-2. Separate jokes/sarcasm/shitposting into candidate_jokes or candidate_lore; NEVER record sarcasm as candidate_facts.
-3. Never extract candidate_facts, candidate_jokes, or member_styles for the bot itself.
-4. For member_styles, capture brief interaction vibe with the group/bot when clear (e.g. "爱互怼的熟人", "爱聊技术的老哥", "话少但爱发图"), at most 12 chars.
-5. Keep arrays compact (at most 5 items each) so the JSON stays concise and valid.
-6. Output ONLY valid compact JSON matching:
+2. candidate_facts: ONLY enduring personal traits, job/school, city, hobbies, or recurring habits. NEVER record one-off stock/crypto prices, transient news headlines, single trade orders, bot commands, or sarcasm/jokes.
+3. Separate jokes/sarcasm/shitposting into candidate_jokes or candidate_lore; NEVER record sarcasm as candidate_facts.
+4. Never extract candidate_facts, candidate_jokes, or member_styles for the bot itself or other bots.
+5. candidate_lore: ONLY genuine recurring group slang, inside jokes, or nicknames (at most 3 items). NEVER record standalone numbers/prices, ordinary dictionary words, or generic product/library names.
+6. For member_styles, capture brief interaction vibe with the group/bot when clear (e.g. "爱互怼的熟人", "爱聊技术的老哥", "话少但爱发图"), at most 12 chars.
+7. Keep arrays compact (at most 5 items each) so the JSON stays concise and valid.
+8. Output ONLY valid compact JSON matching:
 {"topic":"...","summary":"...","participants":[{"id":"...","role_in_topic":"..."}],"notable_quotes":["..."],"candidate_facts":[{"member_id":"...","fact":"...","serious":true}],"candidate_jokes":[{"member_id":"...","joke":"..."}],"member_styles":[{"member_id":"...","style":"..."}],"candidate_lore":[{"term":"...","meaning":"..."}]}`
 
 	resp, err := s.hub.Chat(ctx, role, infer.ChatRequest{
@@ -719,17 +791,6 @@ Rules:
 		s.mu.Unlock()
 	}
 
-	// Identify bot self IDs so the bot never pollutes member profiles with its own persona/history.
-	botIDs := make(map[string]bool)
-	if _, botID, _, _, ok := model.ParseChannelID(ch); ok && botID != "" {
-		botIDs[botID] = true
-	}
-	for _, m := range win {
-		if m.FromBot && m.SenderID != "" {
-			botIDs[m.SenderID] = true
-		}
-	}
-
 	// Merge L2 Candidate Facts & Jokes with anti-sarcasm corroboration (>=2 distinct episodes).
 	for _, cf := range ext.CandidateFacts {
 		if cf.MemberID == "" || botIDs[cf.MemberID] || strings.TrimSpace(cf.Fact) == "" {
@@ -750,14 +811,16 @@ Rules:
 		_ = s.UpdateProfileStyle(ctx, ch, ms.MemberID, ms.Style)
 	}
 	for _, cl := range ext.CandidateLore {
-		if strings.TrimSpace(cl.Term) == "" || strings.TrimSpace(cl.Meaning) == "" {
+		term := strings.TrimSpace(cl.Term)
+		meaning := strings.TrimSpace(cl.Meaning)
+		if !isValidLoreTerm(term) || meaning == "" {
 			continue
 		}
 		_ = s.store.UpsertLore(ctx, model.LoreEntry{
 			ChannelID:  ch,
-			Term:       strings.TrimSpace(cl.Term),
-			Meaning:    strings.TrimSpace(cl.Meaning),
-			Confidence: 0.6,
+			Term:       term,
+			Meaning:    meaning,
+			Confidence: 0.45, // Starts tentative; corroborated episodes increment +0.15 up to 0.95.
 		})
 	}
 	return ep, nil
@@ -870,15 +933,32 @@ func CompactProfileFacts(facts []model.ProfileFact, nowMs int64) []model.Profile
 	return out
 }
 
-// DistillIncremental runs a lightweight bounded incremental distillation pass (<=5 new episodes,
-// concurrency=1) for a single channel inside the live serve process, updating RAM vectors immediately.
+// DistillIncremental runs a lightweight bounded incremental distillation pass (<=5 new episodes
+// from the last 30 days, concurrency=1) for a single channel inside the live serve process,
+// updating RAM vectors immediately without wasting GPU chewing months-old dormant channels.
 func (s *Service) DistillIncremental(ctx context.Context, ch model.ChannelID) (int, error) {
 	return s.DistillChannel(ctx, DistillOptions{
 		ChannelID:   ch,
 		MaxEpisodes: 5,
 		Concurrency: 1,
 		Role:        "distill",
+		SinceDays:   30,
 	})
+}
+
+func isValidLoreTerm(term string) bool {
+	r := []rune(strings.TrimSpace(term))
+	if len(r) < 2 || len(r) > 24 {
+		return false
+	}
+	hasLetterOrHan := false
+	for _, ch := range r {
+		if unicode.IsLetter(ch) {
+			hasLetterOrHan = true
+			break
+		}
+	}
+	return hasLetterOrHan
 }
 
 // ReloadIndex refreshes the in-memory float16 episode index from SQLite (picks up external CLI distill runs).

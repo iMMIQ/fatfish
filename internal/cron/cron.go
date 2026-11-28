@@ -416,6 +416,9 @@ func (s *Scheduler) runMaintenance(ctx context.Context, now time.Time) {
 	if evicted, err := s.store.EnforceMediaQuotas(ctx, roomBytes, totalBytes); err == nil && evicted > 0 {
 		s.log.Info("enforced blobstore media quotas", "evicted", evicted)
 	}
+	if prunedLore, err := s.store.PruneStaleLore(ctx, 120, 30); err == nil && prunedLore > 0 {
+		s.log.Info("pruned stale lore entries", "count", prunedLore)
+	}
 	if err := s.store.Checkpoint(ctx, "TRUNCATE"); err != nil {
 		s.log.Warn("wal checkpoint failed", "err", err)
 	}
@@ -472,7 +475,7 @@ func (s *Scheduler) GenerateDailyDigest(ctx context.Context, ch model.ChannelID,
 	if s.hub != nil && len(sampleLines) > 0 {
 		if resp, err := s.hub.Chat(ctx, "fast", infer.ChatRequest{
 			Messages: []infer.ChatMessage{
-				{Role: "system", Content: "Summarize today's channel discussions concisely in bullet points (key topics, highlights, decisions)."},
+				{Role: "system", Content: "请严格使用简体中文，以简洁要点总结今天本群的核心讨论话题、精彩瞬间与重要结论（不要使用英文）。"},
 				{Role: "user", Content: strings.Join(sampleLines, "\n")},
 			},
 		}); err == nil && strings.TrimSpace(resp.Content) != "" {

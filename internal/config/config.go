@@ -138,6 +138,8 @@ type PolicyConfig struct {
 	ThreadMaxTurns         int                            `yaml:"thread_max_turns"`
 	ThreadMinIntervalSec   float64                        `yaml:"thread_min_interval_sec"`
 	MuteBackoffSec         int                            `yaml:"mute_backoff_sec"`
+	RateLimitBackoffSec    int                            `yaml:"rate_limit_backoff_sec"`
+	MaxMsgsPerMin          int                            `yaml:"max_msgs_per_min"`
 	SmartReplyDecoration   bool                           `yaml:"smart_reply_decoration"`
 	SplitNewlineBubbles    bool                           `yaml:"split_newline_bubbles"`
 	MaxReplyBubbles        int                            `yaml:"max_reply_bubbles"`
@@ -159,6 +161,7 @@ type PlusOneConfig struct {
 
 type PokeConfig struct {
 	Mode               string  `yaml:"mode"` // bot_only | all | ignore
+	CooldownSec        int     `yaml:"cooldown_sec"`
 	ReverseProb        float64 `yaml:"reverse_prob"`
 	OtherPokeReplyProb float64 `yaml:"other_poke_reply_prob"`
 	AfterReplyProb     float64 `yaml:"after_reply_prob"`
@@ -206,6 +209,7 @@ type StickerConfig struct {
 	RecentWindow         int     `yaml:"recent_window"`
 	MMRLambda            float64 `yaml:"mmr_lambda"`
 	AsyncSendTimeoutSec  int     `yaml:"async_send_timeout_sec"`
+	MaxSendMiB           int     `yaml:"max_send_mib"`
 	AutoCollect          bool    `yaml:"auto_collect"`
 }
 
@@ -337,6 +341,8 @@ func defaultConfig() *Config {
 			ThreadMaxTurns:        3,
 			ThreadMinIntervalSec:  4.0,
 			MuteBackoffSec:        1800,
+			RateLimitBackoffSec:   75,
+			MaxMsgsPerMin:         8,
 			SmartReplyDecoration:  true,
 			SplitNewlineBubbles:   true,
 			MaxReplyBubbles:       4,
@@ -351,6 +357,7 @@ func defaultConfig() *Config {
 			},
 			Poke: PokeConfig{
 				Mode:               "bot_only",
+				CooldownSec:        15,
 				OtherPokeReplyProb: 0.15,
 				AfterReplyProb:     0.15,
 				AfterReplyMaxChars: 35,
@@ -384,6 +391,7 @@ func defaultConfig() *Config {
 			RecentWindow:         30,
 			MMRLambda:            0.7,
 			AsyncSendTimeoutSec:  15,
+			MaxSendMiB:           5,
 		},
 		Tools: ToolsConfig{
 			DefaultTimeoutSec:      30,
@@ -470,6 +478,15 @@ func applyDefaults(cfg *Config) {
 	if cfg.Policy.MaxReplyBubbles <= 0 {
 		cfg.Policy.MaxReplyBubbles = 4
 	}
+	if cfg.Policy.RateLimitBackoffSec <= 0 {
+		cfg.Policy.RateLimitBackoffSec = 75
+	}
+	if cfg.Policy.MaxMsgsPerMin < 0 {
+		cfg.Policy.MaxMsgsPerMin = 8
+	}
+	if cfg.Policy.Poke.CooldownSec < 0 {
+		cfg.Policy.Poke.CooldownSec = 15
+	}
 	if cfg.LinkParser.CooldownSec < 0 {
 		cfg.LinkParser.CooldownSec = 15
 	}
@@ -496,6 +513,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Sticker.AsyncSendTimeoutSec <= 0 {
 		cfg.Sticker.AsyncSendTimeoutSec = 15
+	}
+	if cfg.Sticker.MaxSendMiB <= 0 {
+		cfg.Sticker.MaxSendMiB = 5
 	}
 	if cfg.Tools.DefaultTimeoutSec <= 0 {
 		cfg.Tools.DefaultTimeoutSec = 30

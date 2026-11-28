@@ -352,12 +352,25 @@ func (e *Engine) Search(ctx context.Context, opts SearchOptions) ([]SearchHit, e
 	return out, nil
 }
 
-// PickOne selects a sticker from Top-5 using low-temperature softmax sampling for natural variety.
+// PickOne selects a sticker from Top-5 using low-temperature softmax sampling for natural variety,
+// preferring files within cfg.MaxSendMiB to avoid OneBot base64 WS timeouts and memory spikes.
 func (e *Engine) PickOne(ctx context.Context, opts SearchOptions) (*SearchHit, error) {
 	opts.TopK = 5
 	hits, err := e.Search(ctx, opts)
 	if err != nil || len(hits) == 0 {
 		return nil, err
+	}
+	if maxMiB := e.getConfig().MaxSendMiB; maxMiB > 0 {
+		maxBytes := int64(maxMiB) << 20
+		var within []SearchHit
+		for _, h := range hits {
+			if sz := e.stickerFileSize(h.Sticker); sz <= 0 || sz <= maxBytes {
+				within = append(within, h)
+			}
+		}
+		if len(within) > 0 {
+			hits = within
+		}
 	}
 	if len(hits) == 1 {
 		return &hits[0], nil
@@ -385,6 +398,18 @@ func (e *Engine) PickOne(ctx context.Context, opts SearchOptions) (*SearchHit, e
 		}
 	}
 	return &hits[0], nil
+}
+
+func (e *Engine) stickerFileSize(st model.Sticker) int64 {
+	p := st.RelPath
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(e.getConfig().PackDir, p)
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
 }
 
 // ReadStickerFile reads the raw image bytes for a sticker (preserving animated GIFs/WebP).

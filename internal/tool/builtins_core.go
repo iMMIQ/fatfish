@@ -402,7 +402,7 @@ func (t *InteractTool) UpdateAllowRelayChannels(channels []string) {
 func (t *InteractTool) Name() string   { return "interact" }
 func (t *InteractTool) ReadOnly() bool { return false }
 func (t *InteractTool) Description() string {
-	return "Perform social interactions: poke the triggering sender (max once per turn), react with an emoji on the trigger message, or relay (admin + allowlist only)."
+	return "Perform social interactions: poke the triggering sender (optional, max once per turn; do not call on every inbound poke since reverse-poke is automatic), react with an emoji on the trigger message, or relay (admin + allowlist only)."
 }
 
 func (t *InteractTool) Execute(ctx context.Context, tc ToolContext, args InteractArgs) (ToolResult, error) {

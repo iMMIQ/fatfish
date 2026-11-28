@@ -225,3 +225,59 @@ func TestFactDecayHalfLifeAndOverlappingEpisodeDedup(t *testing.T) {
 		t.Fatalf("expected StyleNote in member card, got %#v", snap.MemberCards)
 	}
 }
+
+func TestLoreCorroborationPruningAndTermFilter(t *testing.T) {
+	if isValidLoreTerm("75000") || isValidLoreTerm("67") || isValidLoreTerm("➗") || isValidLoreTerm("x") {
+		t.Fatal("expected pure numeric/symbol/single-char lore terms to be rejected")
+	}
+	if !isValidLoreTerm("牛回") || !isValidLoreTerm("大肥鱼") || !isValidLoreTerm("A11") {
+		t.Fatal("expected valid group lore terms to be accepted")
+	}
+
+	st, err := store.Open(t.TempDir(), 512, 5)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	ch := model.MakeChannelID("onebot", "1", model.ChannelGroup, "99")
+
+	// First insert starts at 0.45; second upsert increments +0.15 to 0.60; third to 0.75.
+	for i := 0; i < 3; i++ {
+		if err := st.UpsertLore(ctx, model.LoreEntry{
+			ChannelID:  ch,
+			Term:       "大肥鱼",
+			Meaning:    "群里的DeepSeek小鲸鱼",
+			Confidence: 0.45,
+		}); err != nil {
+			t.Fatalf("UpsertLore #%d: %v", i, err)
+		}
+	}
+	// Add 3 single-occurrence low-confidence terms.
+	for _, term := range []string{"噪音词甲", "噪音词乙", "噪音词丙"} {
+		_ = st.UpsertLore(ctx, model.LoreEntry{
+			ChannelID:  ch,
+			Term:       term,
+			Meaning:    "一次性说法",
+			Confidence: 0.45,
+		})
+	}
+
+	list, err := st.ListLore(ctx, ch, 10)
+	if err != nil || len(list) != 4 {
+		t.Fatalf("expected 4 lore entries, got %d err=%v", len(list), err)
+	}
+	if list[0].Term != "大肥鱼" || list[0].Confidence < 0.74 || list[0].Confidence > 0.76 {
+		t.Fatalf("expected corroborated 大肥鱼 ranked first with conf ~0.75, got %+v", list[0])
+	}
+
+	// Prune cap to 2 entries must keep 大肥鱼 and drop 2 low-confidence entries.
+	pruned, err := st.PruneStaleLore(ctx, 2, 0)
+	if err != nil || pruned != 2 {
+		t.Fatalf("expected 2 pruned lore entries, got %d err=%v", pruned, err)
+	}
+	list2, _ := st.ListLore(ctx, ch, 10)
+	if len(list2) != 2 || list2[0].Term != "大肥鱼" {
+		t.Fatalf("expected 大肥鱼 preserved after prune, got %+v", list2)
+	}
+}

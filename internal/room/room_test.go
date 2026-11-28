@@ -574,3 +574,124 @@ tools:
 			gateCalls.Load(), primaryCalls.Load(), tr.sentTexts.Load())
 	}
 }
+
+func TestRoomOutboundRateLimitBubbleCollapseAndTieredBackoff(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "fatfish.yaml")
+	yamlCfg := `data_dir: "` + filepath.ToSlash(dir) + `"
+timezone: "UTC"
+policy:
+  max_msgs_per_min: 8
+  mute_backoff_sec: 1800
+  rate_limit_backoff_sec: 75
+  explicit_debounce_sec: 0.9
+  poke:
+    mode: "all"
+    cooldown_sec: 15
+  rules:
+    reply_gate: "mentioned || poked"
+`
+	if err := os.WriteFile(cfgPath, []byte(yamlCfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfgMgr, err := config.NewManager(cfgPath, policy.ValidateConfig)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	st, err := store.Open(dir, 512, 5)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+	pol, _ := policy.NewEngine(cfgMgr.Get().Policy)
+	tr := &mockTransport{}
+	mgr := NewManager(Dependencies{
+		Config:    cfgMgr,
+		Store:     st,
+		Policy:    pol,
+		Frames:    frame.NewBuilder(st, cfgMgr.Get().Frame),
+		Transport: tr,
+	})
+	ch := model.MakeChannelID("onebot", "10001", model.ChannelGroup, "77777")
+	ctx := context.Background()
+	r := newRoom(mgr, ch)
+	cfg := cfgMgr.Get()
+
+	// 1. Pre-fill 6 recent outbound messages in 60s window (remaining = 2).
+	// A 3-bubble plan must collapse into 1 single message to preserve rate-limit headroom.
+	now := time.Now()
+	for i := 0; i < 6; i++ {
+		r.recordOutbound(now)
+	}
+	seg, _, err := mgr.frames.EnsureActiveSegment(ctx, ch, 1, "h1", nil)
+	if err != nil {
+		t.Fatalf("EnsureActiveSegment: %v", err)
+	}
+	plan := model.TurnPlan{
+		ChannelID: ch,
+		Epoch:     1,
+		SegmentID: seg.ID,
+		RawText:   "line1\nline2\nline3",
+		Bubbles:   []string{"line1", "line2", "line3"},
+	}
+	ok := r.deliverPlan(ctx, seg, plan, nil, -1, agent.TurnStats{ModelUsed: "test"}, triggerState{kind: "mention"}, cfg)
+	if !ok {
+		t.Fatal("expected deliverPlan to commit")
+	}
+	if got := tr.sentTexts.Load(); got != 1 {
+		t.Fatalf("expected 3 bubbles to collapse into 1 outbound send when headroom=2, got %d", got)
+	}
+
+	// 2. Tiered backoff: with 7 recent outbound msgs in 60s, hit #1 uses short rate_limit_backoff_sec (~75s),
+	// hit #2 escalates to ~300s, hit #3 escalates to full mute_backoff_sec (1800s).
+	r.engageMute(ctx, cfg)
+	d1 := time.Until(time.Unix(0, r.muteUntilNano.Load()))
+	if d1 < 60*time.Second || d1 > 90*time.Second {
+		t.Fatalf("expected hit #1 rate-limit backoff ~75s, got %v", d1)
+	}
+	r.engageMute(ctx, cfg)
+	d2 := time.Until(time.Unix(0, r.muteUntilNano.Load()))
+	if d2 < 280*time.Second || d2 > 310*time.Second {
+		t.Fatalf("expected hit #2 rate-limit backoff ~300s, got %v", d2)
+	}
+	r.engageMute(ctx, cfg)
+	d3 := time.Until(time.Unix(0, r.muteUntilNano.Load()))
+	if d3 < 1700*time.Second {
+		t.Fatalf("expected hit #3 full mute backoff ~1800s, got %v", d3)
+	}
+
+	// 3. Low outbound volume hit immediately uses full mute_backoff_sec (real admin mute).
+	r2 := newRoom(mgr, model.MakeChannelID("onebot", "10001", model.ChannelGroup, "77778"))
+	r2.engageMute(ctx, cfg)
+	dFull := time.Until(time.Unix(0, r2.muteUntilNano.Load()))
+	if dFull < 1700*time.Second {
+		t.Fatalf("expected low-outbound risk hit to use full 1800s mute backoff, got %v", dFull)
+	}
+
+	// 4. Poke debounce & cooldown: first poke debounces (~0.9s); second poke within 15s cooldown is suppressed.
+	r3 := newRoom(mgr, model.MakeChannelID("onebot", "10001", model.ChannelGroup, "77779"))
+	waitP1, armP1 := r3.onMessage(&model.Message{
+		ChannelID:  r3.ch,
+		SenderID:   "u1",
+		SenderName: "Alice",
+		PokedBot:   true,
+		Parts:      []model.Part{{Kind: model.PartPoke, TargetID: "10001", Text: "[戳一戳]"}},
+		CreatedAt:  time.Now(),
+	})
+	if !armP1 || waitP1 < 800*time.Millisecond {
+		t.Fatalf("expected direct poke to coalesce with explicit_debounce_sec (~0.9s), got wait=%v arm=%v", waitP1, armP1)
+	}
+	r3.lastPokeReply = time.Now()
+	r3.pendingTrigger = nil
+	waitP2, armP2 := r3.onMessage(&model.Message{
+		ChannelID:  r3.ch,
+		SenderID:   "u2",
+		SenderName: "Bob",
+		PokedBot:   true,
+		Parts:      []model.Part{{Kind: model.PartPoke, TargetID: "10001", Text: "[戳一戳]"}},
+		CreatedAt:  time.Now(),
+	})
+	if armP2 || waitP2 != 0 {
+		t.Fatalf("expected poke within 15s cooldown to be suppressed, got wait=%v arm=%v", waitP2, armP2)
+	}
+}
