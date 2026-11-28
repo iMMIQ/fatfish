@@ -65,7 +65,7 @@ func (t *WebSearchTool) httpClient() *http.Client {
 func (t *WebSearchTool) Name() string   { return "web_search" }
 func (t *WebSearchTool) ReadOnly() bool { return true }
 func (t *WebSearchTool) Description() string {
-	return "Fallback web search (bing/baidu) and specialized github/hf_mirror/arxiv search. Prefer MCP web_search_prime for general web queries when available."
+	return "Specialized search for github/hf_mirror/arxiv, or emergency fallback (bing/baidu) ONLY when mcp_web_search_prime_web_search_prime fails or errors. Do NOT call bing/baidu alongside web_search_prime for normal web, news, hotel, or travel queries."
 }
 
 func (t *WebSearchTool) Execute(ctx context.Context, _ ToolContext, args WebSearchArgs) (ToolResult, error) {

@@ -30,7 +30,7 @@ const (
 var ErrStarlarkOOMBlocked = errors.New("compute: blocked unsafe allocation pattern in Starlark AST")
 
 type ComputeArgs struct {
-	Code string `json:"code" jsonschema:"required,description=Starlark script to execute. Preloaded: math, json, time, stats, finance, chart. Guide visuals: chart.card(title, sections=[{'heading':'Day1 ...','items':['...']}], subtitle='...', footer='避坑: ...'); chart.table(title, headers=['维度','方案A','方案B'], rows=[['预算','...','...']], subtitle='...', highlight_col=1). Use print() for text output."`
+	Code string `json:"code" jsonschema:"required,description=Starlark script to execute (NO f-strings/import/class/try—use % or + for string formatting). Preloaded: math, json, time, stats, finance, chart. Guide visuals: chart.card(title, sections=[{'heading':'Day1 ...','items':['...']}], subtitle='...', footer='避坑: ...'); chart.table(title, headers=['维度','方案A','方案B'], rows=[['预算','...','...']], subtitle='...', highlight_col=1). Use print() for text output."`
 }
 
 type ComputeTool struct {
