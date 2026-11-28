@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -158,10 +157,15 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 	for iter := 1; iter <= maxIter; iter++ {
 		req := buildReq(msgs, defs)
 		iterPrefixHash := assembled.PrefixHash
-		if iter > 1 && len(msgs) > 1 {
-			pb, _ := json.Marshal(msgs[:len(msgs)-1])
-			sum := sha256.Sum256(pb)
-			iterPrefixHash = hex.EncodeToString(sum[:])
+		if iter > 1 && len(newFrames) > 1 {
+			h := sha256.New()
+			_, _ = h.Write([]byte(assembled.PrefixHash))
+			for _, nf := range newFrames[:len(newFrames)-1] {
+				_, _ = h.Write([]byte{0})
+				pb, _ := json.Marshal(nf)
+				_, _ = h.Write(pb)
+			}
+			iterPrefixHash = hex.EncodeToString(h.Sum(nil))
 		}
 		resp, err := r.hub.Chat(ctx, "primary", req)
 		if err != nil {
@@ -347,6 +351,8 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 	}, nil
 }
 
+const maxParallelReadOnlyTools = 4
+
 func (r *Runner) executeToolBatch(ctx context.Context, tc tool.ToolContext, calls []infer.ToolCall) []tool.ToolResult {
 	out := make([]tool.ToolResult, len(calls))
 	if r.registry == nil {
@@ -356,41 +362,50 @@ func (r *Runner) executeToolBatch(ctx context.Context, tc tool.ToolContext, call
 		return out
 	}
 
-	allReadOnly := len(calls) > 1
-	for _, c := range calls {
-		e, ok := r.registry.Lookup(c.Function.Name)
-		if !ok || !e.ReadOnly {
-			allReadOnly = false
-			break
+	// Partition calls into maximal contiguous read-only segments separated by side-effect barriers.
+	// Read-only segments run concurrently with a bounded concurrency cap (protecting 512 MiB container RAM),
+	// while write/side-effect calls execute strictly in order.
+	for i := 0; i < len(calls); {
+		j := i
+		for j < len(calls) && r.registry.IsReadOnlyCall(calls[j].Function.Name, calls[j].Function.Arguments) {
+			j++
 		}
-	}
-
-	if allReadOnly {
-		var mu sync.Mutex
-		g, gctx := errgroup.WithContext(ctx)
-		for idx, call := range calls {
-			i, c := idx, call
-			g.Go(func() error {
-				res, err := r.registry.Execute(gctx, tc, c.Function.Name, c.Function.Arguments)
-				if err != nil {
-					res = tool.ToolResult{TextForLLM: fmt.Sprintf("tool %s error: %v", c.Function.Name, err)}
-				}
-				mu.Lock()
-				out[i] = res
-				mu.Unlock()
-				return nil
-			})
+		roCount := j - i
+		if roCount >= 2 {
+			g, gctx := errgroup.WithContext(ctx)
+			g.SetLimit(maxParallelReadOnlyTools)
+			for idx := i; idx < j; idx++ {
+				pos := idx
+				c := calls[idx]
+				g.Go(func() error {
+					res, err := r.registry.Execute(gctx, tc, c.Function.Name, c.Function.Arguments)
+					if err != nil {
+						res = tool.ToolResult{TextForLLM: fmt.Sprintf("tool %s error: %v", c.Function.Name, err)}
+					}
+					out[pos] = res
+					return nil
+				})
+			}
+			_ = g.Wait()
+		} else if roCount == 1 {
+			c := calls[i]
+			res, err := r.registry.Execute(ctx, tc, c.Function.Name, c.Function.Arguments)
+			if err != nil {
+				res = tool.ToolResult{TextForLLM: fmt.Sprintf("tool %s error: %v", c.Function.Name, err)}
+			}
+			out[i] = res
 		}
-		_ = g.Wait()
-		return out
-	}
-
-	for i, c := range calls {
-		res, err := r.registry.Execute(ctx, tc, c.Function.Name, c.Function.Arguments)
-		if err != nil {
-			res = tool.ToolResult{TextForLLM: fmt.Sprintf("tool %s error: %v", c.Function.Name, err)}
+		if j < len(calls) {
+			c := calls[j]
+			res, err := r.registry.Execute(ctx, tc, c.Function.Name, c.Function.Arguments)
+			if err != nil {
+				res = tool.ToolResult{TextForLLM: fmt.Sprintf("tool %s error: %v", c.Function.Name, err)}
+			}
+			out[j] = res
+			i = j + 1
+		} else {
+			i = j
 		}
-		out[i] = res
 	}
 	return out
 }

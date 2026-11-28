@@ -1,6 +1,7 @@
 package vec
 
 import (
+	"fmt"
 	"math"
 	"testing"
 )
@@ -51,5 +52,28 @@ func TestEncodeDecodeFloat16AndMMR(t *testing.T) {
 	got := MMRRerank(cands, idx.Vector, 0.5, 2)
 	if len(got) != 2 || got[0].ID != "a1" || got[1].ID != "b1" {
 		t.Fatalf("expected MMR to pick diverse b1 over duplicate a2, got %+v", got)
+	}
+}
+
+func TestFlatF16IndexShardedSearchExactMatch(t *testing.T) {
+	idx := NewFlatF16Index(8, 0)
+	// Insert 2500 vectors (>2048 threshold) to exercise parallel sharded Top-K scan + F16 LUT.
+	for i := 0; i < 2500; i++ {
+		v := []float32{0, 0, 0, 0, 0, 0, 0, 1}
+		if i == 10 {
+			v = []float32{1, 0, 0, 0, 0, 0, 0, 0}
+		} else if i == 1500 {
+			v = []float32{0.9, 0.4, 0, 0, 0, 0, 0, 0}
+		} else if i == 2400 {
+			v = []float32{0.7, 0.7, 0, 0, 0, 0, 0, 0}
+		}
+		idx.Upsert(fmt.Sprintf("id_%04d", i), v)
+	}
+	hits := idx.Search([]float32{1, 0, 0, 0, 0, 0, 0, 0}, 3, nil)
+	if len(hits) != 3 {
+		t.Fatalf("expected 3 hits, got %d", len(hits))
+	}
+	if hits[0].ID != "id_0010" || hits[1].ID != "id_1500" || hits[2].ID != "id_2400" {
+		t.Fatalf("unexpected sharded top-3 order: %+v", hits)
 	}
 }

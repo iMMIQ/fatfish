@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/iMMIQ/fatfish/internal/config"
@@ -128,6 +129,7 @@ type Hub struct {
 	cfg      config.ModelsConfig
 	client   *http.Client
 	heavySem chan struct{}
+	fgActive atomic.Int32 // Active foreground local GPU requests (embed/rerank/asr/translate)
 
 	breakers map[string]*CircuitBreaker
 }
@@ -140,7 +142,9 @@ func NewHub(cfg config.ModelsConfig) *Hub {
 	}
 	tr := &http.Transport{
 		Proxy:               nil, // Direct LAN/API calls without dead local proxy interference
-		MaxIdleConns:        32,
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        64,
+		MaxIdleConnsPerHost: 32,
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
@@ -259,14 +263,22 @@ func (h *Hub) chatOnce(ctx context.Context, role string, req ChatRequest) (*Chat
 		return nil, err
 	}
 
-	// Enforce heavy local GPU semaphore on distill role before acquiring a breaker probe slot.
+	// Enforce heavy local GPU semaphore on distill role before acquiring a breaker probe slot,
+	// briefly yielding to active foreground local GPU requests (embed/rerank/asr/translate).
 	if role == "distill" {
+		if err := h.yieldForForeground(ctx); err != nil {
+			return nil, err
+		}
 		select {
 		case h.heavySem <- struct{}{}:
 			defer func() { <-h.heavySem }()
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
+	}
+	if role == "translate" {
+		h.fgActive.Add(1)
+		defer h.fgActive.Add(-1)
 	}
 	if err := cb.Allow(); err != nil {
 		return nil, err
@@ -425,10 +437,29 @@ func (h *Hub) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	return results, nil
 }
 
+func (h *Hub) yieldForForeground(ctx context.Context) error {
+	if h.fgActive.Load() <= 0 {
+		return nil
+	}
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for h.fgActive.Load() > 0 && time.Now().Before(deadline) {
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
 func (h *Hub) embedChunk(ctx context.Context, ep config.ModelEndpointConfig, cb *CircuitBreaker, texts []string) ([][]float32, error) {
 	if err := cb.Allow(); err != nil {
 		return nil, err
 	}
+	h.fgActive.Add(1)
+	defer h.fgActive.Add(-1)
 	payload, _ := json.Marshal(map[string]any{
 		"model": ep.Model,
 		"input": texts,
@@ -528,6 +559,8 @@ func (h *Hub) rerankChunk(ctx context.Context, ep config.ModelEndpointConfig, cb
 	if err := cb.Allow(); err != nil {
 		return nil, err
 	}
+	h.fgActive.Add(1)
+	defer h.fgActive.Add(-1)
 	payload, _ := json.Marshal(map[string]any{
 		"model":     ep.Model,
 		"query":     query,
@@ -611,6 +644,8 @@ func (h *Hub) Transcribe(ctx context.Context, filename string, audioBytes []byte
 	if err := cb.Allow(); err != nil {
 		return "", err
 	}
+	h.fgActive.Add(1)
+	defer h.fgActive.Add(-1)
 
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)

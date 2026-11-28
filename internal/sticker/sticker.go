@@ -15,7 +15,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/iMMIQ/fatfish/internal/config"
 	"github.com/iMMIQ/fatfish/internal/infer"
@@ -204,35 +207,70 @@ func (e *Engine) Search(ctx context.Context, opts SearchOptions) ([]SearchHit, e
 	}
 	contentW := 1.0 - intentW
 
-	// 1. FTS5 exact OCR/tag recall Top-20.
-	ftsIDs, _ := e.store.SearchStickersFTS(ctx, opts.Query, opts.PackID, 20)
-	ftsHits := make([]vec.Hit, 0, len(ftsIDs))
-	for i, id := range ftsIDs {
-		ftsHits = append(ftsHits, vec.Hit{ID: id, Score: float32(20 - i)})
-	}
-
-	// 2. Dual-vector recall Top-30 each (unshifted query q against doc-centered corpus).
-	var intentHits, contentHits []vec.Hit
+	// Run FTS5 recall, Embed + parallel dual-vector scan, and recent-use decay queries concurrently.
+	var (
+		ftsIDs       []string
+		intentHits   []vec.Hit
+		contentHits  []vec.Hit
+		recent       []string
+		globalRecent []string
+	)
 	e.mu.RLock()
 	hasVecs := e.intentIdx.Len() > 0 || e.contentIdx.Len() > 0
 	e.mu.RUnlock()
 
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		ftsIDs, _ = e.store.SearchStickersFTS(ctx, opts.Query, opts.PackID, 20)
+	}()
+	go func() {
+		defer wg.Done()
+		globalRecent, _ = e.store.RecentStickerUsesGlobal(ctx, 12)
+	}()
+	if opts.ChannelID != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			recent, _ = e.store.RecentStickerUses(ctx, opts.ChannelID, cfg.RecentWindow)
+		}()
+	}
 	if e.hub != nil && hasVecs && strings.TrimSpace(opts.Query) != "" {
-		if embs, err := e.hub.Embed(ctx, []string{opts.Query}); err == nil && len(embs) == 1 && len(embs[0]) == e.dim {
-			q := embs[0]
-			e.mu.RLock()
-			// Note: caller already holds e.mu.RLock(); never re-lock inside filter to avoid RWMutex deadlock.
-			filter := func(id string) bool {
-				if opts.PackID == "" {
-					return true
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if embs, err := e.hub.Embed(ctx, []string{opts.Query}); err == nil && len(embs) == 1 && len(embs[0]) == e.dim {
+				q := embs[0]
+				e.mu.RLock()
+				// Note: caller holds e.mu.RLock() across both read-only vector scans; filter never re-locks e.mu.
+				filter := func(id string) bool {
+					if opts.PackID == "" {
+						return true
+					}
+					st, ok := e.stickers[id]
+					return ok && st.PackID == opts.PackID
 				}
-				st, ok := e.stickers[id]
-				return ok && st.PackID == opts.PackID
+				var vwg sync.WaitGroup
+				vwg.Add(2)
+				go func() {
+					defer vwg.Done()
+					intentHits = e.intentIdx.Search(q, 30, filter)
+				}()
+				go func() {
+					defer vwg.Done()
+					contentHits = e.contentIdx.Search(q, 30, filter)
+				}()
+				vwg.Wait()
+				e.mu.RUnlock()
 			}
-			intentHits = e.intentIdx.Search(q, 30, filter)
-			contentHits = e.contentIdx.Search(q, 30, filter)
-			e.mu.RUnlock()
-		}
+		}()
+	}
+	wg.Wait()
+
+	ftsHits := make([]vec.Hit, 0, len(ftsIDs))
+	for i, id := range ftsIDs {
+		ftsHits = append(ftsHits, vec.Hit{ID: id, Score: float32(20 - i)})
 	}
 
 	// Build score breakdown maps for console diagnostics.
@@ -301,27 +339,24 @@ func (e *Engine) Search(ctx context.Context, opts SearchOptions) ([]SearchHit, e
 		}
 	}
 
-	// 5. Exponential anti-repeat decay for stickers recently used in this channel (plus lighter global decay).
-	if opts.ChannelID != "" {
-		recent, _ := e.store.RecentStickerUses(ctx, opts.ChannelID, cfg.RecentWindow)
-		if len(recent) > 0 {
-			lastPos := make(map[string]int, len(recent))
-			for idx, id := range recent {
-				if _, seen := lastPos[id]; !seen {
-					lastPos[id] = idx // 0 = most recently used
-				}
+	// 5. Exponential anti-repeat decay using pre-fetched recent-use lists (zero extra DB latency after Rerank).
+	if len(recent) > 0 {
+		lastPos := make(map[string]int, len(recent))
+		for idx, id := range recent {
+			if _, seen := lastPos[id]; !seen {
+				lastPos[id] = idx // 0 = most recently used
 			}
-			for i := range cands {
-				if pos, used := lastPos[cands[i].Sticker.StickerID]; used {
-					// Strongly penalize most recent sends (decay ~0.15 -> 0.85 over window).
-					decay := 1.0 - 0.85*math.Exp(-float64(pos)/8.0)
-					cands[i].DecayFactor *= decay
-					cands[i].FinalScore *= decay
-				}
+		}
+		for i := range cands {
+			if pos, used := lastPos[cands[i].Sticker.StickerID]; used {
+				// Strongly penalize most recent sends (decay ~0.15 -> 0.85 over window).
+				decay := 1.0 - 0.85*math.Exp(-float64(pos)/8.0)
+				cands[i].DecayFactor *= decay
+				cands[i].FinalScore *= decay
 			}
 		}
 	}
-	if globalRecent, err := e.store.RecentStickerUsesGlobal(ctx, 12); err == nil && len(globalRecent) > 0 {
+	if len(globalRecent) > 0 {
 		gPos := make(map[string]int, len(globalRecent))
 		for idx, id := range globalRecent {
 			if _, seen := gPos[id]; !seen {
@@ -505,54 +540,64 @@ func (e *Engine) EnrichAndTag(ctx context.Context, tagUntagged bool) (enriched i
 	if err != nil {
 		return 0, 0, err
 	}
+	var enrichedCnt, taggedCnt atomic.Int64
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(4)
 	for _, r := range rows {
 		st := r.Sticker
 		if st.Status == "ready" && strings.TrimSpace(st.IntentText) == "" && strings.TrimSpace(st.ContentText+st.OCRText) != "" {
-			resp, cerr := e.hub.Chat(ctx, "fast", infer.ChatRequest{
-				Messages: []infer.ChatMessage{
-					{Role: "system", Content: "Given a sticker visual description/OCR, output a concise comma-separated list of emotions, tones, and chat reply scenes (intent_text) in Chinese. Output plain text only."},
-					{Role: "user", Content: strings.TrimSpace(st.ContentText + " " + st.OCRText)},
-				},
-			})
-			if cerr == nil && strings.TrimSpace(resp.Content) != "" {
-				if uerr := e.store.UpdateStickerStatus(ctx, st.StickerID, st.Status, st.OCRText, strings.TrimSpace(resp.Content), st.ContentText); uerr == nil {
-					enriched++
+			g.Go(func() error {
+				resp, cerr := e.hub.Chat(gctx, "fast", infer.ChatRequest{
+					Messages: []infer.ChatMessage{
+						{Role: "system", Content: "Given a sticker visual description/OCR, output a concise comma-separated list of emotions, tones, and chat reply scenes (intent_text) in Chinese. Output plain text only."},
+						{Role: "user", Content: strings.TrimSpace(st.ContentText + " " + st.OCRText)},
+					},
+				})
+				if cerr == nil && strings.TrimSpace(resp.Content) != "" {
+					if uerr := e.store.UpdateStickerStatus(gctx, st.StickerID, st.Status, st.OCRText, strings.TrimSpace(resp.Content), st.ContentText); uerr == nil {
+						enrichedCnt.Add(1)
+					}
 				}
-			}
+				return nil
+			})
 			continue
 		}
 		if tagUntagged && st.Status == "needs_review" && strings.TrimSpace(st.ContentText) == "" && strings.TrimSpace(st.IntentText) == "" {
-			raw, rerr := e.ReadStickerFile(st)
-			if rerr != nil || len(raw) == 0 {
-				continue
-			}
-			dataURI := "data:" + MimeTypeFor(st) + ";base64," + base64.StdEncoding.EncodeToString(raw)
-			resp, cerr := e.hub.Chat(ctx, "primary", infer.ChatRequest{
-				Messages: []infer.ChatMessage{
-					{Role: "system", Content: `Tag this chat sticker as JSON: {"ocr_text":"...","intent_text":"emotions/reply scenes in Chinese","content_text":"visual description in Chinese"}`},
-					{Role: "user", Content: []infer.ContentPart{
-						{Type: "text", Text: "Analyze this sticker:"},
-						{Type: "image_url", ImageURL: &infer.ImageURL{URL: dataURI}},
-					}},
-				},
-				ResponseFormat: map[string]any{"type": "json_object"},
-			})
-			if cerr != nil {
-				continue
-			}
-			var parsed struct {
-				OCRText     string `json:"ocr_text"`
-				IntentText  string `json:"intent_text"`
-				ContentText string `json:"content_text"`
-			}
-			if json.Unmarshal([]byte(resp.Content), &parsed) == nil && (parsed.IntentText != "" || parsed.ContentText != "") {
-				if uerr := e.store.UpdateStickerStatus(ctx, st.StickerID, "needs_review", strings.TrimSpace(parsed.OCRText), strings.TrimSpace(parsed.IntentText), strings.TrimSpace(parsed.ContentText)); uerr == nil {
-					tagged++
+			g.Go(func() error {
+				raw, rerr := e.ReadStickerFile(st)
+				if rerr != nil || len(raw) == 0 {
+					return nil
 				}
-			}
+				dataURI := "data:" + MimeTypeFor(st) + ";base64," + base64.StdEncoding.EncodeToString(raw)
+				resp, cerr := e.hub.Chat(gctx, "primary", infer.ChatRequest{
+					Messages: []infer.ChatMessage{
+						{Role: "system", Content: `Tag this chat sticker as JSON: {"ocr_text":"...","intent_text":"emotions/reply scenes in Chinese","content_text":"visual description in Chinese"}`},
+						{Role: "user", Content: []infer.ContentPart{
+							{Type: "text", Text: "Analyze this sticker:"},
+							{Type: "image_url", ImageURL: &infer.ImageURL{URL: dataURI}},
+						}},
+					},
+					ResponseFormat: map[string]any{"type": "json_object"},
+				})
+				if cerr != nil {
+					return nil
+				}
+				var parsed struct {
+					OCRText     string `json:"ocr_text"`
+					IntentText  string `json:"intent_text"`
+					ContentText string `json:"content_text"`
+				}
+				if json.Unmarshal([]byte(resp.Content), &parsed) == nil && (parsed.IntentText != "" || parsed.ContentText != "") {
+					if uerr := e.store.UpdateStickerStatus(gctx, st.StickerID, "needs_review", strings.TrimSpace(parsed.OCRText), strings.TrimSpace(parsed.IntentText), strings.TrimSpace(parsed.ContentText)); uerr == nil {
+						taggedCnt.Add(1)
+					}
+				}
+				return nil
+			})
 		}
 	}
-	return enriched, tagged, nil
+	_ = g.Wait()
+	return int(enrichedCnt.Load()), int(taggedCnt.Load()), nil
 }
 
 // ReindexOne embeds a single sticker (used when approving a sticker in the Console) and refreshes RAM index.
@@ -630,13 +675,26 @@ func (e *Engine) Reindex(ctx context.Context, alpha float64) (int, error) {
 		contentTexts[i] = ct
 	}
 
-	intentEmbs, err := e.hub.Embed(ctx, intentTexts)
-	if err != nil {
-		return 0, fmt.Errorf("sticker: embed intent: %w", err)
-	}
-	contentEmbs, err := e.hub.Embed(ctx, contentTexts)
-	if err != nil {
-		return 0, fmt.Errorf("sticker: embed content: %w", err)
+	var intentEmbs, contentEmbs [][]float32
+	eg, ectx := errgroup.WithContext(ctx)
+	eg.Go(func() error {
+		var eerr error
+		intentEmbs, eerr = e.hub.Embed(ectx, intentTexts)
+		if eerr != nil {
+			return fmt.Errorf("sticker: embed intent: %w", eerr)
+		}
+		return nil
+	})
+	eg.Go(func() error {
+		var eerr error
+		contentEmbs, eerr = e.hub.Embed(ectx, contentTexts)
+		if eerr != nil {
+			return fmt.Errorf("sticker: embed content: %w", eerr)
+		}
+		return nil
+	})
+	if err := eg.Wait(); err != nil {
+		return 0, err
 	}
 
 	rawIntent := make(map[string][]float32, len(rows))

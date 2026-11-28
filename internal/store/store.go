@@ -18,7 +18,7 @@ import (
 	"github.com/iMMIQ/fatfish/internal/model"
 )
 
-// Store provides dual-pool SQLite persistence (writeDB=1 conn 8MiB, readDB=3 conns 12MiB)
+// Store provides dual-pool SQLite persistence (writeDB=1 conn 8MiB, readDB=6 conns 12MiB)
 // plus the SHA-256 canonical BlobStore.
 type Store struct {
 	writeDB *sql.DB
@@ -56,8 +56,8 @@ func Open(dataDir string, imageMaxDim, maxImageMiB int) (*Store, error) {
 		_ = writeDB.Close()
 		return nil, fmt.Errorf("store: open readDB: %w", err)
 	}
-	readDB.SetMaxOpenConns(3)
-	readDB.SetMaxIdleConns(3)
+	readDB.SetMaxOpenConns(6)
+	readDB.SetMaxIdleConns(6)
 
 	blobs, err := NewBlobStore(filepath.Join(dataDir, "blobs"), imageMaxDim, maxImageMiB)
 	if err != nil {
@@ -80,7 +80,7 @@ func buildDSN(dbPath string, readOnly bool) string {
 	q.Add("_pragma", "temp_store(MEMORY)")
 	if readOnly {
 		q.Add("mode", "ro")
-		q.Add("_pragma", "cache_size(-4000)")
+		q.Add("_pragma", "cache_size(-2000)")
 	} else {
 		q.Add("mode", "rwc")
 		q.Add("_pragma", "journal_mode(WAL)")
@@ -771,18 +771,27 @@ func (s *Store) RegisterMediaAsset(ctx context.Context, ch model.ChannelID, send
 	now := time.Now()
 	exp := now.Add(retention)
 
+	tx, err := s.writeDB.BeginTx(ctx, nil)
+	if err != nil {
+		return model.MediaAsset{}, err
+	}
+	defer tx.Rollback()
+
 	var count int
-	_ = s.readDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM media_assets WHERE channel_id = ?`, string(ch)).Scan(&count)
+	_ = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM media_assets WHERE channel_id = ?`, string(ch)).Scan(&count)
 	mediaID := fmt.Sprintf("m_%04d", count+1)
-	// Ensure uniqueness if old assets were pruned.
-	for attempt := 0; attempt < 10; attempt++ {
-		_, err := s.writeDB.ExecContext(ctx,
+	// Ensure uniqueness inside the serialized write transaction if old assets were pruned.
+	for attempt := 0; attempt < 16; attempt++ {
+		_, err := tx.ExecContext(ctx,
 			`INSERT INTO media_assets (channel_id, media_id, sha256, mime_type, byte_size, width, height, sender_id, created_at, expires_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			string(ch), mediaID, blob.SHA256, blob.MimeType, blob.ByteSize, blob.Width, blob.Height,
 			senderID, now.UnixMilli(), exp.UnixMilli(),
 		)
 		if err == nil {
+			if cerr := tx.Commit(); cerr != nil {
+				return model.MediaAsset{}, cerr
+			}
 			return model.MediaAsset{
 				ChannelID: ch,
 				MediaID:   mediaID,
@@ -796,7 +805,7 @@ func (s *Store) RegisterMediaAsset(ctx context.Context, ch model.ChannelID, send
 				ExpiresAt: exp,
 			}, nil
 		}
-		mediaID = fmt.Sprintf("m_%04d_%d", count+1+attempt, now.UnixNano()%1000)
+		mediaID = fmt.Sprintf("m_%04d_%d", count+1+attempt, (now.UnixNano()+int64(attempt))%10000)
 	}
 	return model.MediaAsset{}, errors.New("store: failed to allocate unique media_id")
 }
@@ -1100,6 +1109,53 @@ func (s *Store) DeleteFramesUpToIndex(ctx context.Context, segID int64, maxFrame
 	return err
 }
 
+// CommitTurnFrames atomically trims obsolete frames (if trimUpToIdx >= 0), appends all new
+// FrozenFrames with contiguous frame_index values, and touches segments.last_active_at in ONE tx.
+func (s *Store) CommitTurnFrames(ctx context.Context, segID int64, trimUpToIdx int, recs []FrameRecord, touchAt time.Time) error {
+	if touchAt.IsZero() {
+		touchAt = time.Now()
+	}
+	tx, err := s.writeDB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if trimUpToIdx >= 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM frames WHERE segment_id = ? AND frame_index <= ?`, segID, trimUpToIdx); err != nil {
+			return err
+		}
+	}
+	var maxIdx int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(frame_index), -1) FROM frames WHERE segment_id = ?`, segID).Scan(&maxIdx); err != nil {
+		return err
+	}
+	nextIdx := maxIdx + 1
+	if len(recs) > 0 {
+		stmt, err := tx.PrepareContext(ctx,
+			`INSERT INTO frames (segment_id, channel_id, frame_index, role, payload_json, est_tokens, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+		for i := range recs {
+			created := recs[i].CreatedAt
+			if created.IsZero() {
+				created = touchAt
+			}
+			if _, err := stmt.ExecContext(ctx, segID, string(recs[i].ChannelID), nextIdx, recs[i].Role, recs[i].PayloadJSON, recs[i].EstTokens, created.UnixMilli()); err != nil {
+				return err
+			}
+			nextIdx++
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE segments SET last_active_at = ? WHERE id = ?`, touchAt.UnixMilli(), segID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // --- Delivery Ledger & KV Metrics ---
 
 func (s *Store) CreateDelivery(ctx context.Context, plan model.TurnPlan) (int64, error) {
@@ -1321,6 +1377,36 @@ func (s *Store) GetEpisodeByID(ctx context.Context, id int64) (*model.Episode, e
 		return nil, err
 	}
 	return &eps[0], nil
+}
+
+// GetEpisodesByIDs batch-fetches channel-scoped episodes by ID in a single query, avoiding N+1 lookups.
+func (s *Store) GetEpisodesByIDs(ctx context.Context, ch model.ChannelID, ids []int64) (map[int64]model.Episode, error) {
+	out := make(map[int64]model.Episode, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	ph := make([]string, len(ids))
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, string(ch))
+	for i, id := range ids {
+		ph[i] = "?"
+		args = append(args, id)
+	}
+	rows, err := s.readDB.QueryContext(ctx,
+		`SELECT id, channel_id, start_seq, end_seq, start_ts, end_ts, topic, summary, participants_json, notable_json, NULL, created_at
+		 FROM episodes WHERE channel_id = ? AND id IN (`+strings.Join(ph, ",")+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	eps, _, err := scanEpisodes(rows)
+	if err != nil {
+		return nil, err
+	}
+	for _, ep := range eps {
+		out[ep.ID] = ep
+	}
+	return out, nil
 }
 
 func scanEpisodes(rows *sql.Rows) ([]model.Episode, [][]byte, error) {

@@ -31,6 +31,14 @@ func (t *TravelTool) Name() string { return "travel" }
 func (t *TravelTool) ReadOnly() bool {
 	return false
 }
+func (t *TravelTool) ReadOnlyArgs(args TravelArgs) bool {
+	switch strings.ToLower(strings.TrimSpace(args.Action)) {
+	case "", "status", "history", "map", "ticket":
+		return true
+	default:
+		return false
+	}
+}
 func (t *TravelTool) Description() string {
 	return "Check your ongoing world-travel location/weather/diary, view visited city history, record a member's suggestion for the next destination, or send a world footprint map / boarding pass image."
 }

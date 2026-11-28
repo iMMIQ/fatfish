@@ -47,13 +47,20 @@ type Tool[Args any] interface {
 	Execute(ctx context.Context, tc ToolContext, args Args) (ToolResult, error)
 }
 
+// DynamicReadOnlyTool may be implemented by tools whose read-only status depends on call arguments
+// (e.g. note.list, schedule.list, travel.status/history/map/ticket).
+type DynamicReadOnlyTool[Args any] interface {
+	ReadOnlyArgs(args Args) bool
+}
+
 // Entry is the type-erased runtime representation stored in Registry.
 type Entry struct {
-	Name        string
-	Description string
-	ReadOnly    bool
-	Parameters  json.RawMessage
-	Invoke      func(ctx context.Context, tc ToolContext, rawArgs json.RawMessage) (ToolResult, error)
+	Name          string
+	Description   string
+	ReadOnly      bool
+	ReadOnlyCheck func(rawArgs json.RawMessage) bool
+	Parameters    json.RawMessage
+	Invoke        func(ctx context.Context, tc ToolContext, rawArgs json.RawMessage) (ToolResult, error)
 }
 
 // Stat tracks per-tool latency and error counts for the console dashboard.
@@ -97,11 +104,24 @@ func Register[Args any](r *Registry, t Tool[Args]) error {
 	if err != nil {
 		return fmt.Errorf("tool: schema for %s: %w", t.Name(), err)
 	}
+	var roCheck func(rawArgs json.RawMessage) bool
+	if dt, ok := any(t).(DynamicReadOnlyTool[Args]); ok {
+		roCheck = func(rawArgs json.RawMessage) bool {
+			var args Args
+			if len(rawArgs) > 0 && string(rawArgs) != "null" && string(rawArgs) != "{}" {
+				if err := json.Unmarshal(rawArgs, &args); err != nil {
+					return false
+				}
+			}
+			return dt.ReadOnlyArgs(args)
+		}
+	}
 	return r.RegisterRaw(Entry{
-		Name:        t.Name(),
-		Description: t.Description(),
-		ReadOnly:    t.ReadOnly(),
-		Parameters:  schemaBytes,
+		Name:          t.Name(),
+		Description:   t.Description(),
+		ReadOnly:      t.ReadOnly(),
+		ReadOnlyCheck: roCheck,
+		Parameters:    schemaBytes,
 		Invoke: func(ctx context.Context, tc ToolContext, rawArgs json.RawMessage) (ToolResult, error) {
 			var args Args
 			if len(rawArgs) > 0 && string(rawArgs) != "null" && string(rawArgs) != "{}" {
@@ -211,6 +231,26 @@ func (r *Registry) Lookup(name string) (Entry, bool) {
 	defer r.mu.RUnlock()
 	e, ok := r.entries[name]
 	return e, ok
+}
+
+// IsReadOnlyCall reports whether a specific tool invocation is safe to execute concurrently
+// with sibling read-only calls in the same agent tool batch.
+func (r *Registry) IsReadOnlyCall(name, rawArgs string) bool {
+	e, ok := r.Lookup(name)
+	if !ok {
+		return false
+	}
+	if e.ReadOnly {
+		return true
+	}
+	if e.ReadOnlyCheck != nil {
+		b := json.RawMessage(strings.TrimSpace(rawArgs))
+		if len(b) == 0 {
+			b = json.RawMessage(`{}`)
+		}
+		return e.ReadOnlyCheck(b)
+	}
+	return false
 }
 
 // UpdateDefaultTimeout hot-reloads the default per-tool execution timeout.

@@ -625,16 +625,21 @@ func (c *Client) callAPI(ctx context.Context, action string, params map[string]a
 		return apiResponse{}, err
 	}
 
+	timeout := time.Duration(maxInt(c.cfg.APITimeoutSec, 10)) * time.Second
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	c.writeMu.Lock()
+	writeDeadline := time.Now().Add(timeout)
+	if dl, ok := reqCtx.Deadline(); ok && dl.Before(writeDeadline) {
+		writeDeadline = dl
+	}
+	_ = conn.SetWriteDeadline(writeDeadline)
 	err = conn.WriteMessage(websocket.TextMessage, reqPayload)
 	c.writeMu.Unlock()
 	if err != nil {
 		return apiResponse{}, err
 	}
-
-	timeout := time.Duration(maxInt(c.cfg.APITimeoutSec, 10)) * time.Second
-	reqCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
 	select {
 	case resp, ok := <-ch:

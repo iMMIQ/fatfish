@@ -1,9 +1,13 @@
 package room
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"image"
+	"image/color"
+	"image/png"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -794,5 +798,122 @@ policy:
 	})
 	if !arm3 {
 		t.Fatal("expected direct follow-up from active thread user to trigger continuation")
+	}
+}
+
+// TestRoomNonBlockingPerceptionAndParallelMultiImage verifies that:
+// 1. Multiple images in one message are fetched/processed concurrently inside runPerception.
+// 2. Room.run() remains immediately responsive to commands (/status) while perception is in flight.
+func TestRoomNonBlockingPerceptionAndParallelMultiImage(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 16, 16))
+	img.Set(0, 0, color.RGBA{R: 255, A: 255})
+	var pngBuf bytes.Buffer
+	_ = png.Encode(&pngBuf, img)
+	pngBytes := pngBuf.Bytes()
+
+	var inFlight, maxInFlight atomic.Int32
+	imgSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cur := inFlight.Add(1)
+		for {
+			prev := maxInFlight.Load()
+			if cur <= prev || maxInFlight.CompareAndSwap(prev, cur) {
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+		inFlight.Add(-1)
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(pngBytes)
+	}))
+	defer imgSrv.Close()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "fatfish.yaml")
+	yamlCfg := `data_dir: "` + filepath.ToSlash(dir) + `"
+timezone: "UTC"
+policy:
+  media_wait_sec: 1.5
+  explicit_debounce_sec: 0.05
+  rules:
+    reply_gate: "mentioned"
+tools:
+  ssrf_allow_hosts: ["127.0.0.1"]
+`
+	if err := os.WriteFile(cfgPath, []byte(yamlCfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfgMgr, err := config.NewManager(cfgPath, policy.ValidateConfig)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	st, err := store.Open(dir, 512, 5)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+	pol, _ := policy.NewEngine(cfgMgr.Get().Policy)
+	mgr := NewManager(Dependencies{
+		Config: cfgMgr,
+		Store:  st,
+		Policy: pol,
+	})
+	defer mgr.Drain(2 * time.Second)
+
+	ch := model.MakeChannelID("onebot", "10001", model.ChannelGroup, "66666")
+	mgr.Dispatch(&model.Message{
+		ChannelID:     ch,
+		PlatformMsgID: "m_multi_img",
+		SenderID:      "u1",
+		SenderName:    "Alice",
+		MentionedBot:  true,
+		Parts: []model.Part{
+			{Kind: model.PartText, Text: "看这三张图"},
+			{Kind: model.PartImage, URL: imgSrv.URL + "/1.png"},
+			{Kind: model.PartImage, URL: imgSrv.URL + "/2.png"},
+			{Kind: model.PartImage, URL: imgSrv.URL + "/3.png"},
+		},
+		CreatedAt: time.Now(),
+	})
+
+	// Send /status immediately: must return well before the 100ms image perception finishes!
+	replyCh := make(chan string, 1)
+	start := time.Now()
+	mgr.DispatchCommand(model.AdminCommand{
+		ChannelID: ch,
+		SenderID:  "u1",
+		Name:      "status",
+		Reply:     replyCh,
+	})
+	select {
+	case rep := <-replyCh:
+		if rep == "" {
+			t.Fatal("expected status reply")
+		}
+		if elapsed := time.Since(start); elapsed > 80*time.Millisecond {
+			t.Fatalf("Room.run() was blocked during perception: /status took %v", elapsed)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("Room.run() blocked on perception instead of servicing /status immediately")
+	}
+
+	// Wait for parallel perception to complete and verify all 3 images were fetched concurrently.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		saved, err := st.GetMessageByPlatformID(context.Background(), ch, "m_multi_img")
+		if err == nil && saved != nil {
+			ready := 0
+			for _, p := range saved.Parts {
+				if p.Kind == model.PartImage && p.SHA256 != "" && p.MediaID != "" {
+					ready++
+				}
+			}
+			if ready == 3 {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if maxInFlight.Load() < 2 {
+		t.Fatalf("expected multi-image perception to run concurrently (maxInFlight >= 2), got %d", maxInFlight.Load())
 	}
 }

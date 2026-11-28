@@ -201,7 +201,8 @@ func (b *Builder) EnsureActiveSegmentWithClose(
 		return nil, nil, err
 	}
 	var closedSeg *store.SegmentRecord
-	var rotatedSummary string
+	var oldSeg *store.SegmentRecord
+	var needRotate bool
 	idleLimit := time.Duration(defaultIfNonPos(cfg.SegmentIdleMinutes, 30)) * time.Minute
 
 	if chState.ActiveSegmentID > 0 {
@@ -210,26 +211,42 @@ func (b *Builder) EnsureActiveSegmentWithClose(
 			if time.Since(seg.LastActiveAt) <= idleLimit {
 				return seg, nil, nil
 			}
-			// Idle rotation: close old segment and optionally summarize inline within a short timeout.
-			if onClose != nil {
-				rotatedSummary = strings.TrimSpace(onClose(ctx, seg))
-			}
-			_ = b.store.CloseSegment(ctx, seg.ID, rotatedSummary)
-			seg.SummaryText = rotatedSummary
-			closedSeg = seg
+			needRotate = true
+			oldSeg = seg
 		} else if err == nil && seg.ClosedAt.IsZero() {
-			if onClose != nil {
-				rotatedSummary = strings.TrimSpace(onClose(ctx, seg))
-			}
-			_ = b.store.CloseSegment(ctx, seg.ID, rotatedSummary)
-			seg.SummaryText = rotatedSummary
-			closedSeg = seg
+			needRotate = true
+			oldSeg = seg
 		}
 	}
 
 	var in SnapshotInput
-	if snapshotFn != nil {
-		in, _ = snapshotFn(ctx)
+	var rotatedSummary string
+	if needRotate && oldSeg != nil && onClose != nil && snapshotFn != nil {
+		// Run old-segment LLM summarization and new-segment DB/travel snapshot concurrently
+		// to hide all SQLite/travel reads behind the summarization network RTT.
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			rotatedSummary = strings.TrimSpace(onClose(ctx, oldSeg))
+		}()
+		go func() {
+			defer wg.Done()
+			in, _ = snapshotFn(ctx)
+		}()
+		wg.Wait()
+	} else {
+		if needRotate && oldSeg != nil && onClose != nil {
+			rotatedSummary = strings.TrimSpace(onClose(ctx, oldSeg))
+		}
+		if snapshotFn != nil {
+			in, _ = snapshotFn(ctx)
+		}
+	}
+	if needRotate && oldSeg != nil {
+		_ = b.store.CloseSegment(ctx, oldSeg.ID, rotatedSummary)
+		oldSeg.SummaryText = rotatedSummary
+		closedSeg = oldSeg
 	}
 	if in.PreviousSummary == "" {
 		if rotatedSummary != "" {
@@ -403,10 +420,8 @@ func (b *Builder) AssemblePlan(
 		estTextTokens += frameRawText[i]
 	}
 
-	// Prefix hash covers [msg 0..k] (everything strictly prior to the current turn).
-	prefixBytes, _ := json.Marshal(msgs)
-	sum := sha256.Sum256(prefixBytes)
-	prefixHash := hex.EncodeToString(sum[:])
+	// Prefix hash covers [msg 0..k] using lightweight SHA-256 media refs instead of multi-MB base64 payloads.
+	prefixHash := hashCanonicalPrefix(SystemPrompt(personaText), seg.PinnedSnapshot, parsed)
 
 	var effUser *StoredFramePayload
 	if hasCur {
@@ -436,42 +451,41 @@ func (b *Builder) AppendFrozenFrames(ctx context.Context, seg *store.SegmentReco
 }
 
 // AppendFrozenFramesWithTrim commits any deferred whole-turn trim (when trimUpToIdx >= 0) and
-// appends new immutable turn frames to the segment only after delivery succeeds.
+// appends new immutable turn frames to the segment atomically in ONE SQLite transaction.
 func (b *Builder) AppendFrozenFramesWithTrim(ctx context.Context, seg *store.SegmentRecord, trimUpToIdx int, payloads ...StoredFramePayload) error {
 	cfg := b.getConfig()
-	if trimUpToIdx >= 0 {
-		_ = b.store.DeleteFramesUpToIndex(ctx, seg.ID, trimUpToIdx)
-	}
-	existing, err := b.store.ListFrames(ctx, seg.ID)
-	if err != nil {
-		return err
-	}
-	nextIdx := 0
-	if len(existing) > 0 {
-		nextIdx = existing[len(existing)-1].FrameIndex + 1
-	}
 	imgReserve := defaultIfNonPos(cfg.ImageTokenReserve, 1600)
+	now := time.Now()
+	recs := make([]store.FrameRecord, 0, len(payloads))
 	for _, p := range payloads {
 		raw, err := json.Marshal(p)
 		if err != nil {
 			return err
 		}
 		est := estimatePayloadTextTokens(p) + len(p.Images)*imgReserve
-		rec := &store.FrameRecord{
+		recs = append(recs, store.FrameRecord{
 			SegmentID:   seg.ID,
 			ChannelID:   seg.ChannelID,
-			FrameIndex:  nextIdx,
 			Role:        p.Role,
 			PayloadJSON: string(raw),
 			EstTokens:   est,
-			CreatedAt:   time.Now(),
-		}
-		if err := b.store.AppendFrame(ctx, rec); err != nil {
-			return err
-		}
-		nextIdx++
+			CreatedAt:   now,
+		})
 	}
-	return b.store.TouchSegment(ctx, seg.ID, time.Now())
+	return b.store.CommitTurnFrames(ctx, seg.ID, trimUpToIdx, recs, now)
+}
+
+func hashCanonicalPrefix(sysPrompt, pinnedSnapshot string, frames []StoredFramePayload) string {
+	h := sha256.New()
+	_, _ = h.Write([]byte(sysPrompt))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(pinnedSnapshot))
+	for _, f := range frames {
+		_, _ = h.Write([]byte{0})
+		raw, _ := json.Marshal(f)
+		_, _ = h.Write(raw)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // FormatUserTurn formats a batch of channel messages (plus optional one-time new-member delta lines)

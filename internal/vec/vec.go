@@ -1,13 +1,25 @@
 package vec
 
 import (
+	"container/heap"
 	"encoding/binary"
 	"math"
+	"runtime"
 	"sort"
 	"sync"
 
 	"github.com/x448/float16"
 )
+
+// f16ToF32LUT caches IEEE 754 binary16 -> float32 conversions (256 KiB static table)
+// to eliminate per-element bit-twiddling during dot-product scans.
+var f16ToF32LUT [65536]float32
+
+func init() {
+	for i := 0; i < 65536; i++ {
+		f16ToF32LUT[i] = float16.Frombits(uint16(i)).Float32()
+	}
+}
 
 // Hit represents a single scored nearest-neighbor result.
 type Hit struct {
@@ -217,12 +229,72 @@ func (idx *FlatF16Index) Vector(id string) ([]float32, bool) {
 	out := make([]float32, idx.dim)
 	off := slot * idx.dim
 	for i := 0; i < idx.dim; i++ {
-		out[i] = float16.Frombits(idx.data[off+i]).Float32()
+		out[i] = f16ToF32LUT[idx.data[off+i]]
 	}
 	return out, true
 }
 
-// Search performs a sequential L2-normalized dot product scan against unshifted query q.
+func hitBetter(a, b Hit) bool {
+	if a.Score == b.Score {
+		return a.ID < b.ID
+	}
+	return a.Score > b.Score
+}
+
+// hitMinHeap keeps the worst (lowest-scoring) of the top-K hits at index 0.
+type hitMinHeap []Hit
+
+func (h hitMinHeap) Len() int           { return len(h) }
+func (h hitMinHeap) Less(i, j int) bool { return hitBetter(h[j], h[i]) }
+func (h hitMinHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *hitMinHeap) Push(x any)        { *h = append(*h, x.(Hit)) }
+func (h *hitMinHeap) Pop() any {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
+}
+
+func (h *hitMinHeap) pushTopK(cand Hit, k int) {
+	if len(*h) < k {
+		heap.Push(h, cand)
+		return
+	}
+	if hitBetter(cand, (*h)[0]) {
+		(*h)[0] = cand
+		heap.Fix(h, 0)
+	}
+}
+
+func scanRangeTopK(ids []string, data []uint16, dim int, qn []float32, start, end, k int, filter func(id string) bool) []Hit {
+	hp := make(hitMinHeap, 0, k)
+	for slot := start; slot < end; slot++ {
+		id := ids[slot]
+		if filter != nil && !filter(id) {
+			continue
+		}
+		off := slot * dim
+		vecSlice := data[off : off+dim]
+		var dot float32
+		i := 0
+		for ; i+3 < dim; i += 4 {
+			dot += qn[i]*f16ToF32LUT[vecSlice[i]] +
+				qn[i+1]*f16ToF32LUT[vecSlice[i+1]] +
+				qn[i+2]*f16ToF32LUT[vecSlice[i+2]] +
+				qn[i+3]*f16ToF32LUT[vecSlice[i+3]]
+		}
+		for ; i < dim; i++ {
+			dot += qn[i] * f16ToF32LUT[vecSlice[i]]
+		}
+		hp.pushTopK(Hit{ID: id, Score: dot}, k)
+	}
+	return hp
+}
+
+// Search performs an L2-normalized dot product scan against unshifted query q using a static
+// float16 LUT and bounded Top-K heap, sharding across CPU cores automatically for large corpora.
+// filter, if non-nil, must be safe for concurrent read-only invocation.
 func (idx *FlatF16Index) Search(q []float32, k int, filter func(id string) bool) []Hit {
 	if k <= 0 || len(q) != idx.dim {
 		return nil
@@ -244,31 +316,49 @@ func (idx *FlatF16Index) Search(q []float32, k int, filter func(id string) bool)
 		k = n
 	}
 
-	hits := make([]Hit, 0, n)
 	dim := idx.dim
 	data := idx.data
-	for slot := 0; slot < n; slot++ {
-		id := idx.ids[slot]
-		if filter != nil && !filter(id) {
-			continue
+	ids := idx.ids
+
+	var hits []Hit
+	workers := runtime.GOMAXPROCS(0)
+	if workers > 4 {
+		workers = 4
+	}
+	if n >= 2048 && workers > 1 {
+		partials := make([][]Hit, workers)
+		chunk := (n + workers - 1) / workers
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			s := w * chunk
+			if s >= n {
+				break
+			}
+			e := s + chunk
+			if e > n {
+				e = n
+			}
+			wg.Add(1)
+			go func(wi, start, end int) {
+				defer wg.Done()
+				partials[wi] = scanRangeTopK(ids, data, dim, qn, start, end, k, filter)
+			}(w, s, e)
 		}
-		off := slot * dim
-		var dot float32
-		for i := 0; i < dim; i++ {
-			dot += qn[i] * float16.Frombits(data[off+i]).Float32()
+		wg.Wait()
+		merged := make(hitMinHeap, 0, k)
+		for _, part := range partials {
+			for _, h := range part {
+				merged.pushTopK(h, k)
+			}
 		}
-		hits = append(hits, Hit{ID: id, Score: dot})
+		hits = merged
+	} else {
+		hits = scanRangeTopK(ids, data, dim, qn, 0, n, k, filter)
 	}
 
 	sort.Slice(hits, func(i, j int) bool {
-		if hits[i].Score == hits[j].Score {
-			return hits[i].ID < hits[j].ID
-		}
-		return hits[i].Score > hits[j].Score
+		return hitBetter(hits[i], hits[j])
 	})
-	if len(hits) > k {
-		hits = hits[:k]
-	}
 	return hits
 }
 
@@ -315,7 +405,7 @@ func DecodeFloat16(b []byte) []float32 {
 	n := len(b) / 2
 	out := make([]float32, n)
 	for i := 0; i < n; i++ {
-		out[i] = float16.Frombits(binary.LittleEndian.Uint16(b[i*2:])).Float32()
+		out[i] = f16ToF32LUT[binary.LittleEndian.Uint16(b[i*2:])]
 	}
 	return out
 }

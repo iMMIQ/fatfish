@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"container/list"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
@@ -30,11 +32,27 @@ type CanonicalBlob struct {
 	Path     string
 }
 
+const (
+	defaultDataURICacheMaxBytes  = 16 << 20 // 16 MiB bounded RAM cache for hot multimodal turns
+	defaultDataURICacheMaxSingle = 4 << 20  // Do not cache single entries >4 MiB
+)
+
+type dataURICacheEntry struct {
+	key string
+	val string
+}
+
 // BlobStore manages SHA-256 content-addressed canonical images on disk.
 type BlobStore struct {
 	dir         string
 	maxDim      int
 	maxImageMiB int
+
+	cacheMu    sync.Mutex
+	cacheOrder *list.List
+	cacheItems map[string]*list.Element
+	cacheBytes int64
+	cacheMax   int64
 }
 
 // NewBlobStore creates a BlobStore rooted at dir.
@@ -52,6 +70,9 @@ func NewBlobStore(dir string, maxDim, maxImageMiB int) (*BlobStore, error) {
 		dir:         dir,
 		maxDim:      maxDim,
 		maxImageMiB: maxImageMiB,
+		cacheOrder:  list.New(),
+		cacheItems:  make(map[string]*list.Element),
+		cacheMax:    defaultDataURICacheMaxBytes,
 	}, nil
 }
 
@@ -110,7 +131,7 @@ func (b *BlobStore) PutImage(raw []byte) (CanonicalBlob, error) {
 			nh = 1
 		}
 		dst := image.NewNRGBA(image.Rect(0, 0, nw, nh))
-		draw.CatmullRom.Scale(dst, dst.Bounds(), img, bounds, draw.Over, nil)
+		draw.BiLinear.Scale(dst, dst.Bounds(), img, bounds, draw.Over, nil)
 		img = dst
 		w, h = nw, nh
 	}
@@ -232,17 +253,85 @@ func (b *BlobStore) ReadMediaBytes(sha256Hex, mimeType string) ([]byte, string, 
 	return raw, mimeType, err
 }
 
-// DataURI returns the deterministic base64 data URI ("data:image/jpeg;base64,...") for LLM payloads.
+// DataURI returns the deterministic base64 data URI ("data:image/jpeg;base64,...") for LLM payloads,
+// served from a bounded 16 MiB LRU cache to eliminate repeated disk reads and base64 encoding across turns.
 func (b *BlobStore) DataURI(sha256Hex, mimeType string) (string, error) {
+	key := sha256Hex + "|" + mimeType
+	if cached, ok := b.cacheGet(key); ok {
+		return cached, nil
+	}
 	raw, err := b.ReadBytes(sha256Hex, mimeType)
 	if err != nil {
 		return "", err
 	}
-	return "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(raw), nil
+	uri := "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(raw)
+	b.cachePut(key, uri)
+	return uri, nil
+}
+
+func (b *BlobStore) cacheGet(key string) (string, bool) {
+	b.cacheMu.Lock()
+	defer b.cacheMu.Unlock()
+	if b.cacheItems == nil {
+		return "", false
+	}
+	if el, ok := b.cacheItems[key]; ok {
+		b.cacheOrder.MoveToFront(el)
+		return el.Value.(*dataURICacheEntry).val, true
+	}
+	return "", false
+}
+
+func (b *BlobStore) cachePut(key, val string) {
+	sz := int64(len(val))
+	if sz <= 0 || sz > defaultDataURICacheMaxSingle || b.cacheMax <= 0 {
+		return
+	}
+	b.cacheMu.Lock()
+	defer b.cacheMu.Unlock()
+	if b.cacheItems == nil {
+		b.cacheOrder = list.New()
+		b.cacheItems = make(map[string]*list.Element)
+	}
+	if el, ok := b.cacheItems[key]; ok {
+		ent := el.Value.(*dataURICacheEntry)
+		b.cacheBytes += sz - int64(len(ent.val))
+		ent.val = val
+		b.cacheOrder.MoveToFront(el)
+	} else {
+		el = b.cacheOrder.PushFront(&dataURICacheEntry{key: key, val: val})
+		b.cacheItems[key] = el
+		b.cacheBytes += sz
+	}
+	for b.cacheBytes > b.cacheMax && b.cacheOrder.Len() > 0 {
+		tail := b.cacheOrder.Back()
+		ent := tail.Value.(*dataURICacheEntry)
+		b.cacheOrder.Remove(tail)
+		delete(b.cacheItems, ent.key)
+		b.cacheBytes -= int64(len(ent.val))
+	}
+}
+
+func (b *BlobStore) cacheDeletePrefix(sha256Hex string) {
+	if sha256Hex == "" {
+		return
+	}
+	prefix := sha256Hex + "|"
+	b.cacheMu.Lock()
+	defer b.cacheMu.Unlock()
+	for k, el := range b.cacheItems {
+		if strings.HasPrefix(k, prefix) {
+			ent := el.Value.(*dataURICacheEntry)
+			b.cacheOrder.Remove(el)
+			delete(b.cacheItems, k)
+			b.cacheBytes -= int64(len(ent.val))
+		}
+	}
 }
 
 // Delete removes a blob file (and any preserved animated GIF companion) if it exists.
 func (b *BlobStore) Delete(sha256Hex, mimeType string) error {
+	b.cacheDeletePrefix(sha256Hex)
 	p := b.PathFor(sha256Hex, mimeType)
 	if p == "" {
 		return nil

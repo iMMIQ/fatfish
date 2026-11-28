@@ -295,3 +295,72 @@ func TestRunnerAdvisoryOverridesAndMaxToolIterations(t *testing.T) {
 		t.Fatalf("expected 8-iter advisory answer, got text=%q iters=%d", out.Text, out.Stats.Iterations)
 	}
 }
+
+type stubDynamicTool struct {
+	running *atomic.Int32
+	maxConc *atomic.Int32
+}
+
+type stubDynArgs struct {
+	Action string `json:"action"`
+}
+
+func (s *stubDynamicTool) Name() string        { return "dyn_tool" }
+func (s *stubDynamicTool) Description() string { return "dynamic read/write stub" }
+func (s *stubDynamicTool) ReadOnly() bool      { return false }
+func (s *stubDynamicTool) ReadOnlyArgs(args stubDynArgs) bool {
+	return args.Action == "list"
+}
+func (s *stubDynamicTool) Execute(_ context.Context, _ tool.ToolContext, args stubDynArgs) (tool.ToolResult, error) {
+	cur := s.running.Add(1)
+	for {
+		prev := s.maxConc.Load()
+		if cur <= prev || s.maxConc.CompareAndSwap(prev, cur) {
+			break
+		}
+	}
+	time.Sleep(35 * time.Millisecond)
+	s.running.Add(-1)
+	return tool.ToolResult{TextForLLM: "dyn:" + args.Action}, nil
+}
+
+func TestExecuteToolBatchSegmentedReadOnlyAndBoundedCap(t *testing.T) {
+	reg := tool.NewRegistry(5 * time.Second)
+	var running, maxConc atomic.Int32
+	_ = tool.Register[stubArgs](reg, &stubReadTool{name: "read_a", running: &running, maxConc: &maxConc})
+	_ = tool.Register[stubArgs](reg, &stubReadTool{name: "read_b", running: &running, maxConc: &maxConc})
+	_ = tool.Register[stubDynArgs](reg, &stubDynamicTool{running: &running, maxConc: &maxConc})
+	reg.Freeze()
+
+	r := NewRunner(nil, nil, nil, reg, nil)
+
+	// 1. Mixed batch: [read_a, read_b, dyn(list), dyn(save), read_a, read_b]
+	// First 3 must run concurrently (maxConc >= 3), barrier runs alone, trailing 2 run concurrently.
+	calls := []infer.ToolCall{
+		{ID: "1", Type: "function", Function: infer.ToolCallFunction{Name: "read_a", Arguments: `{"x":"1"}`}},
+		{ID: "2", Type: "function", Function: infer.ToolCallFunction{Name: "read_b", Arguments: `{"x":"2"}`}},
+		{ID: "3", Type: "function", Function: infer.ToolCallFunction{Name: "dyn_tool", Arguments: `{"action":"list"}`}},
+		{ID: "4", Type: "function", Function: infer.ToolCallFunction{Name: "dyn_tool", Arguments: `{"action":"save"}`}},
+		{ID: "5", Type: "function", Function: infer.ToolCallFunction{Name: "read_a", Arguments: `{"x":"3"}`}},
+		{ID: "6", Type: "function", Function: infer.ToolCallFunction{Name: "read_b", Arguments: `{"x":"4"}`}},
+	}
+	res := r.executeToolBatch(context.Background(), tool.ToolContext{}, calls)
+	if len(res) != 6 || res[2].TextForLLM != "dyn:list" || res[3].TextForLLM != "dyn:save" || res[5].TextForLLM != "res:4" {
+		t.Fatalf("unexpected batch results: %+v", res)
+	}
+	if maxConc.Load() < 3 {
+		t.Fatalf("expected dynamic read-only segment to run concurrently (maxConc >= 3), got %d", maxConc.Load())
+	}
+
+	// 2. Bounded cap: 6 pure read-only calls must never exceed maxParallelReadOnlyTools (4).
+	running.Store(0)
+	maxConc.Store(0)
+	six := make([]infer.ToolCall, 6)
+	for i := range six {
+		six[i] = infer.ToolCall{ID: "r", Type: "function", Function: infer.ToolCallFunction{Name: "read_a", Arguments: `{"x":"k"}`}}
+	}
+	_ = r.executeToolBatch(context.Background(), tool.ToolContext{}, six)
+	if got := maxConc.Load(); got < 2 || got > maxParallelReadOnlyTools {
+		t.Fatalf("expected bounded concurrency in [2, %d], got %d", maxParallelReadOnlyTools, got)
+	}
+}

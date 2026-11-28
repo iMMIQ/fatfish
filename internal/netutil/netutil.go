@@ -246,7 +246,8 @@ func NewSafeHTTPClient(opts SafeClientOptions) *http.Client {
 			return safeDialer.DialContext(ctx, network, address)
 		},
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          32,
+		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   16,
 		IdleConnTimeout:       60 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,

@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/iMMIQ/fatfish/internal/agent"
 	"github.com/iMMIQ/fatfish/internal/config"
 	"github.com/iMMIQ/fatfish/internal/frame"
@@ -263,6 +265,7 @@ type Room struct {
 	ch          model.ChannelID
 	mailbox     chan model.InboundEvent
 	percPatchCh chan perceptionPatch
+	linkDoneCh  chan linkPreviewOutcome
 	turnDoneCh  chan turnOutcome
 	stopCh      chan struct{}
 	stopOne     sync.Once
@@ -281,12 +284,17 @@ type Room struct {
 	pokeWindowAt      time.Time
 	pokeStreak        int
 	outMu             sync.Mutex
-	outSent           []time.Time // rolling 60s outbound message timestamps (group rate-limit guard)
-	recentLinks       map[string]time.Time // per-channel canonical URL dedup map (actor-owned)
-	seenInSegment     map[string]bool      // tracks members already introduced in active segment
-	lastSegID      int64
-	pendingMsgs    []model.Message // messages accumulated since last LLM turn
-	pendingTrigger *triggerState
+	outSent           []time.Time                // rolling 60s outbound message timestamps (group rate-limit guard)
+	recentLinks       map[string]time.Time       // per-channel canonical URL dedup map (actor-owned)
+	seenInSegment     map[string]bool            // tracks members already introduced in active segment
+	memberCache       map[string]memberCacheItem // actor-owned cache to coalesce redundant UpsertMember writes
+	inflightPerc      map[int64]*inflightPerception
+	percLocalSeq      int64
+	lastSegID         int64
+	pendingMsgs       []model.Message // messages accumulated since last LLM turn
+	pendingTrigger    *triggerState
+	debounceArmed     bool
+	debounceAt        time.Time
 
 	// Managed single turn worker state (owned strictly by Room.run())
 	turnActive bool
@@ -307,9 +315,37 @@ type Room struct {
 	recentSenders []senderStamp
 }
 
+type memberCacheItem struct {
+	displayName string
+	role        string
+	updatedAt   time.Time
+}
+
+type inflightPerception struct {
+	key                    int64
+	seq                    int64
+	epoch                  int64
+	msg                    model.Message
+	deadline               time.Time
+	blockingTurn           bool
+	linkProactiveCandidate bool
+	msgCntAtIngress        uint64
+}
+
 type perceptionPatch struct {
-	seq   int64
-	parts []model.Part
+	key         int64
+	seq         int64
+	epoch       int64
+	parts       []model.Part
+	changed     bool
+	parsedLinks []parsedLinkItem
+}
+
+type linkPreviewOutcome struct {
+	epoch             int64
+	trigMsg           model.Message
+	botMsg            *model.Message
+	triggerCommentary bool
 }
 
 type turnOutcome struct {
@@ -366,10 +402,13 @@ func newRoom(mgr *Manager, ch model.ChannelID) *Room {
 		ch:            ch,
 		mailbox:       make(chan model.InboundEvent, 256),
 		percPatchCh:   make(chan perceptionPatch, 64),
+		linkDoneCh:    make(chan linkPreviewOutcome, 16),
 		turnDoneCh:    make(chan turnOutcome, 1),
 		stopCh:        make(chan struct{}),
 		recentLinks:   make(map[string]time.Time),
 		seenInSegment: make(map[string]bool),
+		memberCache:   make(map[string]memberCacheItem),
+		inflightPerc:  make(map[int64]*inflightPerception),
 		plusOneUsers:  make(map[string]struct{}),
 	}
 	r.epoch.Store(1)
@@ -525,6 +564,8 @@ func (r *Room) run() {
 		if d <= 0 {
 			d = 10 * time.Millisecond
 		}
+		r.debounceArmed = true
+		r.debounceAt = time.Now().Add(d)
 		if debounceTimer == nil {
 			debounceTimer = time.NewTimer(d)
 			debounceCh = debounceTimer.C
@@ -536,6 +577,22 @@ func (r *Room) run() {
 				}
 			}
 			debounceTimer.Reset(d)
+			debounceCh = debounceTimer.C
+		}
+	}
+
+	stopDebounce := func() {
+		r.debounceArmed = false
+		r.debounceAt = time.Time{}
+		if debounceTimer != nil {
+			if !debounceTimer.Stop() {
+				select {
+				case <-debounceTimer.C:
+				default:
+				}
+			}
+			debounceTimer = nil
+			debounceCh = nil
 		}
 	}
 
@@ -543,17 +600,20 @@ func (r *Room) run() {
 		if r.turnActive || r.pendingTrigger == nil {
 			return
 		}
+		if waitMore := r.nextBlockingPerceptionWait(time.Now()); waitMore > 0 {
+			armDebounce(waitMore)
+			return
+		}
 		trig := *r.pendingTrigger
 		r.pendingTrigger = nil
+		stopDebounce()
 		r.startTurn(trig)
 	}
 
 	for {
 		select {
 		case <-r.stopCh:
-			if debounceTimer != nil {
-				debounceTimer.Stop()
-			}
+			stopDebounce()
 			return
 
 		case ev := <-r.mailbox:
@@ -568,30 +628,197 @@ func (r *Room) run() {
 				}
 			} else if ev.Command != nil {
 				r.onAdminCommand(*ev.Command)
+				if ev.Command.Name == "reset" {
+					stopDebounce()
+				}
 			}
 
 		case patch := <-r.percPatchCh:
-			for i := range r.pendingMsgs {
-				if r.pendingMsgs[i].Seq == patch.seq {
-					r.pendingMsgs[i].Parts = patch.parts
-					break
-				}
+			if wait, arm := r.onPerceptionPatch(patch); arm && r.pendingTrigger != nil {
+				armDebounce(wait)
+			} else if r.pendingTrigger != nil && !r.turnActive && !r.debounceArmed {
+				launchPendingTurn()
+			} else if r.pendingTrigger != nil && !r.turnActive && r.debounceArmed && !time.Now().Before(r.debounceAt) {
+				launchPendingTurn()
+			}
+
+		case lp := <-r.linkDoneCh:
+			if wait, arm := r.onLinkPreviewDone(lp); arm && r.pendingTrigger != nil {
+				armDebounce(wait)
 			}
 
 		case out := <-r.turnDoneCh:
 			r.turnActive = false
 			r.turnCancel = nil
 			r.applyTurnOutcome(out)
-			if r.pendingTrigger != nil && debounceTimer == nil {
+			if r.pendingTrigger != nil && !r.debounceArmed {
 				armDebounce(10 * time.Millisecond)
 			}
 
 		case <-debounceCh:
 			debounceCh = nil
 			debounceTimer = nil
+			r.debounceArmed = false
+			r.debounceAt = time.Time{}
 			launchPendingTurn()
 		}
 	}
+}
+
+func (r *Room) nextBlockingPerceptionWait(now time.Time) time.Duration {
+	var earliest time.Duration
+	for k, ip := range r.inflightPerc {
+		if !now.Before(ip.deadline) {
+			ip.blockingTurn = false
+			if !ip.linkProactiveCandidate {
+				delete(r.inflightPerc, k)
+			}
+			continue
+		}
+		if !ip.blockingTurn {
+			continue
+		}
+		rem := ip.deadline.Sub(now)
+		if earliest == 0 || rem < earliest {
+			earliest = rem
+		}
+	}
+	return earliest
+}
+
+func (r *Room) onPerceptionPatch(patch perceptionPatch) (time.Duration, bool) {
+	ip := r.inflightPerc[patch.key]
+	delete(r.inflightPerc, patch.key)
+
+	if patch.epoch != r.epoch.Load() {
+		return 0, false
+	}
+
+	if patch.changed {
+		for i := range r.pendingMsgs {
+			if (patch.seq > 0 && r.pendingMsgs[i].Seq == patch.seq) ||
+				(ip != nil && ip.msg.PlatformMsgID != "" && r.pendingMsgs[i].PlatformMsgID == ip.msg.PlatformMsgID) {
+				r.pendingMsgs[i].Parts = patch.parts
+				break
+			}
+		}
+		if r.pendingTrigger != nil &&
+			((patch.seq > 0 && r.pendingTrigger.msg.Seq == patch.seq) ||
+				(ip != nil && ip.msg.PlatformMsgID != "" && r.pendingTrigger.msg.PlatformMsgID == ip.msg.PlatformMsgID)) {
+			r.pendingTrigger.msg.Parts = patch.parts
+		}
+		if ip != nil {
+			ip.msg.Parts = patch.parts
+		}
+	}
+
+	cfg := r.mgr.cfgMgr.Get()
+	now := time.Now()
+	if len(patch.parsedLinks) > 0 && ip != nil {
+		dedupTTL := time.Duration(cfg.LinkParser.DedupTTLSec) * time.Second
+		fresh := r.collectFreshLinks(patch.parsedLinks, now, dedupTTL)
+		if ip.linkProactiveCandidate && len(fresh) > 0 && !r.isMuted(now) &&
+			!(r.pendingTrigger != nil && !r.pendingTrigger.proactive) {
+			var previews []string
+			for _, item := range fresh {
+				if t := strings.TrimSpace(item.previewText); t != "" {
+					previews = append(previews, t)
+				}
+			}
+			linkCooldownOK := r.lastLinkProactive.IsZero() || now.Sub(r.lastLinkProactive) >= time.Duration(cfg.LinkParser.CooldownSec)*time.Second
+			if len(previews) > 0 && linkCooldownOK {
+				r.lastLinkProactive = now
+				previewBody := strings.Join(previews, "\n---\n")
+				trigMsg := cloneMessage(ip.msg)
+				expEpoch := patch.epoch
+				msgCntAtIngress := ip.msgCntAtIngress
+				triggerCommentary := cfg.LinkParser.ProactiveReply
+				if r.mgr.tr != nil && r.outboundRemaining(now, cfg.Policy.MaxMsgsPerMin) >= 2 {
+					botName := r.botDisplayName(cfg)
+					r.mgr.wg.Add(1)
+					go func() {
+						defer r.mgr.wg.Done()
+						if r.epoch.Load() != expEpoch || r.isMuted(time.Now()) {
+							return
+						}
+						sendOpts := transport.SendOptions{}
+						if cfg.Policy.SmartReplyDecoration && int(r.msgCount.Load()-msgCntAtIngress) > 0 {
+							sendOpts.ReplyToMsgID = trigMsg.PlatformMsgID
+						}
+						sctx, scancel := context.WithTimeout(r.mgr.shutdownCtx, 4*time.Second)
+						pid, serr := r.mgr.tr.SendText(sctx, r.ch, previewBody, sendOpts)
+						scancel()
+						if errors.Is(serr, transport.ErrRiskMuted) {
+							r.engageMute(r.mgr.shutdownCtx, cfg)
+							return
+						}
+						var botMsg *model.Message
+						if serr == nil {
+							r.recordOutbound(time.Now())
+							bm := model.Message{
+								ChannelID:     r.ch,
+								PlatformMsgID: pid,
+								SenderID:      r.mgr.tr.SelfID(),
+								SenderName:    botName,
+								FromBot:       true,
+								Parts:         []model.Part{{Kind: model.PartText, Text: previewBody}},
+								CreatedAt:     time.Now(),
+							}
+							_ = r.mgr.store.AppendMessage(r.mgr.shutdownCtx, &bm)
+							botMsg = &bm
+							r.mgr.log.Info("link preview sent", "channel", r.ch, "count", len(previews))
+						} else {
+							r.mgr.log.Warn("link preview send failed", "channel", r.ch, "err", serr)
+						}
+						select {
+						case r.linkDoneCh <- linkPreviewOutcome{
+							epoch:             expEpoch,
+							trigMsg:           trigMsg,
+							botMsg:            botMsg,
+							triggerCommentary: triggerCommentary,
+						}:
+						case <-r.stopCh:
+						}
+					}()
+					return 0, false
+				}
+				if triggerCommentary {
+					return r.armProactiveLinkTrigger(trigMsg, cfg)
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+func (r *Room) onLinkPreviewDone(lp linkPreviewOutcome) (time.Duration, bool) {
+	if lp.epoch != r.epoch.Load() {
+		return 0, false
+	}
+	if lp.botMsg != nil {
+		r.pendingMsgs = append(r.pendingMsgs, *lp.botMsg)
+		if len(r.pendingMsgs) > 60 {
+			r.pendingMsgs = r.pendingMsgs[len(r.pendingMsgs)-60:]
+		}
+	}
+	if !lp.triggerCommentary || r.isMuted(time.Now()) {
+		return 0, false
+	}
+	if r.pendingTrigger != nil && !r.pendingTrigger.proactive {
+		return 0, false
+	}
+	return r.armProactiveLinkTrigger(lp.trigMsg, r.mgr.cfgMgr.Get())
+}
+
+func (r *Room) armProactiveLinkTrigger(trigMsg model.Message, cfg *config.Config) (time.Duration, bool) {
+	r.pendingTrigger = &triggerState{
+		msg:        cloneMessage(trigMsg),
+		kind:       "link",
+		proactive:  true,
+		enqueuedAt: time.Now(),
+		enqMsgCnt:  r.msgCount.Load(),
+	}
+	return time.Duration(cfg.Policy.InputDebounceSec * float64(time.Second)), true
 }
 
 func (r *Room) onAdminCommand(cmd model.AdminCommand) {
@@ -609,6 +836,7 @@ func (r *Room) onAdminCommand(cmd model.AdminCommand) {
 		}
 		r.pendingMsgs = nil
 		r.pendingTrigger = nil
+		r.inflightPerc = make(map[int64]*inflightPerception)
 		r.recentLinks = make(map[string]time.Time)
 		r.seenInSegment = make(map[string]bool)
 		r.threadUserID = ""
@@ -625,18 +853,24 @@ func (r *Room) onAdminCommand(cmd model.AdminCommand) {
 		}
 	case "tr":
 		if cmd.Reply != nil {
-			trCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			defer cancel()
 			if r.mgr.hub == nil {
 				cmd.Reply <- "翻译失败: inference hub unavailable"
 				return
 			}
-			out, err := r.mgr.hub.Translate(trCtx, cmd.Args, "Simplified Chinese")
-			if err != nil {
-				cmd.Reply <- "翻译失败: " + err.Error()
-			} else {
-				cmd.Reply <- out
-			}
+			args := cmd.Args
+			replyCh := cmd.Reply
+			r.mgr.wg.Add(1)
+			go func() {
+				defer r.mgr.wg.Done()
+				trCtx, cancel := context.WithTimeout(r.mgr.shutdownCtx, 30*time.Second)
+				defer cancel()
+				out, err := r.mgr.hub.Translate(trCtx, args, "Simplified Chinese")
+				if err != nil {
+					replyCh <- "翻译失败: " + err.Error()
+				} else {
+					replyCh <- out
+				}
+			}()
 		}
 	}
 }
@@ -691,14 +925,29 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		r.resolveQuoteChain(ctx, msg, 3)
 	}
 
-	// Update immutable member identity & alias ledger (preserving platform role).
-	_ = r.mgr.store.UpsertMember(ctx, model.Member{
-		ChannelID:   r.ch,
-		MemberID:    msg.SenderID,
-		DisplayName: msg.SenderName,
-		Role:        msg.SenderRole,
-		UpdatedAt:   msg.CreatedAt,
-	})
+	// Update immutable member identity & alias ledger (coalescing unchanged entries within 5m).
+	now := time.Now()
+	needMemberUpsert := true
+	if prev, ok := r.memberCache[msg.SenderID]; ok &&
+		prev.displayName == msg.SenderName &&
+		prev.role == msg.SenderRole &&
+		now.Sub(prev.updatedAt) < 5*time.Minute {
+		needMemberUpsert = false
+	}
+	if needMemberUpsert {
+		_ = r.mgr.store.UpsertMember(ctx, model.Member{
+			ChannelID:   r.ch,
+			MemberID:    msg.SenderID,
+			DisplayName: msg.SenderName,
+			Role:        msg.SenderRole,
+			UpdatedAt:   msg.CreatedAt,
+		})
+		r.memberCache[msg.SenderID] = memberCacheItem{
+			displayName: msg.SenderName,
+			role:        msg.SenderRole,
+			updatedAt:   now,
+		}
+	}
 
 	// Persist L0 raw message immediately so seq is strictly monotonic.
 	_ = r.mgr.store.AppendMessage(ctx, msg)
@@ -709,7 +958,6 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 	}
 
 	// Track distinct senders in a rolling 30s window for PolicyEnv.BurstUsers.
-	now := time.Now()
 	r.recentSenders = append(r.recentSenders, senderStamp{userID: msg.SenderID, at: now})
 	burstUsers := r.countBurstUsers(now, 30*time.Second)
 
@@ -719,11 +967,18 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		replyCh := make(chan string, 1)
 		r.onAdminCommand(model.AdminCommand{ChannelID: r.ch, SenderID: msg.SenderID, Name: "reset", Reply: replyCh})
 		if r.mgr.tr != nil {
-			if _, err := r.mgr.tr.SendText(ctx, r.ch, <-replyCh, transport.SendOptions{}); errors.Is(err, transport.ErrRiskMuted) {
-				r.engageMute(ctx, cfg)
-			} else if err == nil {
-				r.recordOutbound(time.Now())
-			}
+			ackText := <-replyCh
+			r.mgr.wg.Add(1)
+			go func() {
+				defer r.mgr.wg.Done()
+				sctx, cancel := context.WithTimeout(r.mgr.shutdownCtx, 5*time.Second)
+				defer cancel()
+				if _, err := r.mgr.tr.SendText(sctx, r.ch, ackText, transport.SendOptions{}); errors.Is(err, transport.ErrRiskMuted) {
+					r.engageMute(r.mgr.shutdownCtx, cfg)
+				} else if err == nil {
+					r.recordOutbound(time.Now())
+				}
+			}()
 		}
 		return 0, false
 	}
@@ -750,8 +1005,8 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		return 0, false
 	}
 
-	// Launch bounded async perception tasks (image canonicalization + voice ASR + forward nodes + link parsing)
-	// on a DEEP COPY of msg so the Room Actor goroutine never races with background perception!
+	// Detect async perception candidates (images, voice ASR, forward nodes, web links).
+	// Launched strictly non-blockingly after policy evaluation so Room.run() never stalls!
 	hasMedia, hasAudio, hasForward := false, false, false
 	for _, p := range msg.Parts {
 		switch p.Kind {
@@ -767,12 +1022,42 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		cfg.LinkParser.Enabled &&
 		!linkChannelDisabled(cfg.LinkParser.DisabledChannels, r.ch) &&
 		len(r.mgr.parser.ExtractMessageLinks(msg, cfg.LinkParser.MaxURLsPerMsg)) > 0
+	needsPerception := hasMedia || hasAudio || hasForward || hasLinkCandidate
 
-	var perceptionCh chan perceptionResult
-	var deliveredInline atomic.Bool
-	if hasMedia || hasAudio || hasForward || hasLinkCandidate {
-		perceptionCh = make(chan perceptionResult, 1)
+	launchPerception := func(blockingTurn, linkCandidate bool, msgCntAtIngress uint64) {
+		if !needsPerception {
+			return
+		}
+		waitDur := time.Duration(cfg.Policy.MediaWaitSec * float64(time.Second))
+		if hasAudio {
+			if asrW := time.Duration(cfg.Policy.ASRWaitSec * float64(time.Second)); asrW > waitDur {
+				waitDur = asrW
+			}
+		}
+		if hasLinkCandidate {
+			if linkW := time.Duration(cfg.LinkParser.WaitSec * float64(time.Second)); linkW > waitDur {
+				waitDur = linkW
+			}
+		}
+		if waitDur <= 0 {
+			waitDur = 3 * time.Second
+		}
+		r.percLocalSeq++
+		pKey := r.percLocalSeq
+		startEpoch := r.epoch.Load()
 		msgCopy := cloneMessage(*msg)
+		if blockingTurn || linkCandidate {
+			r.inflightPerc[pKey] = &inflightPerception{
+				key:                    pKey,
+				seq:                    msgCopy.Seq,
+				epoch:                  startEpoch,
+				msg:                    cloneMessage(msgCopy),
+				deadline:               time.Now().Add(waitDur),
+				blockingTurn:           blockingTurn,
+				linkProactiveCandidate: linkCandidate,
+				msgCntAtIngress:        msgCntAtIngress,
+			}
+		}
 		r.mgr.wg.Add(1)
 		go func() {
 			defer r.mgr.wg.Done()
@@ -780,18 +1065,21 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 			case r.mgr.percSem <- struct{}{}:
 				defer func() { <-r.mgr.percSem }()
 			case <-r.mgr.shutdownCtx.Done():
-				perceptionCh <- perceptionResult{}
 				return
 			}
 			res := r.runPerception(&msgCopy, cfg)
-			perceptionCh <- res
-			// If perception completed after onMessage moved on (silent msg or timeout),
-			// patch r.pendingMsgs via actor channel so subsequent turns see the image/transcript/link!
-			if res.changed && !deliveredInline.Load() {
-				select {
-				case r.percPatchCh <- perceptionPatch{seq: msgCopy.Seq, parts: res.parts}:
-				default:
-				}
+			patch := perceptionPatch{
+				key:         pKey,
+				seq:         msgCopy.Seq,
+				epoch:       startEpoch,
+				parts:       res.parts,
+				changed:     res.changed,
+				parsedLinks: res.parsedLinks,
+			}
+			select {
+			case r.percPatchCh <- patch:
+			case <-r.stopCh:
+			case <-r.mgr.shutdownCtx.Done():
 			}
 		}()
 	}
@@ -799,6 +1087,7 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 	// Check mute backoff before deciding whether to respond.
 	if r.isMuted(now) {
 		r.pendingMsgs = append(r.pendingMsgs, cloneMessage(*msg))
+		launchPerception(false, false, r.msgCount.Load())
 		return 0, false
 	}
 
@@ -871,6 +1160,7 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 	if r.ch.IsGroup() && cfg.Policy.PlusOne.Enabled && !msg.MentionedBot && !msg.RepliedToBot && !pokedForPolicy {
 		switch r.tryPlusOne(ctx, msg, cfg) {
 		case plusOneEcho:
+			launchPerception(false, false, r.msgCount.Load())
 			return 0, false
 		case plusOneBreak:
 			plusOneBreakTriggered = true
@@ -950,11 +1240,10 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		}
 	}
 
-	// Proactive link parsing candidate: when a group member sends a link without explicitly triggering a reply,
-	// wait bounded for link parsing, always send the plain-text parsed preview for fresh links,
-	// and (when proactive_reply is enabled) let fatfish decide via proactive gate whether to also comment/react/stay silent.
+	// Proactive link parsing candidate: handled asynchronously in onPerceptionPatch when link parsing completes
+	// so Room.run() never blocks waiting for slow external websites.
 	msgCntAtIngress := r.msgCount.Load()
-	linkCooldownOK := time.Since(r.lastLinkProactive) >= time.Duration(cfg.LinkParser.CooldownSec)*time.Second
+	linkCooldownOK := r.lastLinkProactive.IsZero() || time.Since(r.lastLinkProactive) >= time.Duration(cfg.LinkParser.CooldownSec)*time.Second
 	linkProactiveCandidate := r.ch.IsGroup() &&
 		hasLinkCandidate &&
 		!shouldReply &&
@@ -962,94 +1251,14 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		(!isNight || cfg.LinkParser.NightProactive) &&
 		!(r.pendingTrigger != nil && !r.pendingTrigger.proactive)
 
-	// Wait bounded for perception if this message triggers, joins an active turn, or is a proactive link candidate.
-	linkPreviewReady := false
-	linkProactiveTriggered := false
-	var freshLinkPreviews []string
-	if perceptionCh != nil && (shouldReply || r.pendingTrigger != nil || linkProactiveCandidate) {
-		waitDur := time.Duration(cfg.Policy.MediaWaitSec * float64(time.Second))
-		if hasAudio {
-			if asrW := time.Duration(cfg.Policy.ASRWaitSec * float64(time.Second)); asrW > waitDur {
-				waitDur = asrW
-			}
-		}
-		if hasLinkCandidate {
-			if linkW := time.Duration(cfg.LinkParser.WaitSec * float64(time.Second)); linkW > waitDur {
-				waitDur = linkW
-			}
-		}
-		if waitDur <= 0 {
-			waitDur = 3 * time.Second
-		}
-		select {
-		case res := <-perceptionCh:
-			deliveredInline.Store(true)
-			if res.changed {
-				msg.Parts = res.parts
-				plain = strings.TrimSpace(msg.PlainText())
-			}
-			if len(res.parsedLinks) > 0 {
-				dedupTTL := time.Duration(cfg.LinkParser.DedupTTLSec) * time.Second
-				fresh := r.collectFreshLinks(res.parsedLinks, now, dedupTTL)
-				if linkProactiveCandidate && len(fresh) > 0 {
-					for _, item := range fresh {
-						if t := strings.TrimSpace(item.previewText); t != "" {
-							freshLinkPreviews = append(freshLinkPreviews, t)
-						}
-					}
-					linkPreviewReady = len(freshLinkPreviews) > 0
-					if cfg.LinkParser.ProactiveReply {
-						linkProactiveTriggered = true
-						shouldReply = true
-					}
-				}
-			}
-		case <-time.After(waitDur):
-			// Proceed with placeholder; background perception patches L0+FTS5 & r.pendingMsgs on completion.
-		}
-	}
-
 	r.pendingMsgs = append(r.pendingMsgs, cloneMessage(*msg))
 	if len(r.pendingMsgs) > 60 {
 		r.pendingMsgs = r.pendingMsgs[len(r.pendingMsgs)-60:]
 	}
 
-	// Deterministic plain-text preview delivery for proactive links (before optional fatfish commentary).
-	if linkPreviewReady && r.mgr.tr != nil && !r.isMuted(now) && r.outboundRemaining(now, cfg.Policy.MaxMsgsPerMin) >= 2 {
-		previewBody := strings.Join(freshLinkPreviews, "\n---\n")
-		sendOpts := transport.SendOptions{}
-		if cfg.Policy.SmartReplyDecoration && int(r.msgCount.Load()-msgCntAtIngress) > 0 {
-			sendOpts.ReplyToMsgID = msg.PlatformMsgID
-		}
-		sctx, scancel := context.WithTimeout(ctx, 4*time.Second)
-		pid, serr := r.mgr.tr.SendText(sctx, r.ch, previewBody, sendOpts)
-		scancel()
-		if errors.Is(serr, transport.ErrRiskMuted) {
-			r.engageMute(ctx, cfg)
-			return 0, false
-		}
-		if serr == nil {
-			r.recordOutbound(time.Now())
-			r.lastLinkProactive = time.Now()
-			botMsg := model.Message{
-				ChannelID:     r.ch,
-				PlatformMsgID: pid,
-				SenderID:      r.mgr.tr.SelfID(),
-				SenderName:    r.botDisplayName(cfg),
-				FromBot:       true,
-				Parts:         []model.Part{{Kind: model.PartText, Text: previewBody}},
-				CreatedAt:     time.Now(),
-			}
-			_ = r.mgr.store.AppendMessage(ctx, &botMsg)
-			r.pendingMsgs = append(r.pendingMsgs, botMsg)
-			if len(r.pendingMsgs) > 60 {
-				r.pendingMsgs = r.pendingMsgs[len(r.pendingMsgs)-60:]
-			}
-			r.mgr.log.Info("link preview sent", "channel", r.ch, "count", len(freshLinkPreviews))
-		} else {
-			r.mgr.log.Warn("link preview send failed", "channel", r.ch, "err", serr)
-		}
-	}
+	// Launch non-blocking perception: wait until deadline inside Room.run() before starting turn
+	// if this message triggers or joins a pending trigger; proactive links self-trigger on completion.
+	launchPerception(shouldReply || r.pendingTrigger != nil, linkProactiveCandidate, msgCntAtIngress)
 
 	if !shouldReply {
 		// Same-sender burst follow-up coalesces into an active pending trigger (e.g. pure @bot followed by text).
@@ -1080,9 +1289,6 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		proactive = false
 	case pokeBystanderTriggered:
 		trigKind = "poke_bystander"
-		proactive = true
-	case linkProactiveTriggered:
-		trigKind = "link"
 		proactive = true
 	case inThread:
 		trigKind = "thread"
@@ -1149,8 +1355,10 @@ func (r *Room) resolveQuoteChain(ctx context.Context, msg *model.Message, maxDep
 	var chain []string
 	for depth := 0; depth < maxDepth && curID != ""; depth++ {
 		prev, err := r.mgr.store.GetMessageByPlatformID(ctx, r.ch, curID)
-		if (err != nil || prev == nil) && r.mgr.tr != nil {
-			gctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		// Only fall back to remote OneBot GetMessage on depth 0 (needed to detect RepliedToBot
+		// on pre-restart messages) with a tight 1.5s cap so deep quote chains never stall Room.run().
+		if depth == 0 && (err != nil || prev == nil) && r.mgr.tr != nil {
+			gctx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 			prev, err = r.mgr.tr.GetMessage(gctx, r.ch, curID)
 			cancel()
 		}
@@ -1206,119 +1414,140 @@ func (r *Room) runPerception(msg *model.Message, cfg *config.Config) perceptionR
 	ctx, cancel := context.WithTimeout(r.mgr.shutdownCtx, 20*time.Second)
 	defer cancel()
 
-	changed := false
-	maxImageKB := 0
 	retention := time.Duration(cfg.Frame.MediaRetentionHours) * time.Hour
 
+	var (
+		changedFlag atomic.Bool
+		maxImgKB    atomic.Int64
+		linkResults []*parser.Result
+	)
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(4)
+
 	for i := range msg.Parts {
-		p := &msg.Parts[i]
-		switch p.Kind {
+		idx := i
+		switch msg.Parts[idx].Kind {
 		case model.PartImage:
-			if p.SHA256 != "" {
+			if msg.Parts[idx].SHA256 != "" {
 				continue
 			}
-			var raw []byte
-			var err error
-			if strings.HasPrefix(p.URL, "http://") || strings.HasPrefix(p.URL, "https://") {
-				imgHeaders := map[string]string{
-					"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-				}
-				var code int
-				for attempt := 0; attempt < 2; attempt++ {
-					raw, _, code, err = netutil.FetchLimited(ctx, r.mgr.httpClient(), p.URL, int64(cfg.Frame.MaxImageMiB)<<20, imgHeaders)
-					if err == nil && code < 400 && len(raw) > 0 {
-						break
+			g.Go(func() error {
+				p := &msg.Parts[idx]
+				var raw []byte
+				var err error
+				if strings.HasPrefix(p.URL, "http://") || strings.HasPrefix(p.URL, "https://") {
+					imgHeaders := map[string]string{
+						"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 					}
-					raw = nil
-					if attempt == 0 && ctx.Err() == nil {
-						select {
-						case <-time.After(300 * time.Millisecond):
-						case <-ctx.Done():
+					var code int
+					for attempt := 0; attempt < 2; attempt++ {
+						raw, _, code, err = netutil.FetchLimited(gctx, r.mgr.httpClient(), p.URL, int64(cfg.Frame.MaxImageMiB)<<20, imgHeaders)
+						if err == nil && code < 400 && len(raw) > 0 {
+							break
 						}
+						raw = nil
+						if attempt == 0 && gctx.Err() == nil {
+							select {
+							case <-time.After(300 * time.Millisecond):
+							case <-gctx.Done():
+							}
+						}
+					}
+					if len(raw) == 0 {
+						r.mgr.log.Warn("image perception fetch failed", "channel", r.ch, "status", code, "err", err)
+					}
+				}
+				// Fallback to NapCat local file path when configured locally.
+				if len(raw) == 0 && p.FileID != "" && filepath.IsAbs(p.FileID) {
+					if data, rerr := os.ReadFile(p.FileID); rerr == nil && int64(len(data)) <= int64(cfg.Frame.MaxImageMiB)<<20 {
+						raw = data
 					}
 				}
 				if len(raw) == 0 {
-					r.mgr.log.Warn("image perception fetch failed", "channel", r.ch, "status", code, "err", err)
+					return nil
 				}
-			}
-			// Fallback to NapCat local file path when configured locally.
-			if len(raw) == 0 && p.FileID != "" && filepath.IsAbs(p.FileID) {
-				if data, rerr := os.ReadFile(p.FileID); rerr == nil && int64(len(data)) <= int64(cfg.Frame.MaxImageMiB)<<20 {
-					raw = data
+				kb := int64(len(raw) / 1024)
+				for {
+					cur := maxImgKB.Load()
+					if kb <= cur || maxImgKB.CompareAndSwap(cur, kb) {
+						break
+					}
 				}
-			}
-			if len(raw) == 0 {
-				continue
-			}
-			kb := len(raw) / 1024
-			if kb > maxImageKB {
-				maxImageKB = kb
-			}
-			blob, err := r.mgr.store.Blobs().PutImage(raw)
-			if err != nil {
-				continue
-			}
-			asset, err := r.mgr.store.RegisterMediaAsset(ctx, r.ch, msg.SenderID, blob, retention)
-			if err != nil {
-				continue
-			}
-			p.MediaID = asset.MediaID
-			p.SHA256 = asset.SHA256
-			p.MimeType = asset.MimeType
-			p.Width = asset.Width
-			p.Height = asset.Height
-			changed = true
+				blob, err := r.mgr.store.Blobs().PutImage(raw)
+				if err != nil {
+					return nil
+				}
+				asset, err := r.mgr.store.RegisterMediaAsset(gctx, r.ch, msg.SenderID, blob, retention)
+				if err != nil {
+					return nil
+				}
+				p.MediaID = asset.MediaID
+				p.SHA256 = asset.SHA256
+				p.MimeType = asset.MimeType
+				p.Width = asset.Width
+				p.Height = asset.Height
+				changedFlag.Store(true)
 
-			// Optional auto-collect candidate sticker when enabled and policy expr passes (SPEC §5.2).
-			if cfg.Sticker.AutoCollect && r.mgr.policy != nil {
-				nowLocal := time.Now().In(cfg.Location())
-				hour := nowLocal.Hour()
-				if ok, perr := r.mgr.policy.EvalAutoCollectSticker(r.ch, policy.PolicyEnv{
-					IsGroup: r.ch.IsGroup(),
-					FromBot: msg.FromBot,
-					IsAdmin: cfg.IsAdmin(msg.SenderID),
-					IsNight: hour < 7 || hour >= 23,
-					Hour:    hour,
-					ImageKB: kb,
-					Rand:    rand.Float64(),
-				}); perr == nil && ok {
-					r.autoCollectSticker(ctx, cfg, raw, blob.Ext)
+				// Optional auto-collect candidate sticker when enabled and policy expr passes (SPEC §5.2).
+				if cfg.Sticker.AutoCollect && r.mgr.policy != nil {
+					nowLocal := time.Now().In(cfg.Location())
+					hour := nowLocal.Hour()
+					if ok, perr := r.mgr.policy.EvalAutoCollectSticker(r.ch, policy.PolicyEnv{
+						IsGroup: r.ch.IsGroup(),
+						FromBot: msg.FromBot,
+						IsAdmin: cfg.IsAdmin(msg.SenderID),
+						IsNight: hour < 7 || hour >= 23,
+						Hour:    hour,
+						ImageKB: int(kb),
+						Rand:    rand.Float64(),
+					}); perr == nil && ok {
+						r.autoCollectSticker(gctx, cfg, raw, blob.Ext)
+					}
 				}
-			}
+				return nil
+			})
 
 		case model.PartAudio:
-			if p.Transcript != "" || p.FileID == "" || r.mgr.tr == nil {
+			if msg.Parts[idx].Transcript != "" || msg.Parts[idx].FileID == "" || r.mgr.tr == nil {
 				continue
 			}
-			audioBytes, fname, err := r.mgr.tr.FetchAudio(ctx, p.FileID, "wav")
-			if err != nil {
-				p.ASRStatus = "failed"
-				changed = true
-				continue
-			}
-			text, err := r.mgr.hub.Transcribe(ctx, fname, audioBytes)
-			if err != nil {
-				p.ASRStatus = "failed"
-				changed = true
-				continue
-			}
-			p.Transcript = text
-			p.ASRStatus = "ok"
-			changed = true
+			g.Go(func() error {
+				p := &msg.Parts[idx]
+				audioBytes, fname, err := r.mgr.tr.FetchAudio(gctx, p.FileID, "wav")
+				if err != nil {
+					p.ASRStatus = "failed"
+					changedFlag.Store(true)
+					return nil
+				}
+				text, err := r.mgr.hub.Transcribe(gctx, fname, audioBytes)
+				if err != nil {
+					p.ASRStatus = "failed"
+					changedFlag.Store(true)
+					return nil
+				}
+				p.Transcript = text
+				p.ASRStatus = "ok"
+				changedFlag.Store(true)
+				return nil
+			})
 
 		case model.PartForward:
-			if len(p.Nodes) > 0 || p.FileID == "" || r.mgr.tr == nil {
+			if len(msg.Parts[idx].Nodes) > 0 || msg.Parts[idx].FileID == "" || r.mgr.tr == nil {
 				continue
 			}
-			if nodes, ferr := r.mgr.tr.GetForward(ctx, p.FileID, 20); ferr == nil && len(nodes) > 0 {
-				p.Nodes = nodes
-				changed = true
-			}
+			g.Go(func() error {
+				p := &msg.Parts[idx]
+				if nodes, ferr := r.mgr.tr.GetForward(gctx, p.FileID, 20); ferr == nil && len(nodes) > 0 {
+					p.Nodes = nodes
+					changedFlag.Store(true)
+				}
+				return nil
+			})
 		}
 	}
 
-	// Proactive link parsing (Tier-1 extractors + generic web pages) with bounded timeout & shared cache.
-	var parsedLinks []parsedLinkItem
+	// Run proactive link parsing concurrently alongside media/ASR/forward perception.
 	if r.mgr.parser != nil && cfg.LinkParser.Enabled && !linkChannelDisabled(cfg.LinkParser.DisabledChannels, r.ch) {
 		alreadyHasLink := false
 		for _, p := range msg.Parts {
@@ -1328,44 +1557,55 @@ func (r *Room) runPerception(msg *model.Message, cfg *config.Config) perceptionR
 			}
 		}
 		if !alreadyHasLink {
-			lTimeout := time.Duration(cfg.LinkParser.TimeoutSec) * time.Second
-			if lTimeout <= 0 {
-				lTimeout = 12 * time.Second
-			}
-			lCtx, lCancel := context.WithTimeout(ctx, lTimeout)
-			results := r.mgr.parser.ParseMessageLinks(lCtx, msg, cfg.LinkParser.MaxURLsPerMsg)
-			lCancel()
-			hasRichCard := false
-			for _, p := range msg.Parts {
-				if p.Kind == model.PartCard && strings.TrimSpace(p.Title) != "" {
-					hasRichCard = true
-					break
+			msgForLinks := cloneMessage(*msg)
+			g.Go(func() error {
+				lTimeout := time.Duration(cfg.LinkParser.TimeoutSec) * time.Second
+				if lTimeout <= 0 {
+					lTimeout = 12 * time.Second
 				}
+				lCtx, lCancel := context.WithTimeout(gctx, lTimeout)
+				defer lCancel()
+				linkResults = r.mgr.parser.ParseMessageLinks(lCtx, &msgForLinks, cfg.LinkParser.MaxURLsPerMsg)
+				return nil
+			})
+		}
+	}
+
+	_ = g.Wait()
+
+	changed := changedFlag.Load()
+	var parsedLinks []parsedLinkItem
+	if len(linkResults) > 0 {
+		hasRichCard := false
+		for _, p := range msg.Parts {
+			if p.Kind == model.PartCard && strings.TrimSpace(p.Title) != "" {
+				hasRichCard = true
+				break
 			}
-			for _, res := range results {
-				compact := res.CompactForContext(450)
-				if compact == "" {
-					continue
-				}
-				// Skip redundant low-info generic preview when the QQ share card already carries title/summary.
-				isRedundantGeneric := res.Platform == "generic" && hasRichCard &&
-					strings.TrimSpace(res.Summary) == "" && strings.TrimSpace(res.Author) == "" && strings.TrimSpace(res.Stats) == ""
-				if isRedundantGeneric {
-					continue
-				}
-				msg.Parts = append(msg.Parts, model.Part{
-					Kind:    model.PartLink,
-					URL:     res.CanonicalURL,
-					Title:   res.Title,
-					Summary: res.Summary,
-					Text:    compact,
-				})
-				parsedLinks = append(parsedLinks, parsedLinkItem{
-					canonicalURL: res.CanonicalURL,
-					previewText:  res.FormatForGroupText(),
-				})
-				changed = true
+		}
+		for _, res := range linkResults {
+			compact := res.CompactForContext(450)
+			if compact == "" {
+				continue
 			}
+			// Skip redundant low-info generic preview when the QQ share card already carries title/summary.
+			isRedundantGeneric := res.Platform == "generic" && hasRichCard &&
+				strings.TrimSpace(res.Summary) == "" && strings.TrimSpace(res.Author) == "" && strings.TrimSpace(res.Stats) == ""
+			if isRedundantGeneric {
+				continue
+			}
+			msg.Parts = append(msg.Parts, model.Part{
+				Kind:    model.PartLink,
+				URL:     res.CanonicalURL,
+				Title:   res.Title,
+				Summary: res.Summary,
+				Text:    compact,
+			})
+			parsedLinks = append(parsedLinks, parsedLinkItem{
+				canonicalURL: res.CanonicalURL,
+				previewText:  res.FormatForGroupText(),
+			})
+			changed = true
 		}
 	}
 
@@ -1373,7 +1613,7 @@ func (r *Room) runPerception(msg *model.Message, cfg *config.Config) perceptionR
 		_ = r.mgr.store.PatchMessageParts(ctx, msg)
 	}
 	partsOut := append([]model.Part(nil), msg.Parts...)
-	return perceptionResult{parts: partsOut, changed: changed, imageKB: maxImageKB, parsedLinks: parsedLinks}
+	return perceptionResult{parts: partsOut, changed: changed, imageKB: int(maxImgKB.Load()), parsedLinks: parsedLinks}
 }
 
 func (r *Room) collectFreshLinks(items []parsedLinkItem, now time.Time, ttl time.Duration) []parsedLinkItem {
@@ -1474,31 +1714,50 @@ func (r *Room) tryPlusOne(ctx context.Context, msg *model.Message, cfg *config.C
 	r.plusOneUsers = make(map[string]struct{})
 	if roll < cfg.Policy.PlusOne.RepeatProb {
 		r.lastPlusOne = time.Now()
-		if r.mgr.tr != nil && r.outboundRemaining(time.Now(), cfg.Policy.MaxMsgsPerMin) >= 2 {
-			pid, err := r.mgr.tr.SendText(ctx, r.ch, txt, transport.SendOptions{})
-			if errors.Is(err, transport.ErrRiskMuted) {
-				r.engageMute(ctx, cfg)
-			} else if err == nil {
-				r.recordOutbound(time.Now())
-				botMsg := model.Message{
-					ChannelID:     r.ch,
-					PlatformMsgID: pid,
-					SenderID:      r.mgr.tr.SelfID(),
-					SenderName:    r.botDisplayName(cfg),
-					FromBot:       true,
-					Parts:         []model.Part{{Kind: model.PartText, Text: txt}},
-					CreatedAt:     time.Now(),
-				}
-				_ = r.mgr.store.AppendMessage(ctx, &botMsg)
-				// Keep the bot's own +1 echo visible in pendingMsgs so the next LLM turn remembers joining the chain.
-				r.pendingMsgs = append(r.pendingMsgs, cloneMessage(*msg), botMsg)
-				if len(r.pendingMsgs) > 60 {
-					r.pendingMsgs = r.pendingMsgs[len(r.pendingMsgs)-60:]
-				}
-				return plusOneEcho
-			}
-		}
 		r.pendingMsgs = append(r.pendingMsgs, cloneMessage(*msg))
+		if r.mgr.tr != nil && r.outboundRemaining(time.Now(), cfg.Policy.MaxMsgsPerMin) >= 2 {
+			expEpoch := r.epoch.Load()
+			botName := r.botDisplayName(cfg)
+			echoText := txt
+			r.pendingMsgs = append(r.pendingMsgs, model.Message{
+				ChannelID:  r.ch,
+				SenderID:   r.mgr.tr.SelfID(),
+				SenderName: botName,
+				FromBot:    true,
+				Parts:      []model.Part{{Kind: model.PartText, Text: echoText}},
+				CreatedAt:  time.Now(),
+			})
+			r.mgr.wg.Add(1)
+			go func() {
+				defer r.mgr.wg.Done()
+				if r.epoch.Load() != expEpoch || r.isMuted(time.Now()) {
+					return
+				}
+				sctx, cancel := context.WithTimeout(r.mgr.shutdownCtx, 5*time.Second)
+				defer cancel()
+				pid, err := r.mgr.tr.SendText(sctx, r.ch, echoText, transport.SendOptions{})
+				if errors.Is(err, transport.ErrRiskMuted) {
+					r.engageMute(r.mgr.shutdownCtx, cfg)
+					return
+				}
+				if err == nil {
+					r.recordOutbound(time.Now())
+					botMsg := model.Message{
+						ChannelID:     r.ch,
+						PlatformMsgID: pid,
+						SenderID:      r.mgr.tr.SelfID(),
+						SenderName:    botName,
+						FromBot:       true,
+						Parts:         []model.Part{{Kind: model.PartText, Text: echoText}},
+						CreatedAt:     time.Now(),
+					}
+					_ = r.mgr.store.AppendMessage(r.mgr.shutdownCtx, &botMsg)
+				}
+			}()
+		}
+		if len(r.pendingMsgs) > 60 {
+			r.pendingMsgs = r.pendingMsgs[len(r.pendingMsgs)-60:]
+		}
 		return plusOneEcho
 	}
 	if cfg.Policy.PlusOne.BreakProb > 0 && roll < cfg.Policy.PlusOne.RepeatProb+cfg.Policy.PlusOne.BreakProb {

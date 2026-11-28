@@ -90,8 +90,11 @@ type NoteTool struct {
 }
 
 func NewNoteTool(st *store.Store) *NoteTool { return &NoteTool{store: st} }
-func (t *NoteTool) Name() string            { return "note" }
-func (t *NoteTool) ReadOnly() bool          { return false }
+func (t *NoteTool) Name() string   { return "note" }
+func (t *NoteTool) ReadOnly() bool { return false }
+func (t *NoteTool) ReadOnlyArgs(args NoteArgs) bool {
+	return strings.ToLower(strings.TrimSpace(args.Action)) == "list"
+}
 func (t *NoteTool) Description() string {
 	return "Save, list, or delete explicit channel-scoped facts and pinned notes (max 50 per channel)."
 }
@@ -181,6 +184,9 @@ func NewScheduleTool(sc *cron.Scheduler, st *store.Store) *ScheduleTool {
 
 func (t *ScheduleTool) Name() string   { return "schedule" }
 func (t *ScheduleTool) ReadOnly() bool { return false }
+func (t *ScheduleTool) ReadOnlyArgs(args ScheduleArgs) bool {
+	return strings.ToLower(strings.TrimSpace(args.Action)) == "list"
+}
 func (t *ScheduleTool) Description() string {
 	return "Create, list, or cancel channel-scoped one-shot/cron reminders (with optional CN/HK/US trading-day filter) and zero-LLM market price/change alerts."
 }

@@ -29,11 +29,26 @@ type Service struct {
 	log   *slog.Logger
 	dim   int
 
-	mu          sync.RWMutex
-	epIndex     *vec.FlatF16Index // key: "ep:<id>"
-	epChannels  map[string]model.ChannelID
-	ignoredBots map[string]struct{}
-	profileMu   sync.Mutex // Serializes L2 profile read-modify-write across concurrent distill workers
+	mu            sync.RWMutex
+	epIndex       *vec.FlatF16Index // key: "ep:<id>"
+	epChannels    map[string]model.ChannelID
+	ignoredBots   map[string]struct{}
+	profileShards [64]sync.Mutex // Striped per-(channel,member) locks for L2 profile RMW
+}
+
+func (s *Service) profileLock(ch model.ChannelID, memberID string) *sync.Mutex {
+	var h uint64 = 14695981039346656037
+	for i := 0; i < len(ch); i++ {
+		h ^= uint64(ch[i])
+		h *= 1099511628211
+	}
+	h ^= 0xff
+	h *= 1099511628211
+	for i := 0; i < len(memberID); i++ {
+		h ^= uint64(memberID[i])
+		h *= 1099511628211
+	}
+	return &s.profileShards[h%uint64(len(s.profileShards))]
 }
 
 func NewService(st *store.Store, hub *infer.Hub, dim int, logger *slog.Logger) *Service {
@@ -77,24 +92,27 @@ func (s *Service) ignoredBotsCopy() map[string]bool {
 	return out
 }
 
-// LoadIndex loads resident float16 episode vectors from SQLite into RAM.
+// LoadIndex loads resident float16 episode vectors from SQLite into RAM outside the write lock,
+// swapping pointers in O(1) so concurrent Recall queries never stall during hourly reloads.
 func (s *Service) LoadIndex(ctx context.Context) (int, error) {
 	eps, blobs, err := s.store.AllEpisodesWithEmbeds(ctx)
 	if err != nil {
 		return 0, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.epIndex = vec.NewFlatF16Index(s.dim, 0.0)
-	s.epChannels = make(map[string]model.ChannelID, len(eps))
+	newIdx := vec.NewFlatF16Index(s.dim, 0.0)
+	newCh := make(map[string]model.ChannelID, len(eps))
 	loaded := 0
 	for i, ep := range eps {
 		key := episodeKey(ep.ID)
-		s.epChannels[key] = ep.ChannelID
-		if len(blobs[i]) == s.dim*2 && s.epIndex.UpsertPreencoded(key, blobs[i]) {
+		newCh[key] = ep.ChannelID
+		if len(blobs[i]) == s.dim*2 && newIdx.UpsertPreencoded(key, blobs[i]) {
 			loaded++
 		}
 	}
+	s.mu.Lock()
+	s.epIndex = newIdx
+	s.epChannels = newCh
+	s.mu.Unlock()
 	return loaded, nil
 }
 
@@ -114,7 +132,42 @@ func (s *Service) BuildSnapshotWithTime(ctx context.Context, ch model.ChannelID,
 	}
 	localNow := now.In(loc)
 
-	rawLore, _ := s.store.ListLore(ctx, ch, 30)
+	var (
+		rawLore  []model.LoreEntry
+		notes    []model.Note
+		names    map[string]string
+		profiles []model.MemberProfile
+		recentEp []model.Episode
+		digests  []model.DailyDigest
+	)
+	var wg sync.WaitGroup
+	wg.Add(5)
+	go func() {
+		defer wg.Done()
+		rawLore, _ = s.store.ListLore(ctx, ch, 30)
+	}()
+	go func() {
+		defer wg.Done()
+		notes, _ = s.store.ListNotes(ctx, ch, true)
+	}()
+	go func() {
+		defer wg.Done()
+		names, _ = s.store.GetMemberNames(ctx, ch)
+	}()
+	go func() {
+		defer wg.Done()
+		profiles, _ = s.store.ListProfiles(ctx, ch, 30)
+	}()
+	go func() {
+		defer wg.Done()
+		if eps, err := s.store.RecentEpisodesSince(ctx, ch, now.Add(-48*time.Hour), 3); err == nil && len(eps) > 0 {
+			recentEp = eps
+		} else if ds, err := s.store.ListDailyDigests(ctx, ch, 1); err == nil {
+			digests = ds
+		}
+	}()
+	wg.Wait()
+
 	var lore, fallbackLore []model.LoreEntry
 	for _, l := range rawLore {
 		if l.Confidence >= 0.55 {
@@ -134,8 +187,6 @@ func (s *Service) BuildSnapshotWithTime(ctx context.Context, ch model.ChannelID,
 	if len(lore) > 15 {
 		lore = lore[:15]
 	}
-	notes, _ := s.store.ListNotes(ctx, ch, true)
-	names, _ := s.store.GetMemberNames(ctx, ch)
 
 	ignored := s.ignoredBotsCopy()
 	memberSet := make(map[string]struct{}, len(activeMemberIDs))
@@ -144,7 +195,6 @@ func (s *Service) BuildSnapshotWithTime(ctx context.Context, ch model.ChannelID,
 			memberSet[id] = struct{}{}
 		}
 	}
-	profiles, _ := s.store.ListProfiles(ctx, ch, 30)
 	actIDs := make([]string, 0, len(profiles))
 	for _, p := range profiles {
 		if ignored[p.MemberID] {
@@ -174,12 +224,12 @@ func (s *Service) BuildSnapshotWithTime(ctx context.Context, ch model.ChannelID,
 	}
 
 	var highlights []string
-	if eps, err := s.store.RecentEpisodesSince(ctx, ch, now.Add(-48*time.Hour), 3); err == nil && len(eps) > 0 {
-		for _, ep := range eps {
+	if len(recentEp) > 0 {
+		for _, ep := range recentEp {
 			ts := ep.EndTS.In(loc).Format("01-02 15:04")
 			highlights = append(highlights, fmt.Sprintf("- [%s] %s: %s", ts, ep.Topic, truncateText(ep.Summary, 90)))
 		}
-	} else if digests, err := s.store.ListDailyDigests(ctx, ch, 1); err == nil && len(digests) > 0 {
+	} else if len(digests) > 0 {
 		d := digests[0]
 		if now.Sub(d.CreatedAt) <= 72*time.Hour && strings.TrimSpace(d.Report) != "" {
 			highlights = append(highlights, fmt.Sprintf("- [%s 群日报] %s", d.DayKey, truncateText(d.Report, 140)))
@@ -365,10 +415,71 @@ func (s *Service) Recall(ctx context.Context, opts RecallOptions) (RecallResult,
 }
 
 func (s *Service) recallHybridMemory(ctx context.Context, opts RecallOptions) (RecallResult, error) {
+	// Run all independent retrieval legs (FTS5, Embed+Vec, Profiles, Lore, Notes, Digests) in parallel.
+	var (
+		ftsEps       []model.Episode
+		vecHits      []vec.Hit
+		profileLines []string
+		lore         []model.LoreEntry
+		notes        []model.Note
+		digests      []model.DailyDigest
+	)
+
+	s.mu.RLock()
+	hasEpVecs := s.epIndex.Len() > 0
+	s.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	wg.Add(4)
+	go func() {
+		defer wg.Done()
+		ftsEps, _ = s.store.SearchEpisodesFTS(ctx, opts.ChannelID, opts.Query, 20)
+	}()
+	go func() {
+		defer wg.Done()
+		lore, _ = s.store.ListLore(ctx, opts.ChannelID, 10)
+	}()
+	go func() {
+		defer wg.Done()
+		notes, _ = s.store.ListNotes(ctx, opts.ChannelID, false)
+	}()
+	go func() {
+		defer wg.Done()
+		digests, _ = s.store.ListDailyDigests(ctx, opts.ChannelID, 3)
+	}()
+	if s.hub != nil && strings.TrimSpace(opts.Query) != "" && hasEpVecs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if embs, err := s.hub.Embed(ctx, []string{opts.Query}); err == nil && len(embs) == 1 && len(embs[0]) == s.dim {
+				s.mu.RLock()
+				vecHits = s.epIndex.Search(embs[0], 20, func(id string) bool {
+					return s.epChannels[id] == opts.ChannelID
+				})
+				s.mu.RUnlock()
+			}
+		}()
+	}
+	if strings.TrimSpace(opts.Sender) != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ids, _ := s.store.ResolveMembersByAlias(ctx, opts.ChannelID, opts.Sender)
+			names, _ := s.store.GetMemberNames(ctx, opts.ChannelID)
+			for _, id := range ids {
+				if p, err := s.store.GetProfile(ctx, opts.ChannelID, id); err == nil && p != nil {
+					if card := FormatMemberCard(*p, names[id]); card != "" {
+						profileLines = append(profileLines, card)
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
 	var sections []string
 
-	// 1. Episode hybrid recall: FTS5 + Vector -> RRF -> optional Rerank.
-	ftsEps, _ := s.store.SearchEpisodesFTS(ctx, opts.ChannelID, opts.Query, 20)
+	// 1. Episode hybrid recall: FTS5 + Vector -> RRF -> batch hydrate -> optional Rerank.
 	ftsHits := make([]vec.Hit, 0, len(ftsEps))
 	epMap := make(map[string]model.Episode, len(ftsEps))
 	for i, ep := range ftsEps {
@@ -377,33 +488,27 @@ func (s *Service) recallHybridMemory(ctx context.Context, opts RecallOptions) (R
 		ftsHits = append(ftsHits, vec.Hit{ID: k, Score: float32(20 - i)})
 	}
 
-	var vecHits []vec.Hit
-	s.mu.RLock()
-	hasEpVecs := s.epIndex.Len() > 0
-	s.mu.RUnlock()
-	if s.hub != nil && strings.TrimSpace(opts.Query) != "" && hasEpVecs {
-		if embs, err := s.hub.Embed(ctx, []string{opts.Query}); err == nil && len(embs) == 1 && len(embs[0]) == s.dim {
-			s.mu.RLock()
-			vecHits = s.epIndex.Search(embs[0], 20, func(id string) bool {
-				return s.epChannels[id] == opts.ChannelID
-			})
-			s.mu.RUnlock()
+	fused := vec.WeightedRRF([][]vec.Hit{ftsHits, vecHits}, []float32{1.0, 1.0}, 60, 15)
+	var missingIDs []int64
+	for _, h := range fused {
+		if _, ok := epMap[h.ID]; !ok {
+			if id, err := parseEpisodeKey(h.ID); err == nil {
+				missingIDs = append(missingIDs, id)
+			}
+		}
+	}
+	if len(missingIDs) > 0 {
+		if fetched, err := s.store.GetEpisodesByIDs(ctx, opts.ChannelID, missingIDs); err == nil {
+			for id, ep := range fetched {
+				epMap[episodeKey(id)] = ep
+			}
 		}
 	}
 
-	fused := vec.WeightedRRF([][]vec.Hit{ftsHits, vecHits}, []float32{1.0, 1.0}, 60, 15)
 	candidates := make([]model.Episode, 0, len(fused))
 	for _, h := range fused {
-		var ep *model.Episode
-		if e, ok := epMap[h.ID]; ok {
-			epCopy := e
-			ep = &epCopy
-		} else if id, err := parseEpisodeKey(h.ID); err == nil {
-			if e, err := s.store.GetEpisodeByID(ctx, id); err == nil && e.ChannelID == opts.ChannelID {
-				ep = e
-			}
-		}
-		if ep == nil {
+		ep, ok := epMap[h.ID]
+		if !ok {
 			continue
 		}
 		if opts.SinceMs > 0 && ep.EndTS.UnixMilli() < opts.SinceMs {
@@ -412,7 +517,7 @@ func (s *Service) recallHybridMemory(ctx context.Context, opts RecallOptions) (R
 		if opts.UntilMs > 0 && ep.StartTS.UnixMilli() > opts.UntilMs {
 			continue
 		}
-		candidates = append(candidates, *ep)
+		candidates = append(candidates, ep)
 	}
 
 	// Optional precision rerank (gracefully skipped if rerank circuit is open).
@@ -444,25 +549,13 @@ func (s *Service) recallHybridMemory(ctx context.Context, opts RecallOptions) (R
 		sections = append(sections, "[Episodes]\n"+strings.Join(lines, "\n"))
 	}
 
-	// 2. Relevant L2 Profiles (filter by sender if supplied).
-	if strings.TrimSpace(opts.Sender) != "" {
-		ids, _ := s.store.ResolveMembersByAlias(ctx, opts.ChannelID, opts.Sender)
-		names, _ := s.store.GetMemberNames(ctx, opts.ChannelID)
-		var lines []string
-		for _, id := range ids {
-			if p, err := s.store.GetProfile(ctx, opts.ChannelID, id); err == nil && p != nil {
-				if card := FormatMemberCard(*p, names[id]); card != "" {
-					lines = append(lines, card)
-				}
-			}
-		}
-		if len(lines) > 0 {
-			sections = append(sections, "[Member Profiles]\n"+strings.Join(lines, "\n"))
-		}
+	// 2. Relevant L2 Profiles (pre-fetched in parallel).
+	if len(profileLines) > 0 {
+		sections = append(sections, "[Member Profiles]\n"+strings.Join(profileLines, "\n"))
 	}
 
-	// 3. Lore & Pinned Notes & Recent Digests.
-	if lore, err := s.store.ListLore(ctx, opts.ChannelID, 10); err == nil && len(lore) > 0 {
+	// 3. Lore & Pinned Notes & Recent Digests (pre-fetched in parallel).
+	if len(lore) > 0 {
 		var lines []string
 		qLow := strings.ToLower(opts.Query)
 		for _, l := range lore {
@@ -475,7 +568,7 @@ func (s *Service) recallHybridMemory(ctx context.Context, opts RecallOptions) (R
 		}
 	}
 
-	if notes, err := s.store.ListNotes(ctx, opts.ChannelID, false); err == nil && len(notes) > 0 {
+	if len(notes) > 0 {
 		var lines []string
 		for _, n := range notes {
 			lines = append(lines, fmt.Sprintf("- %s: %s", n.Key, n.Content))
@@ -483,7 +576,7 @@ func (s *Service) recallHybridMemory(ctx context.Context, opts RecallOptions) (R
 		sections = append(sections, "[Notes]\n"+strings.Join(lines, "\n"))
 	}
 
-	if digests, err := s.store.ListDailyDigests(ctx, opts.ChannelID, 3); err == nil && len(digests) > 0 {
+	if len(digests) > 0 {
 		var lines []string
 		for _, d := range digests {
 			lines = append(lines, fmt.Sprintf("- [%s] %s", d.DayKey, truncateText(d.Report, 200)))
@@ -875,47 +968,79 @@ Rules:
 
 // MergeCandidateFact enforces SPEC 8 anti-sarcasm corroboration:
 // a fact from a single episode remains tentative until corroborated by >=2 distinct episodes.
+// Uses per-(channel, member) striped locks and executes any network Embed lookup OUTSIDE the lock
+// so concurrent distill workers never serialize behind a global mutex.
 func (s *Service) MergeCandidateFact(ctx context.Context, ch model.ChannelID, memberID, factText string, episodeID int64, serious bool) error {
-	s.profileMu.Lock()
-	defer s.profileMu.Unlock()
+	lk := s.profileLock(ch, memberID)
+	trimmed := strings.TrimSpace(factText)
+	norm := strings.ToLower(trimmed)
 
+	findLexical := func(facts []model.ProfileFact) int {
+		for i := range facts {
+			existing := strings.ToLower(strings.TrimSpace(facts[i].Text))
+			if existing == norm || strings.Contains(existing, norm) || strings.Contains(norm, existing) || factBigramDice(existing, norm) >= 0.45 {
+				return i
+			}
+		}
+		return -1
+	}
+
+	// Phase 1: check under shard lock; only unlock if semantic embedding is needed.
+	lk.Lock()
 	p, err := s.store.GetProfile(ctx, ch, memberID)
 	if err != nil {
+		lk.Unlock()
 		return err
 	}
-	norm := strings.ToLower(strings.TrimSpace(factText))
-	now := time.Now().UnixMilli()
-	matchIdx := -1
-	for i := range p.Facts {
-		existing := strings.ToLower(strings.TrimSpace(p.Facts[i].Text))
-		if existing == norm || strings.Contains(existing, norm) || strings.Contains(norm, existing) || factBigramDice(existing, norm) >= 0.45 {
-			matchIdx = i
-			break
-		}
-	}
+	matchIdx := findLexical(p.Facts)
+	var semanticMatchedText string
 	if matchIdx < 0 && s.hub != nil && len(p.Facts) > 0 {
-		texts := make([]string, 0, len(p.Facts)+1)
-		texts = append(texts, strings.TrimSpace(factText))
-		for _, f := range p.Facts {
-			texts = append(texts, strings.TrimSpace(f.Text))
+		snapTexts := make([]string, len(p.Facts))
+		for i, f := range p.Facts {
+			snapTexts[i] = strings.TrimSpace(f.Text)
 		}
+		lk.Unlock()
+
+		// Run remote embedding completely lock-free.
+		texts := make([]string, 0, len(snapTexts)+1)
+		texts = append(texts, trimmed)
+		texts = append(texts, snapTexts...)
 		embCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		embs, eerr := s.hub.Embed(embCtx, texts)
 		cancel()
 		if eerr == nil && len(embs) == len(texts) {
 			bestSim := 0.0
-			for i := range p.Facts {
+			for i, txt := range snapTexts {
 				if sim := cosineSim(embs[0], embs[i+1]); sim > bestSim {
 					bestSim = sim
 					if sim >= 0.78 {
-						matchIdx = i
+						semanticMatchedText = txt
 					}
 				}
 			}
 		}
+
+		// Re-acquire shard lock and re-read fresh profile to preserve strict RMW consistency.
+		lk.Lock()
+		p, err = s.store.GetProfile(ctx, ch, memberID)
+		if err != nil {
+			lk.Unlock()
+			return err
+		}
+		matchIdx = findLexical(p.Facts)
+		if matchIdx < 0 && semanticMatchedText != "" {
+			for i := range p.Facts {
+				if strings.TrimSpace(p.Facts[i].Text) == semanticMatchedText {
+					matchIdx = i
+					break
+				}
+			}
+		}
 	}
-	matched := matchIdx >= 0
-	if matched {
+	defer lk.Unlock()
+
+	now := time.Now().UnixMilli()
+	if matchIdx >= 0 {
 		if !containsInt64(p.Facts[matchIdx].EvidenceEpisodes, episodeID) {
 			p.Facts[matchIdx].EvidenceEpisodes = append(p.Facts[matchIdx].EvidenceEpisodes, episodeID)
 		}
@@ -924,14 +1049,13 @@ func (s *Service) MergeCandidateFact(ctx context.Context, ch model.ChannelID, me
 			p.Facts[matchIdx].Confidence = minFloat(0.95, 0.55+0.15*float64(len(p.Facts[matchIdx].EvidenceEpisodes)))
 		}
 		p.Facts[matchIdx].UpdatedAt = now
-	}
-	if !matched {
+	} else {
 		conf := 0.35
 		if serious {
 			conf = 0.45
 		}
 		p.Facts = append(p.Facts, model.ProfileFact{
-			Text:             strings.TrimSpace(factText),
+			Text:             trimmed,
 			Confidence:       conf,
 			EvidenceEpisodes: []int64{episodeID},
 			Tentative:        true, // Requires >=2 distinct episodes to graduate!
@@ -1037,8 +1161,9 @@ func (s *Service) ReloadIndex(ctx context.Context) (int, error) {
 }
 
 func (s *Service) AddProfileJoke(ctx context.Context, ch model.ChannelID, memberID, jokeText string, episodeID int64) error {
-	s.profileMu.Lock()
-	defer s.profileMu.Unlock()
+	lk := s.profileLock(ch, memberID)
+	lk.Lock()
+	defer lk.Unlock()
 
 	p, err := s.store.GetProfile(ctx, ch, memberID)
 	if err != nil {
@@ -1057,8 +1182,9 @@ func (s *Service) AddProfileJoke(ctx context.Context, ch model.ChannelID, member
 
 // UpdateProfileStyle updates the concise interaction vibe note for a channel member.
 func (s *Service) UpdateProfileStyle(ctx context.Context, ch model.ChannelID, memberID, style string) error {
-	s.profileMu.Lock()
-	defer s.profileMu.Unlock()
+	lk := s.profileLock(ch, memberID)
+	lk.Lock()
+	defer lk.Unlock()
 
 	p, err := s.store.GetProfile(ctx, ch, memberID)
 	if err != nil {

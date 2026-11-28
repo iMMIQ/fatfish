@@ -13,6 +13,7 @@ import (
 	"time"
 
 	robfigcron "github.com/robfig/cron/v3"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/iMMIQ/fatfish/internal/infer"
 	"github.com/iMMIQ/fatfish/internal/model"
@@ -355,23 +356,30 @@ func (s *Scheduler) RunIncrementalDistill(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	total := 0
+	var total atomic.Int64
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(3)
 	for _, c := range chs {
-		if ctx.Err() != nil {
-			return
-		}
-		if s.chanFilter != nil && !s.chanFilter.ChannelAllowed(c.ChannelID) {
+		chID := c.ChannelID
+		if s.chanFilter != nil && !s.chanFilter.ChannelAllowed(chID) {
 			continue
 		}
-		n, err := s.memHooks.DistillIncremental(ctx, c.ChannelID)
-		if err != nil {
-			s.log.Warn("incremental distill failed", "channel", c.ChannelID, "err", err)
-			continue
-		}
-		total += n
+		g.Go(func() error {
+			if gctx.Err() != nil {
+				return nil
+			}
+			n, err := s.memHooks.DistillIncremental(gctx, chID)
+			if err != nil {
+				s.log.Warn("incremental distill failed", "channel", chID, "err", err)
+				return nil
+			}
+			total.Add(int64(n))
+			return nil
+		})
 	}
-	if total > 0 {
-		s.log.Info("hourly incremental distill finished", "new_episodes", total)
+	_ = g.Wait()
+	if total.Load() > 0 {
+		s.log.Info("hourly incremental distill finished", "new_episodes", total.Load())
 	}
 }
 
@@ -393,23 +401,30 @@ func (s *Scheduler) maybeRunDailyDigests(ctx context.Context, now time.Time) {
 	if err != nil {
 		return
 	}
-	generated := 0
+	var generated atomic.Int64
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(3)
 	for _, c := range chs {
-		if ctx.Err() != nil {
-			return
-		}
-		if s.chanFilter != nil && !s.chanFilter.ChannelAllowed(c.ChannelID) {
+		chID := c.ChannelID
+		if s.chanFilter != nil && !s.chanFilter.ChannelAllowed(chID) {
 			continue
 		}
-		if d, err := s.GenerateDailyDigest(ctx, c.ChannelID, yesterday); err == nil && d != nil {
-			generated++
-		}
+		g.Go(func() error {
+			if gctx.Err() != nil {
+				return nil
+			}
+			if d, err := s.GenerateDailyDigest(gctx, chID, yesterday); err == nil && d != nil {
+				generated.Add(1)
+			}
+			return nil
+		})
 	}
+	_ = g.Wait()
 	if ctx.Err() == nil {
 		_ = s.store.SetMeta(ctx, metaKey, "1")
 	}
-	if generated > 0 {
-		s.log.Info("generated daily digests", "day", dayKey, "channels", generated)
+	if generated.Load() > 0 {
+		s.log.Info("generated daily digests", "day", dayKey, "channels", generated.Load())
 	}
 }
 

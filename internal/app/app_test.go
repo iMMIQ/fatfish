@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// TestAllBuiltinSchemasNoRefs verifies all 10 production built-in tools compile, register,
+// TestAllBuiltinSchemasNoRefs verifies all 11 production built-in tools compile, register,
 // sort deterministically, and produce 100% flattened OpenAI schemas with zero $ref/$defs.
 func TestAllBuiltinSchemasNoRefs(t *testing.T) {
 	dir := t.TempDir()
@@ -35,8 +35,8 @@ console:
 	defer application.Close()
 
 	defs := application.Registry.Definitions()
-	if len(defs) != 10 {
-		t.Fatalf("expected 10 built-in tools, got %d", len(defs))
+	if len(defs) != 11 {
+		t.Fatalf("expected 11 built-in tools, got %d", len(defs))
 	}
 
 	raw := string(application.Registry.FrozenJSON())
