@@ -45,6 +45,12 @@ type TravelHooks interface {
 	Tick(ctx context.Context, now time.Time) error
 }
 
+// SegmentHooks lets the scheduler proactively close & summarize idle segments in the background
+// so the next user message after an idle gap pays 0ms summary wait.
+type SegmentHooks interface {
+	PrecloseIdleSegments(ctx context.Context, now time.Time) int
+}
+
 // Scheduler polls persistent SQLite schedules and posts SystemTriggerEvents into Rooms,
 // and runs periodic maintenance (hourly incremental memory distill, daily digests, WAL/media quota cleanup).
 type Scheduler struct {
@@ -53,6 +59,7 @@ type Scheduler struct {
 	dispatcher     Dispatcher
 	memHooks       MemoryHooks
 	travelHooks    TravelHooks
+	segHooks       SegmentHooks
 	chanFilter     ChannelFilter
 	loc            *time.Location
 	maxPerChannel  int
@@ -60,16 +67,20 @@ type Scheduler struct {
 	embedDim       int
 	log            *slog.Logger
 
-	mu            sync.RWMutex
-	roomMediaMiB  int
-	totalMediaMiB int
-	priceFetcher  PriceFetcher
+	mu               sync.RWMutex
+	roomMediaMiB     int
+	totalMediaMiB    int
+	priceFetcher     PriceFetcher
+	lastDigestDayKey string
+	nextSchedWake    time.Time
+	nextSchedChecked time.Time
 
 	distillBusy atomic.Bool
 	digestBusy  atomic.Bool
 	maintBusy   atomic.Bool
 	alertBusy   atomic.Bool
 	travelBusy  atomic.Bool
+	segBusy     atomic.Bool
 }
 
 // SetMemoryHooks attaches optional in-process incremental memory distillation and channel filtering.
@@ -83,6 +94,20 @@ func (s *Scheduler) SetTravelHooks(hooks TravelHooks) {
 	s.mu.Lock()
 	s.travelHooks = hooks
 	s.mu.Unlock()
+}
+
+// SetSegmentHooks attaches optional background idle-segment pre-closing & summarization.
+func (s *Scheduler) SetSegmentHooks(hooks SegmentHooks) {
+	s.mu.Lock()
+	s.segHooks = hooks
+	s.mu.Unlock()
+}
+
+func (s *Scheduler) getSegmentHooks() SegmentHooks {
+	s.mu.RLock()
+	h := s.segHooks
+	s.mu.RUnlock()
+	return h
 }
 
 func (s *Scheduler) getTravelHooks() TravelHooks {
@@ -254,6 +279,9 @@ func (s *Scheduler) CreateScheduleWithMarket(ctx context.Context, ch model.Chann
 	if err := s.store.CreateSchedule(ctx, sc, s.maxPerChannel); err != nil {
 		return nil, err
 	}
+	s.mu.Lock()
+	s.nextSchedChecked = time.Time{} // Force re-check on next tick
+	s.mu.Unlock()
 	return sc, nil
 }
 
@@ -294,6 +322,23 @@ func (s *Scheduler) Start(ctx context.Context) {
 		}
 	}
 
+	runSegPreclose := func(ts time.Time) {
+		sh := s.getSegmentHooks()
+		if sh == nil {
+			return
+		}
+		if s.segBusy.CompareAndSwap(false, true) {
+			wg.Add(1)
+			go func(t time.Time) {
+				defer wg.Done()
+				defer s.segBusy.Store(false)
+				if n := sh.PrecloseIdleSegments(ctx, t); n > 0 {
+					s.log.Info("preclosed idle segments in background", "count", n)
+				}
+			}(ts)
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -302,9 +347,10 @@ func (s *Scheduler) Start(ctx context.Context) {
 			runTravel(now)
 		case now := <-travelTicker.C:
 			runTravel(now)
+			runSegPreclose(now)
 		case now := <-ticker.C:
 			s.tick(ctx, now)
-			if s.digestBusy.CompareAndSwap(false, true) {
+			if s.needsDailyDigestCheck(now) && s.digestBusy.CompareAndSwap(false, true) {
 				wg.Add(1)
 				go func(ts time.Time) {
 					defer wg.Done()
@@ -383,6 +429,19 @@ func (s *Scheduler) RunIncrementalDistill(ctx context.Context) {
 	}
 }
 
+// needsDailyDigestCheck returns false in O(1) without DB/goroutine overhead once yesterday's digest is done.
+func (s *Scheduler) needsDailyDigestCheck(now time.Time) bool {
+	local := now.In(s.location())
+	if local.Hour() == 0 && local.Minute() < 15 {
+		return false
+	}
+	dayKey := local.AddDate(0, 0, -1).Format("2006-01-02")
+	s.mu.RLock()
+	done := s.lastDigestDayKey == dayKey
+	s.mu.RUnlock()
+	return !done
+}
+
 // maybeRunDailyDigests generates yesterday's channel digests once per day after 00:15 local time,
 // catching up later in the day if the service was offline across 00:15-00:59.
 func (s *Scheduler) maybeRunDailyDigests(ctx context.Context, now time.Time) {
@@ -392,8 +451,17 @@ func (s *Scheduler) maybeRunDailyDigests(ctx context.Context, now time.Time) {
 	}
 	yesterday := local.AddDate(0, 0, -1)
 	dayKey := yesterday.Format("2006-01-02")
+	s.mu.RLock()
+	alreadyDone := s.lastDigestDayKey == dayKey
+	s.mu.RUnlock()
+	if alreadyDone {
+		return
+	}
 	metaKey := "daily_digest_done:" + dayKey
 	if done, err := s.store.GetMeta(ctx, metaKey); err == nil && done == "1" {
+		s.mu.Lock()
+		s.lastDigestDayKey = dayKey
+		s.mu.Unlock()
 		return
 	}
 
@@ -422,6 +490,9 @@ func (s *Scheduler) maybeRunDailyDigests(ctx context.Context, now time.Time) {
 	_ = g.Wait()
 	if ctx.Err() == nil {
 		_ = s.store.SetMeta(ctx, metaKey, "1")
+		s.mu.Lock()
+		s.lastDigestDayKey = dayKey
+		s.mu.Unlock()
 	}
 	if generated.Load() > 0 {
 		s.log.Info("generated daily digests", "day", dayKey, "channels", generated.Load())
@@ -429,6 +500,15 @@ func (s *Scheduler) maybeRunDailyDigests(ctx context.Context, now time.Time) {
 }
 
 func (s *Scheduler) tick(ctx context.Context, now time.Time) {
+	// Skip unnecessary 10s SQLite polls when we already know no schedule is due soon.
+	s.mu.RLock()
+	checkedAt := s.nextSchedChecked
+	nextWake := s.nextSchedWake
+	s.mu.RUnlock()
+	if !checkedAt.IsZero() && now.Sub(checkedAt) < 5*time.Minute && (nextWake.IsZero() || now.Before(nextWake)) {
+		return
+	}
+
 	due, err := s.store.DueSchedules(ctx, now)
 	if err != nil {
 		s.log.Warn("cron poll failed", "err", err)
@@ -465,6 +545,12 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 			})
 		}
 	}
+	if nextAt, err := s.store.NextEnabledScheduleAt(ctx); err == nil {
+		s.mu.Lock()
+		s.nextSchedWake = nextAt
+		s.nextSchedChecked = now
+		s.mu.Unlock()
+	}
 }
 
 func (s *Scheduler) runMaintenance(ctx context.Context, now time.Time) {
@@ -480,6 +566,9 @@ func (s *Scheduler) runMaintenance(ctx context.Context, now time.Time) {
 	}
 	if prunedLore, err := s.store.PruneStaleLore(ctx, 120, 30); err == nil && prunedLore > 0 {
 		s.log.Info("pruned stale lore entries", "count", prunedLore)
+	}
+	if prunedHist, err := s.store.PruneHistoricalData(ctx, now); err == nil && prunedHist > 0 {
+		s.log.Info("pruned historical telemetry/frames", "rows", prunedHist)
 	}
 	if err := s.store.Checkpoint(ctx, "TRUNCATE"); err != nil {
 		s.log.Warn("wal checkpoint failed", "err", err)

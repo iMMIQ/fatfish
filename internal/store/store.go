@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -21,10 +22,11 @@ import (
 // Store provides dual-pool SQLite persistence (writeDB=1 conn 8MiB, readDB=6 conns 12MiB)
 // plus the SHA-256 canonical BlobStore.
 type Store struct {
-	writeDB *sql.DB
-	readDB  *sql.DB
-	blobs   *BlobStore
-	dbPath  string
+	writeDB      *sql.DB
+	readDB       *sql.DB
+	blobs        *BlobStore
+	dbPath       string
+	calSampleCnt atomic.Int64
 }
 
 // Open initializes SQLite WAL databases, runs schema migrations, and initializes BlobStore.
@@ -324,6 +326,22 @@ func (s *Store) GetMemberNames(ctx context.Context, ch model.ChannelID) (map[str
 		out[id] = name
 	}
 	return out, rows.Err()
+}
+
+// GetMemberName resolves a single member's display name via primary key lookup without scanning the whole channel.
+func (s *Store) GetMemberName(ctx context.Context, ch model.ChannelID, memberID string) (string, error) {
+	if memberID == "" {
+		return "", nil
+	}
+	var name string
+	err := s.readDB.QueryRowContext(ctx,
+		`SELECT display_name FROM members WHERE channel_id = ? AND member_id = ?`,
+		string(ch), memberID,
+	).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return name, err
 }
 
 // --- L0 Messages & FTS5 ---
@@ -829,7 +847,7 @@ func (s *Store) GetMediaAsset(ctx context.Context, ch model.ChannelID, mediaID s
 	return a, nil
 }
 
-// PruneExpiredMedia removes expired media rows and deletes unreferenced blob files.
+// PruneExpiredMedia removes expired media rows in a single write transaction and deletes unreferenced blob files.
 func (s *Store) PruneExpiredMedia(ctx context.Context, now time.Time) (int, error) {
 	rows, err := s.readDB.QueryContext(ctx,
 		`SELECT channel_id, media_id, sha256, mime_type FROM media_assets WHERE expires_at < ?`, now.UnixMilli())
@@ -845,22 +863,47 @@ func (s *Store) PruneExpiredMedia(ctx context.Context, now time.Time) (int, erro
 		}
 	}
 	rows.Close()
+	if len(expired) == 0 {
+		return 0, nil
+	}
+
+	tx, err := s.writeDB.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, `DELETE FROM media_assets WHERE channel_id = ? AND media_id = ?`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
 
 	deleted := 0
+	shaMime := make(map[string]string, len(expired))
 	for _, it := range expired {
-		_, err := s.writeDB.ExecContext(ctx,
-			`DELETE FROM media_assets WHERE channel_id = ? AND media_id = ?`, it.ch, it.mid)
-		if err != nil {
+		if _, err := stmt.ExecContext(ctx, it.ch, it.mid); err != nil {
 			continue
 		}
 		deleted++
-		var refs int
-		_ = s.readDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM media_assets WHERE sha256 = ?`, it.sha).Scan(&refs)
-		if refs == 0 {
-			_ = s.blobs.Delete(it.sha, it.mime)
+		if it.sha != "" {
+			shaMime[it.sha] = it.mime
 		}
 	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	s.deleteUnreferencedBlobs(ctx, shaMime)
 	return deleted, nil
+}
+
+func (s *Store) deleteUnreferencedBlobs(ctx context.Context, shaMime map[string]string) {
+	for sha, mime := range shaMime {
+		var refs int
+		if err := s.readDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM media_assets WHERE sha256 = ?`, sha).Scan(&refs); err == nil && refs == 0 {
+			_ = s.blobs.Delete(sha, mime)
+		}
+	}
 }
 
 // EnforceMediaQuotas enforces soft per-channel (e.g. 256 MiB) and hard global (e.g. 1024 MiB)
@@ -872,20 +915,10 @@ func (s *Store) EnforceMediaQuotas(ctx context.Context, roomMaxBytes, totalMaxBy
 	if totalMaxBytes <= 0 {
 		totalMaxBytes = 1024 << 20
 	}
-	deleted := 0
-
-	deleteAsset := func(ch, mid, sha, mime string) {
-		if _, err := s.writeDB.ExecContext(ctx,
-			`DELETE FROM media_assets WHERE channel_id = ? AND media_id = ?`, ch, mid); err != nil {
-			return
-		}
-		deleted++
-		var refs int
-		_ = s.readDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM media_assets WHERE sha256 = ?`, sha).Scan(&refs)
-		if refs == 0 {
-			_ = s.blobs.Delete(sha, mime)
-		}
-	}
+	type evictItem struct{ ch, mid, sha, mime string }
+	var toEvict []evictItem
+	evictedSet := make(map[string]struct{})
+	evictKey := func(ch, mid string) string { return ch + "|" + mid }
 
 	// 1. Per-channel soft quota.
 	chRows, err := s.readDB.QueryContext(ctx,
@@ -906,64 +939,93 @@ func (s *Store) EnforceMediaQuotas(ctx context.Context, roomMaxBytes, totalMaxBy
 	}
 	chRows.Close()
 
+	var roomFreed int64
 	for _, u := range overCh {
 		rows, err := s.readDB.QueryContext(ctx,
 			`SELECT media_id, sha256, mime_type, byte_size FROM media_assets WHERE channel_id = ? ORDER BY created_at ASC`, u.ch)
 		if err != nil {
 			continue
 		}
-		type item struct {
-			mid, sha, mime string
-			size           int64
-		}
-		var items []item
-		for rows.Next() {
-			var it item
-			if err := rows.Scan(&it.mid, &it.sha, &it.mime, &it.size); err == nil {
-				items = append(items, it)
-			}
-		}
-		rows.Close()
 		cur := u.bytes
-		for _, it := range items {
+		for rows.Next() {
+			var mid, sha, mime string
+			var size int64
+			if err := rows.Scan(&mid, &sha, &mime, &size); err != nil {
+				continue
+			}
 			if cur <= roomMaxBytes {
 				break
 			}
-			deleteAsset(u.ch, it.mid, it.sha, it.mime)
-			cur -= it.size
+			k := evictKey(u.ch, mid)
+			evictedSet[k] = struct{}{}
+			toEvict = append(toEvict, evictItem{ch: u.ch, mid: mid, sha: sha, mime: mime})
+			cur -= size
+			roomFreed += size
 		}
+		rows.Close()
 	}
 
 	// 2. Global hard quota.
 	var totalBytes int64
 	_ = s.readDB.QueryRowContext(ctx, `SELECT COALESCE(SUM(byte_size), 0) FROM media_assets`).Scan(&totalBytes)
+	totalBytes -= roomFreed
 	if totalBytes > totalMaxBytes {
 		rows, err := s.readDB.QueryContext(ctx,
 			`SELECT channel_id, media_id, sha256, mime_type, byte_size FROM media_assets ORDER BY created_at ASC`)
 		if err != nil {
-			return deleted, err
+			return 0, err
 		}
-		type gItem struct {
-			ch, mid, sha, mime string
-			size               int64
-		}
-		var items []gItem
 		for rows.Next() {
-			var it gItem
-			if err := rows.Scan(&it.ch, &it.mid, &it.sha, &it.mime, &it.size); err == nil {
-				items = append(items, it)
+			var ch, mid, sha, mime string
+			var size int64
+			if err := rows.Scan(&ch, &mid, &sha, &mime, &size); err != nil {
+				continue
 			}
-		}
-		rows.Close()
-		for _, it := range items {
 			if totalBytes <= totalMaxBytes {
 				break
 			}
-			deleteAsset(it.ch, it.mid, it.sha, it.mime)
-			totalBytes -= it.size
+			k := evictKey(ch, mid)
+			if _, already := evictedSet[k]; already {
+				continue
+			}
+			evictedSet[k] = struct{}{}
+			toEvict = append(toEvict, evictItem{ch: ch, mid: mid, sha: sha, mime: mime})
+			totalBytes -= size
 		}
+		rows.Close()
 	}
 
+	if len(toEvict) == 0 {
+		return 0, nil
+	}
+
+	tx, err := s.writeDB.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, `DELETE FROM media_assets WHERE channel_id = ? AND media_id = ?`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+
+	deleted := 0
+	shaMime := make(map[string]string, len(toEvict))
+	for _, it := range toEvict {
+		if _, err := stmt.ExecContext(ctx, it.ch, it.mid); err != nil {
+			continue
+		}
+		deleted++
+		if it.sha != "" {
+			shaMime[it.sha] = it.mime
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	s.deleteUnreferencedBlobs(ctx, shaMime)
 	return deleted, nil
 }
 
@@ -1061,6 +1123,40 @@ func (s *Store) CloseSegment(ctx context.Context, segID int64, summary string) e
 		summary, summary, now, segID,
 	)
 	return err
+}
+
+// ListIdleOpenSegments returns open segments whose last_active_at is before idleCutoff,
+// enabling background pre-closing & summarization so the next turn has 0ms summary wait.
+func (s *Store) ListIdleOpenSegments(ctx context.Context, idleCutoff time.Time, limit int) ([]*SegmentRecord, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.readDB.QueryContext(ctx,
+		`SELECT id, channel_id, epoch, scope_hash, pinned_snapshot, summary_text, created_at, last_active_at, closed_at
+		 FROM segments WHERE closed_at = 0 AND last_active_at < ? ORDER BY last_active_at ASC LIMIT ?`,
+		idleCutoff.UnixMilli(), limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*SegmentRecord
+	for rows.Next() {
+		var r SegmentRecord
+		var chID string
+		var createdMs, lastMs, closedMs int64
+		if err := rows.Scan(&r.ID, &chID, &r.Epoch, &r.ScopeHash, &r.PinnedSnapshot, &r.SummaryText, &createdMs, &lastMs, &closedMs); err != nil {
+			return nil, err
+		}
+		r.ChannelID = model.ChannelID(chID)
+		r.CreatedAt = time.UnixMilli(createdMs)
+		r.LastActiveAt = time.UnixMilli(lastMs)
+		if closedMs > 0 {
+			r.ClosedAt = time.UnixMilli(closedMs)
+		}
+		out = append(out, &r)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) AppendFrame(ctx context.Context, f *FrameRecord) error {
@@ -1334,6 +1430,38 @@ func (s *Store) AllEpisodesWithEmbeds(ctx context.Context) ([]model.Episode, [][
 	}
 	defer rows.Close()
 	return scanEpisodes(rows)
+}
+
+// EpisodeEmbedStats returns (count, maxID) of episodes with non-null embeddings so hourly
+// ReloadIndex can skip full rebuilds in O(1) when no external episodes were added.
+func (s *Store) EpisodeEmbedStats(ctx context.Context) (count int, maxID int64, err error) {
+	err = s.readDB.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(MAX(id), 0) FROM episodes WHERE embed_f16 IS NOT NULL`,
+	).Scan(&count, &maxID)
+	return count, maxID, err
+}
+
+// StreamEpisodeEmbeds streams only (id, channel_id, embed_f16) from episodes without
+// allocating full Episode structs or decoding JSON columns, avoiding 2x RAM spikes on reload.
+func (s *Store) StreamEpisodeEmbeds(ctx context.Context, fn func(id int64, ch model.ChannelID, blob []byte)) (int, error) {
+	rows, err := s.readDB.QueryContext(ctx,
+		`SELECT id, channel_id, embed_f16 FROM episodes WHERE embed_f16 IS NOT NULL ORDER BY id ASC`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		var id int64
+		var chID string
+		var blob []byte
+		if err := rows.Scan(&id, &chID, &blob); err != nil {
+			return n, err
+		}
+		fn(id, model.ChannelID(chID), blob)
+		n++
+	}
+	return n, rows.Err()
 }
 
 func (s *Store) SearchEpisodesFTS(ctx context.Context, ch model.ChannelID, query string, limit int) ([]model.Episode, error) {
@@ -1776,6 +1904,65 @@ func (s *Store) ListStickers(ctx context.Context, status string) ([]StickerRow, 
 	return out, rows.Err()
 }
 
+// GetStickerByID fetches a single sticker row by primary key (avoiding full table scan on single reindex).
+func (s *Store) GetStickerByID(ctx context.Context, stickerID string) (*StickerRow, error) {
+	var r StickerRow
+	var tsMs int64
+	err := s.readDB.QueryRowContext(ctx,
+		`SELECT sticker_id, pack_id, sha256, rel_path, status, ocr_text, intent_text, content_text, intent_f16, content_f16, created_at
+		 FROM stickers WHERE sticker_id = ?`, stickerID,
+	).Scan(&r.Sticker.StickerID, &r.Sticker.PackID, &r.Sticker.SHA256, &r.Sticker.RelPath,
+		&r.Sticker.Status, &r.Sticker.OCRText, &r.Sticker.IntentText, &r.Sticker.ContentText,
+		&r.IntentF16, &r.ContentF16, &tsMs)
+	if err != nil {
+		return nil, err
+	}
+	r.Sticker.CreatedAt = time.UnixMilli(tsMs)
+	return &r, nil
+}
+
+// CountStickers returns the number of stickers matching status (or all if status == "").
+func (s *Store) CountStickers(ctx context.Context, status string) (int, error) {
+	var n int
+	var err error
+	if status != "" {
+		err = s.readDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM stickers WHERE status = ?`, status).Scan(&n)
+	} else {
+		err = s.readDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM stickers`).Scan(&n)
+	}
+	return n, err
+}
+
+// StreamStickers streams sticker rows without materializing all float16 blobs in an intermediate slice.
+func (s *Store) StreamStickers(ctx context.Context, status string, fn func(r StickerRow)) (int, error) {
+	q := `SELECT sticker_id, pack_id, sha256, rel_path, status, ocr_text, intent_text, content_text, intent_f16, content_f16, created_at FROM stickers`
+	var args []any
+	if status != "" {
+		q += ` WHERE status = ?`
+		args = append(args, status)
+	}
+	q += ` ORDER BY sticker_id ASC`
+	rows, err := s.readDB.QueryContext(ctx, q, args...)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		var r StickerRow
+		var tsMs int64
+		if err := rows.Scan(&r.Sticker.StickerID, &r.Sticker.PackID, &r.Sticker.SHA256, &r.Sticker.RelPath,
+			&r.Sticker.Status, &r.Sticker.OCRText, &r.Sticker.IntentText, &r.Sticker.ContentText,
+			&r.IntentF16, &r.ContentF16, &tsMs); err != nil {
+			return n, err
+		}
+		r.Sticker.CreatedAt = time.UnixMilli(tsMs)
+		fn(r)
+		n++
+	}
+	return n, rows.Err()
+}
+
 func (s *Store) SearchStickersFTS(ctx context.Context, query string, packID string, limit int) ([]string, error) {
 	if limit <= 0 {
 		limit = 20
@@ -1951,6 +2138,16 @@ func (s *Store) DueSchedules(ctx context.Context, now time.Time) ([]model.Schedu
 	}
 	defer rows.Close()
 	return scanSchedules(rows)
+}
+
+// NextEnabledScheduleAt returns the earliest next_run_at among enabled schedules (zero if none).
+func (s *Store) NextEnabledScheduleAt(ctx context.Context) (time.Time, error) {
+	var nextMs sql.NullInt64
+	err := s.readDB.QueryRowContext(ctx, `SELECT MIN(next_run_at) FROM schedules WHERE enabled = 1`).Scan(&nextMs)
+	if err != nil || !nextMs.Valid || nextMs.Int64 <= 0 {
+		return time.Time{}, err
+	}
+	return time.UnixMilli(nextMs.Int64), nil
 }
 
 func (s *Store) UpdateScheduleNextRun(ctx context.Context, id int64, next time.Time, enabled bool) error {
@@ -2194,12 +2391,14 @@ func (s *Store) AddCalibratorSample(ctx context.Context, sample CalibratorSample
 	if err != nil {
 		return err
 	}
-	// Keep rolling window bounded per model key (last 128 rows).
-	_, _ = s.writeDB.ExecContext(ctx,
-		`DELETE FROM calibrator_samples WHERE model_key = ? AND id NOT IN (
-			SELECT id FROM calibrator_samples WHERE model_key = ? ORDER BY id DESC LIMIT 128
-		)`, sample.ModelKey, sample.ModelKey,
-	)
+	// Amortize rolling window pruning to every 16 inserts instead of running a subquery DELETE on every turn.
+	if s.calSampleCnt.Add(1)%16 == 0 {
+		_, _ = s.writeDB.ExecContext(ctx,
+			`DELETE FROM calibrator_samples WHERE model_key = ? AND id NOT IN (
+				SELECT id FROM calibrator_samples WHERE model_key = ? ORDER BY id DESC LIMIT 128
+			)`, sample.ModelKey, sample.ModelKey,
+		)
+	}
 	return nil
 }
 
@@ -2259,104 +2458,234 @@ func (s *Store) SetDistillCheckpoint(ctx context.Context, ch model.ChannelID, se
 	return s.SetMeta(ctx, "distill_seq:"+string(ch), strconv.FormatInt(seq, 10))
 }
 
-// RebuildFTS rebuilds messages_fts, episodes_fts, and stickers_fts from source tables.
+// PruneHistoricalData trims old telemetry/delivery/usage logs and obsolete closed-segment frames
+// (preserving segments.summary_text) and runs PRAGMA optimize to keep query plans fresh.
+func (s *Store) PruneHistoricalData(ctx context.Context, now time.Time) (int64, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	cutoff30d := now.AddDate(0, 0, -30).UnixMilli()
+	cutoff7d := now.AddDate(0, 0, -7).UnixMilli()
+
+	var total int64
+	stmts := []struct {
+		query string
+		arg   int64
+	}{
+		{`DELETE FROM kv_metrics WHERE created_at < ?`, cutoff30d},
+		{`DELETE FROM deliveries WHERE created_at < ?`, cutoff30d},
+		{`DELETE FROM sticker_uses WHERE used_at < ?`, cutoff30d},
+		{`DELETE FROM frames WHERE segment_id IN (SELECT id FROM segments WHERE closed_at > 0 AND closed_at < ?)`, cutoff7d},
+	}
+	for _, st := range stmts {
+		res, err := s.writeDB.ExecContext(ctx, st.query, st.arg)
+		if err != nil {
+			return total, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			total += n
+		}
+	}
+	_, _ = s.writeDB.ExecContext(ctx, `PRAGMA optimize`)
+	return total, nil
+}
+
+// RebuildFTS rebuilds messages_fts, episodes_fts, and stickers_fts in bounded streaming batches
+// using prepared statements so large chat histories never OOM a 256-512 MiB container.
 func (s *Store) RebuildFTS(ctx context.Context) error {
-	tx, err := s.writeDB.BeginTx(ctx, nil)
+	const batchSize = 2000
+
+	clearTx, err := s.writeDB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
-
 	for _, tbl := range []string{"messages_fts", "episodes_fts", "stickers_fts"} {
-		if _, err := tx.ExecContext(ctx, "INSERT INTO "+tbl+"("+tbl+") VALUES('delete-all')"); err != nil {
+		if _, err := clearTx.ExecContext(ctx, "INSERT INTO "+tbl+"("+tbl+") VALUES('delete-all')"); err != nil {
+			_ = clearTx.Rollback()
 			return err
 		}
 	}
-
-	// Messages
-	mRows, err := tx.QueryContext(ctx, `SELECT id, channel_id, sender_id, sender_name, plain_text, created_at FROM messages`)
-	if err != nil {
+	if err := clearTx.Commit(); err != nil {
 		return err
 	}
+
+	// Messages
 	type mItem struct {
 		id, ts              int64
 		ch, sid, sname, txt string
 	}
-	var msgs []mItem
-	for mRows.Next() {
-		var it mItem
-		if err := mRows.Scan(&it.id, &it.ch, &it.sid, &it.sname, &it.txt, &it.ts); err != nil {
+	var lastMsgID int64
+	for {
+		mRows, err := s.readDB.QueryContext(ctx,
+			`SELECT id, channel_id, sender_id, sender_name, plain_text, created_at
+			 FROM messages WHERE id > ? ORDER BY id ASC LIMIT ?`, lastMsgID, batchSize)
+		if err != nil {
+			return err
+		}
+		msgs := make([]mItem, 0, batchSize)
+		for mRows.Next() {
+			var it mItem
+			if err := mRows.Scan(&it.id, &it.ch, &it.sid, &it.sname, &it.txt, &it.ts); err != nil {
+				mRows.Close()
+				return err
+			}
+			msgs = append(msgs, it)
+			lastMsgID = it.id
+		}
+		if err := mRows.Err(); err != nil {
 			mRows.Close()
 			return err
 		}
-		msgs = append(msgs, it)
-	}
-	mRows.Close()
-	for _, it := range msgs {
-		if toks := TokenizeCJK(it.sname + " " + it.txt); toks != "" {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO messages_fts (rowid, tokens, channel_id, sender_id, created_at) VALUES (?, ?, ?, ?, ?)`,
-				it.id, toks, it.ch, it.sid, it.ts); err != nil {
-				return err
+		mRows.Close()
+		if len(msgs) == 0 {
+			break
+		}
+
+		tx, err := s.writeDB.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		stmt, err := tx.PrepareContext(ctx, `INSERT INTO messages_fts (rowid, tokens, channel_id, sender_id, created_at) VALUES (?, ?, ?, ?, ?)`)
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		for _, it := range msgs {
+			if toks := TokenizeCJK(it.sname + " " + it.txt); toks != "" {
+				if _, err := stmt.ExecContext(ctx, it.id, toks, it.ch, it.sid, it.ts); err != nil {
+					stmt.Close()
+					_ = tx.Rollback()
+					return err
+				}
 			}
+		}
+		stmt.Close()
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		if len(msgs) < batchSize {
+			break
 		}
 	}
 
 	// Episodes
-	eRows, err := tx.QueryContext(ctx, `SELECT id, channel_id, topic, summary, notable_json FROM episodes`)
-	if err != nil {
-		return err
-	}
 	type eItem struct {
 		id                         int64
 		ch, topic, summary, notRaw string
 	}
-	var eps []eItem
-	for eRows.Next() {
-		var it eItem
-		if err := eRows.Scan(&it.id, &it.ch, &it.topic, &it.summary, &it.notRaw); err != nil {
+	var lastEpID int64
+	for {
+		eRows, err := s.readDB.QueryContext(ctx,
+			`SELECT id, channel_id, topic, summary, notable_json
+			 FROM episodes WHERE id > ? ORDER BY id ASC LIMIT ?`, lastEpID, batchSize)
+		if err != nil {
+			return err
+		}
+		eps := make([]eItem, 0, batchSize)
+		for eRows.Next() {
+			var it eItem
+			if err := eRows.Scan(&it.id, &it.ch, &it.topic, &it.summary, &it.notRaw); err != nil {
+				eRows.Close()
+				return err
+			}
+			eps = append(eps, it)
+			lastEpID = it.id
+		}
+		if err := eRows.Err(); err != nil {
 			eRows.Close()
 			return err
 		}
-		eps = append(eps, it)
-	}
-	eRows.Close()
-	for _, it := range eps {
-		var notable []string
-		_ = json.Unmarshal([]byte(it.notRaw), &notable)
-		if toks := TokenizeCJK(it.topic + " " + it.summary + " " + strings.Join(notable, " ")); toks != "" {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO episodes_fts (rowid, tokens, channel_id) VALUES (?, ?, ?)`,
-				it.id, toks, it.ch); err != nil {
-				return err
+		eRows.Close()
+		if len(eps) == 0 {
+			break
+		}
+
+		tx, err := s.writeDB.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		stmt, err := tx.PrepareContext(ctx, `INSERT INTO episodes_fts (rowid, tokens, channel_id) VALUES (?, ?, ?)`)
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		for _, it := range eps {
+			var notable []string
+			_ = json.Unmarshal([]byte(it.notRaw), &notable)
+			if toks := TokenizeCJK(it.topic + " " + it.summary + " " + strings.Join(notable, " ")); toks != "" {
+				if _, err := stmt.ExecContext(ctx, it.id, toks, it.ch); err != nil {
+					stmt.Close()
+					_ = tx.Rollback()
+					return err
+				}
 			}
+		}
+		stmt.Close()
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		if len(eps) < batchSize {
+			break
 		}
 	}
 
 	// Stickers
-	sRows, err := tx.QueryContext(ctx, `SELECT rowid, pack_id, ocr_text, intent_text, content_text FROM stickers`)
-	if err != nil {
-		return err
-	}
 	type sItem struct {
 		rowid                  int64
 		pack, ocr, intent, cnt string
 	}
-	var stks []sItem
-	for sRows.Next() {
-		var it sItem
-		if err := sRows.Scan(&it.rowid, &it.pack, &it.ocr, &it.intent, &it.cnt); err != nil {
+	var lastStkRowID int64
+	for {
+		sRows, err := s.readDB.QueryContext(ctx,
+			`SELECT rowid, pack_id, ocr_text, intent_text, content_text
+			 FROM stickers WHERE rowid > ? ORDER BY rowid ASC LIMIT ?`, lastStkRowID, batchSize)
+		if err != nil {
+			return err
+		}
+		stks := make([]sItem, 0, batchSize)
+		for sRows.Next() {
+			var it sItem
+			if err := sRows.Scan(&it.rowid, &it.pack, &it.ocr, &it.intent, &it.cnt); err != nil {
+				sRows.Close()
+				return err
+			}
+			stks = append(stks, it)
+			lastStkRowID = it.rowid
+		}
+		if err := sRows.Err(); err != nil {
 			sRows.Close()
 			return err
 		}
-		stks = append(stks, it)
-	}
-	sRows.Close()
-	for _, it := range stks {
-		if toks := TokenizeCJK(it.ocr + " " + it.intent + " " + it.cnt); toks != "" {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO stickers_fts (rowid, tokens, pack_id) VALUES (?, ?, ?)`,
-				it.rowid, toks, it.pack); err != nil {
-				return err
+		sRows.Close()
+		if len(stks) == 0 {
+			break
+		}
+
+		tx, err := s.writeDB.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		stmt, err := tx.PrepareContext(ctx, `INSERT INTO stickers_fts (rowid, tokens, pack_id) VALUES (?, ?, ?)`)
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		for _, it := range stks {
+			if toks := TokenizeCJK(it.ocr + " " + it.intent + " " + it.cnt); toks != "" {
+				if _, err := stmt.ExecContext(ctx, it.rowid, toks, it.pack); err != nil {
+					stmt.Close()
+					_ = tx.Rollback()
+					return err
+				}
 			}
 		}
+		stmt.Close()
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		if len(stks) < batchSize {
+			break
+		}
 	}
-	return tx.Commit()
+	return nil
 }

@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/iMMIQ/fatfish/internal/model"
 	"github.com/iMMIQ/fatfish/internal/netutil"
 )
@@ -241,6 +243,7 @@ type Service struct {
 
 	cacheMu sync.RWMutex
 	cache   map[string]cacheEntry
+	sf      singleflight.Group
 }
 
 // NewService creates a new Link Parser service.
@@ -359,7 +362,8 @@ func (s *Service) ParseMessageLinks(ctx context.Context, msg *model.Message, max
 	return out
 }
 
-// Parse resolves, extracts, and caches structured information for rawURL.
+// Parse resolves, extracts, and caches structured information for rawURL,
+// coalescing concurrent duplicate fetches via singleflight.
 func (s *Service) Parse(ctx context.Context, rawURL string, popts ParseOptions) (*Result, error) {
 	rawURL = strings.TrimSpace(rawURL)
 	if err := netutil.ValidateURL(rawURL); err != nil {
@@ -376,6 +380,54 @@ func (s *Service) Parse(ctx context.Context, rawURL string, popts ParseOptions) 
 		return cached, nil
 	}
 
+	sfKey := normOrig
+	if popts.Deep {
+		sfKey += "|deep"
+	}
+	ch := s.sf.DoChan(sfKey, func() (any, error) {
+		if cached, ok := s.cacheGet(normOrig, popts.Deep); ok {
+			return cached, nil
+		}
+		// Detach from a single caller's cancellation while honoring bounded timeout so sibling callers share work safely.
+		to := opts.Timeout
+		if popts.Deep {
+			to *= 2
+			if to < 25*time.Second {
+				to = 25 * time.Second
+			}
+		}
+		if to <= 0 {
+			to = 12 * time.Second
+		}
+		runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), to)
+		defer cancel()
+		return s.parseUncached(runCtx, rawURL, normOrig, popts, opts, cli, ign)
+	})
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		r, _ := res.Val.(*Result)
+		if r == nil {
+			return nil, ErrEmptyContent
+		}
+		cp := *r
+		return &cp, nil
+	}
+}
+
+func (s *Service) parseUncached(
+	ctx context.Context,
+	rawURL, normOrig string,
+	popts ParseOptions,
+	opts Options,
+	cli *http.Client,
+	ign map[string]struct{},
+) (*Result, error) {
 	targetURL := rawURL
 	u, err := url.Parse(rawURL)
 	if err != nil {

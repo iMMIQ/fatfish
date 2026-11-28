@@ -201,6 +201,51 @@ func (m *Manager) ActiveChannels() []model.ChannelID {
 	return out
 }
 
+// PrecloseIdleSegments proactively closes & summarizes open segments that have exceeded
+// segment_idle_minutes while their channel is idle, eliminating the 1-6s inline summary wait
+// on the next user message.
+func (m *Manager) PrecloseIdleSegments(ctx context.Context, now time.Time) int {
+	if m.store == nil || m.cfgMgr == nil || m.draining.Load() {
+		return 0
+	}
+	cfg := m.cfgMgr.Get()
+	idleMins := cfg.Frame.SegmentIdleMinutes
+	if idleMins <= 0 {
+		idleMins = 30
+	}
+	idleCutoff := now.Add(-time.Duration(idleMins) * time.Minute)
+	segs, err := m.store.ListIdleOpenSegments(ctx, idleCutoff, 10)
+	if err != nil || len(segs) == 0 {
+		return 0
+	}
+	closedCount := 0
+	for _, seg := range segs {
+		if ctx.Err() != nil || m.draining.Load() {
+			break
+		}
+		m.mu.RLock()
+		r := m.rooms[seg.ChannelID]
+		m.mu.RUnlock()
+		if r != nil && r.turnBusy.Load() {
+			continue
+		}
+		sumCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		summary := m.generateSegmentSummary(sumCtx, seg)
+		cancel()
+		if err := m.store.CloseSegment(ctx, seg.ID, summary); err != nil {
+			continue
+		}
+		seg.SummaryText = summary
+		closedCount++
+		m.wg.Add(1)
+		go func(cseg *store.SegmentRecord) {
+			defer m.wg.Done()
+			m.summarizeClosedSegment(cseg)
+		}(seg)
+	}
+	return closedCount
+}
+
 // Drain stops accepting new events and waits up to timeout for in-flight turns, deliveries,
 // and background room tasks to finish before cancelling remaining contexts.
 func (m *Manager) Drain(timeout time.Duration) {
@@ -296,8 +341,9 @@ type Room struct {
 	debounceArmed     bool
 	debounceAt        time.Time
 
-	// Managed single turn worker state (owned strictly by Room.run())
+	// Managed single turn worker state (owned strictly by Room.run(); turnBusy mirrors turnActive for lock-free checks)
 	turnActive bool
+	turnBusy   atomic.Bool
 	turnCancel context.CancelFunc
 
 	// Thread continuation state
@@ -649,6 +695,7 @@ func (r *Room) run() {
 
 		case out := <-r.turnDoneCh:
 			r.turnActive = false
+			r.turnBusy.Store(false)
 			r.turnCancel = nil
 			r.applyTurnOutcome(out)
 			if r.pendingTrigger != nil && !r.debounceArmed {
@@ -1817,6 +1864,7 @@ func (r *Room) startTurn(trig triggerState) {
 
 	turnCtx, cancel := context.WithCancel(r.mgr.shutdownCtx)
 	r.turnActive = true
+	r.turnBusy.Store(true)
 	r.turnCancel = cancel
 	if trig.kind == "poke" {
 		r.lastPokeReply = time.Now()
@@ -1958,10 +2006,11 @@ func (r *Room) runTurnWorker(
 			return snap, nil
 		},
 		func(sctx context.Context, closed *store.SegmentRecord) string {
-			// Summarize closed segment inline within a short 6s budget so Segment N+1 gets Segment N's summary immediately.
-			sumCtx, cancel := context.WithTimeout(sctx, 6*time.Second)
+			// Idle segments are normally pre-closed in the background; keep inline fallback brief (2s)
+			// so passive rotations (e.g. hot-reload) never stall first-token latency.
+			sumCtx, cancel := context.WithTimeout(sctx, 2*time.Second)
 			defer cancel()
-			return r.generateSegmentSummary(sumCtx, closed)
+			return r.mgr.generateSegmentSummary(sumCtx, closed)
 		},
 	)
 	if err != nil {
@@ -1972,7 +2021,7 @@ func (r *Room) runTurnWorker(
 		r.mgr.wg.Add(1)
 		go func(cseg *store.SegmentRecord) {
 			defer r.mgr.wg.Done()
-			r.summarizeClosedSegment(cseg)
+			r.mgr.summarizeClosedSegment(cseg)
 		}(closedSeg)
 	}
 	outcome.segID = seg.ID
@@ -2649,25 +2698,31 @@ func (r *Room) botDisplayName(cfg *config.Config) string {
 	return "fatfish"
 }
 
+func (r *Room) lookupMemberName(ctx context.Context, memberID string) string {
+	if memberID == "" {
+		return ""
+	}
+	if item, ok := r.memberCache[memberID]; ok && item.displayName != "" {
+		return item.displayName
+	}
+	name, err := r.mgr.store.GetMemberName(ctx, r.ch, memberID)
+	if err == nil && name != "" {
+		// Cache resolved display name without suppressing future UpsertMember refreshes (zero updatedAt).
+		r.memberCache[memberID] = memberCacheItem{displayName: name}
+		return name
+	}
+	return ""
+}
+
 func (r *Room) enrichInboundEvent(ctx context.Context, msg *model.Message) {
 	if r.mgr.store == nil || msg == nil {
 		return
 	}
-	needNames := msg.SilentNotice || msg.SenderName == "" || msg.SenderName == msg.SenderID
-	if !needNames {
-		for _, p := range msg.Parts {
-			if p.Kind == model.PartPoke || p.Kind == model.PartMention || p.Kind == model.PartNotice {
-				needNames = true
-				break
-			}
+	needSender := msg.SenderName == "" || msg.SenderName == msg.SenderID
+	if needSender {
+		if name := r.lookupMemberName(ctx, msg.SenderID); name != "" {
+			msg.SenderName = name
 		}
-	}
-	if !needNames {
-		return
-	}
-	names, _ := r.mgr.store.GetMemberNames(ctx, r.ch)
-	if (msg.SenderName == "" || msg.SenderName == msg.SenderID) && names[msg.SenderID] != "" {
-		msg.SenderName = names[msg.SenderID]
 	}
 	for i := range msg.Parts {
 		p := &msg.Parts[i]
@@ -2675,7 +2730,7 @@ func (r *Room) enrichInboundEvent(ctx context.Context, msg *model.Message) {
 		case model.PartPoke:
 			if msg.PokedBot {
 				p.Text = "[戳了你]"
-			} else if tName := names[p.TargetID]; tName != "" && tName != p.TargetID {
+			} else if tName := r.lookupMemberName(ctx, p.TargetID); tName != "" && tName != p.TargetID {
 				p.Text = fmt.Sprintf("[戳了 %s]", tName)
 			} else if p.TargetID != "" {
 				p.Text = fmt.Sprintf("[戳了 %s]", p.TargetID)
@@ -2683,7 +2738,7 @@ func (r *Room) enrichInboundEvent(ctx context.Context, msg *model.Message) {
 				p.Text = "[戳了别人]"
 			}
 		case model.PartMention:
-			if tName := names[p.TargetID]; tName != "" && tName != p.TargetID {
+			if tName := r.lookupMemberName(ctx, p.TargetID); tName != "" && tName != p.TargetID {
 				p.Text = fmt.Sprintf("@%s(%s)", tName, p.TargetID)
 			}
 		case model.PartNotice:
@@ -2712,11 +2767,11 @@ func extractJSONBlock(s string) string {
 	return s
 }
 
-func (r *Room) generateSegmentSummary(ctx context.Context, seg *store.SegmentRecord) string {
-	if seg == nil || r.mgr.hub == nil || r.mgr.store == nil {
+func (m *Manager) generateSegmentSummary(ctx context.Context, seg *store.SegmentRecord) string {
+	if seg == nil || m.hub == nil || m.store == nil {
 		return ""
 	}
-	frames, err := r.mgr.store.ListFrames(ctx, seg.ID)
+	frames, err := m.store.ListFrames(ctx, seg.ID)
 	if err != nil || len(frames) == 0 {
 		return ""
 	}
@@ -2730,7 +2785,7 @@ func (r *Room) generateSegmentSummary(ctx context.Context, seg *store.SegmentRec
 	if len(lines) == 0 {
 		return ""
 	}
-	resp, err := r.mgr.hub.Chat(ctx, "fast", infer.ChatRequest{
+	resp, err := m.hub.Chat(ctx, "fast", infer.ChatRequest{
 		Messages: []infer.ChatMessage{
 			{Role: "system", Content: "用简体中文简明概括这段已结束群聊的脉络与未完结话题（不超过120字），纯文本不要Markdown标题或列表；若涉及粗俗、色情、敏感或争吵细节，必须中性脱敏概括（如“聊了成人玩笑”），绝不复述露骨词汇、脏话或直接照抄原聊天记录。"},
 			{Role: "user", Content: strings.Join(lines, "\n")},
@@ -2749,31 +2804,31 @@ func (r *Room) generateSegmentSummary(ctx context.Context, seg *store.SegmentRec
 	return summary
 }
 
-func (r *Room) summarizeClosedSegment(seg *store.SegmentRecord) {
-	ctx, cancel := context.WithTimeout(r.mgr.shutdownCtx, 90*time.Second)
+func (m *Manager) summarizeClosedSegment(seg *store.SegmentRecord) {
+	ctx, cancel := context.WithTimeout(m.shutdownCtx, 90*time.Second)
 	defer cancel()
 	// Backfill segment summary if inline summarization timed out or was skipped.
 	if strings.TrimSpace(seg.SummaryText) == "" {
-		if summary := r.generateSegmentSummary(ctx, seg); summary != "" {
-			_ = r.mgr.store.CloseSegment(ctx, seg.ID, summary)
+		if summary := m.generateSegmentSummary(ctx, seg); summary != "" {
+			_ = m.store.CloseSegment(ctx, seg.ID, summary)
 		}
 	}
 
 	// Online L1 Episode & L2 Profile/Lore distillation on segment close (SPEC §6.2 & §8).
 	// Prefer local "distill" role (longer timeout, zero cloud cost) when configured, falling back to "fast".
-	if r.mgr.memory != nil {
+	if m.memory != nil {
 		role := "fast"
-		if cfg := r.mgr.cfgMgr.Get(); cfg != nil && cfg.Models.Distill.IsEnabled() {
+		if cfg := m.cfgMgr.Get(); cfg != nil && cfg.Models.Distill.IsEnabled() {
 			role = "distill"
 		}
 		endTS := seg.LastActiveAt
 		if endTS.Before(seg.CreatedAt) {
 			endTS = time.Now()
 		}
-		segMsgs, merr := r.mgr.store.MessagesInRange(ctx, seg.ChannelID, seg.CreatedAt.Add(-time.Minute), endTS.Add(time.Minute), 200)
+		segMsgs, merr := m.store.MessagesInRange(ctx, seg.ChannelID, seg.CreatedAt.Add(-time.Minute), endTS.Add(time.Minute), 200)
 		if merr == nil && len(segMsgs) >= 3 {
-			if _, derr := r.mgr.memory.DistillWindow(ctx, seg.ChannelID, segMsgs, role); derr != nil {
-				r.mgr.log.Warn("online segment distill failed", "channel", seg.ChannelID, "segment", seg.ID, "role", role, "err", derr)
+			if _, derr := m.memory.DistillWindow(ctx, seg.ChannelID, segMsgs, role); derr != nil {
+				m.log.Warn("online segment distill failed", "channel", seg.ChannelID, "segment", seg.ID, "role", role, "err", derr)
 			}
 		}
 	}

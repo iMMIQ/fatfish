@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -36,6 +37,15 @@ type Runner struct {
 	frames   *frame.Builder
 	registry *tool.Registry
 	log      *slog.Logger
+
+	toolTokMu      sync.RWMutex
+	cachedToolHash string
+	cachedToolTok  int
+
+	teleMu     sync.Mutex
+	teleCh     chan func()
+	teleWG     sync.WaitGroup
+	teleClosed bool
 }
 
 func NewRunner(hub *infer.Hub, st *store.Store, fb *frame.Builder, reg *tool.Registry, logger *slog.Logger) *Runner {
@@ -49,6 +59,85 @@ func NewRunner(hub *infer.Hub, st *store.Store, fb *frame.Builder, reg *tool.Reg
 		registry: reg,
 		log:      logger,
 	}
+}
+
+// EnableAsyncTelemetry moves non-critical KV metric & calibrator SQLite writes onto a bounded
+// single-worker background queue so turn delivery and multi-step tool loops never stall on writeDB.
+func (r *Runner) EnableAsyncTelemetry() {
+	r.teleMu.Lock()
+	defer r.teleMu.Unlock()
+	if r.teleCh != nil || r.teleClosed {
+		return
+	}
+	r.teleCh = make(chan func(), 128)
+	r.teleWG.Add(1)
+	go func(ch <-chan func()) {
+		defer r.teleWG.Done()
+		for fn := range ch {
+			fn()
+		}
+	}(r.teleCh)
+}
+
+// Drain flushes queued async telemetry writes before closing SQLite pools.
+func (r *Runner) Drain(timeout time.Duration) {
+	r.teleMu.Lock()
+	if r.teleClosed || r.teleCh == nil {
+		r.teleClosed = true
+		r.teleMu.Unlock()
+		return
+	}
+	r.teleClosed = true
+	close(r.teleCh)
+	r.teleMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		r.teleWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		r.log.Warn("agent telemetry drain timed out", "timeout", timeout)
+	}
+}
+
+func (r *Runner) enqueueTelemetry(fn func()) {
+	r.teleMu.Lock()
+	ch := r.teleCh
+	closed := r.teleClosed
+	r.teleMu.Unlock()
+	if ch == nil || closed {
+		fn()
+		return
+	}
+	select {
+	case ch <- fn:
+	default:
+		// Drop telemetry rather than blocking user turn if queue is saturated.
+	}
+}
+
+func (r *Runner) cachedToolTokens() int {
+	if r.registry == nil {
+		return 0
+	}
+	h := r.registry.Hash()
+	r.toolTokMu.RLock()
+	if r.cachedToolHash == h && h != "" {
+		tok := r.cachedToolTok
+		r.toolTokMu.RUnlock()
+		return tok
+	}
+	r.toolTokMu.RUnlock()
+
+	tok := frame.EstimateTextTokens(string(r.registry.FrozenJSON()))
+	r.toolTokMu.Lock()
+	r.cachedToolHash = h
+	r.cachedToolTok = tok
+	r.toolTokMu.Unlock()
+	return tok
 }
 
 // TurnInput describes the inputs for one agent turn inside a Room segment.
@@ -102,7 +191,7 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 	toolTokens := 0
 	if r.registry != nil {
 		defs = r.registry.Definitions()
-		toolTokens = frame.EstimateTextTokens(string(r.registry.FrozenJSON()))
+		toolTokens = r.cachedToolTokens()
 	}
 
 	modelKey := r.hub.ModelKey("primary")
@@ -217,24 +306,35 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 			}
 		}
 
-		// Record KV telemetry & first-attempt calibrator sample.
-		if r.store != nil {
-			_ = r.store.RecordKVMetric(ctx, model.KVMetric{
-				ChannelID:        in.ChannelID,
-				SegmentID:        in.Segment.ID,
-				ModelID:          metricModelKey,
-				Attempt:          iter,
-				PromptTokens:     resp.Usage.PromptTokens,
-				CachedTokens:     resp.Usage.CachedTokens,
-				CompletionTokens: resp.Usage.CompletionTokens,
-				PrefixHash:       iterPrefixHash,
-				MissReason:       missReason,
-				LatencyMs:        resp.LatencyMs,
-				CreatedAt:        time.Now(),
-			})
+		// Record KV telemetry & first-attempt calibrator sample off the hot turn path when async enabled.
+		metric := model.KVMetric{
+			ChannelID:        in.ChannelID,
+			SegmentID:        in.Segment.ID,
+			ModelID:          metricModelKey,
+			Attempt:          iter,
+			PromptTokens:     resp.Usage.PromptTokens,
+			CachedTokens:     resp.Usage.CachedTokens,
+			CompletionTokens: resp.Usage.CompletionTokens,
+			PrefixHash:       iterPrefixHash,
+			MissReason:       missReason,
+			LatencyMs:        resp.LatencyMs,
+			CreatedAt:        time.Now(),
 		}
-		if iter == 1 && !resp.FallbackUsed && resp.Usage.PromptTokens > 0 {
-			r.frames.RecordCalibratorSample(ctx, modelKey, assembled.EstTextTokens, resp.Usage.PromptTokens, assembled.ImageCount)
+		recordCal := iter == 1 && !resp.FallbackUsed && resp.Usage.PromptTokens > 0
+		estTextTok := assembled.EstTextTokens
+		actualPromptTok := resp.Usage.PromptTokens
+		imgCnt := assembled.ImageCount
+		if r.store != nil || recordCal {
+			r.enqueueTelemetry(func() {
+				tctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if r.store != nil {
+					_ = r.store.RecordKVMetric(tctx, metric)
+				}
+				if recordCal && r.frames != nil {
+					r.frames.RecordCalibratorSample(tctx, modelKey, estTextTok, actualPromptTok, imgCnt)
+				}
+			})
 		}
 
 		// No tool calls -> final answer.

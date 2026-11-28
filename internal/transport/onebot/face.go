@@ -156,16 +156,14 @@ var qqFaceNames = map[string]string{
 }
 
 // formatQQFace renders a OneBot face segment into a concise Chinese tag like "[表情:doge]".
-func formatQQFace(data map[string]any) string {
-	if raw, ok := data["raw"].(map[string]any); ok {
-		if ft := strings.TrimSpace(anyToString(raw["faceText"])); ft != "" {
-			ft = strings.TrimPrefix(ft, "/")
-			if ft != "" {
-				return "[表情:" + ft + "]"
-			}
+func formatQQFace(id, faceText string) string {
+	if ft := strings.TrimSpace(faceText); ft != "" {
+		ft = strings.TrimPrefix(ft, "/")
+		if ft != "" {
+			return "[表情:" + ft + "]"
 		}
 	}
-	id := strings.TrimSpace(anyToString(data["id"]))
+	id = strings.TrimSpace(id)
 	if id == "" {
 		return ""
 	}

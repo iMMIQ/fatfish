@@ -9,38 +9,22 @@ import (
 	"image/draw"
 	"image/png"
 	"math"
-	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/opentype"
 	"golang.org/x/image/math/fixed"
 
+	"github.com/iMMIQ/fatfish/internal/fontcache"
 	"github.com/iMMIQ/fatfish/internal/model"
 )
 
-var (
-	fontCacheMu sync.Mutex
-	fontCache   = map[string]*opentype.Font{}
-)
-
 func loadTTF(path string) (*opentype.Font, error) {
-	fontCacheMu.Lock()
-	defer fontCacheMu.Unlock()
-	if f, ok := fontCache[path]; ok {
-		return f, nil
-	}
-	raw, err := os.ReadFile(path)
+	f, err := fontcache.Load(path)
 	if err != nil {
-		return nil, fmt.Errorf("travel: read font %s: %w", path, err)
+		return nil, fmt.Errorf("travel: %w", err)
 	}
-	f, err := opentype.Parse(raw)
-	if err != nil {
-		return nil, fmt.Errorf("travel: parse font %s: %w", path, err)
-	}
-	fontCache[path] = f
 	return f, nil
 }
 

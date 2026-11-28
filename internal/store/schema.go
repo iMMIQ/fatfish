@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS media_assets (
     PRIMARY KEY (channel_id, media_id)
 );
 CREATE INDEX IF NOT EXISTS idx_media_expires ON media_assets(expires_at);
+CREATE INDEX IF NOT EXISTS idx_media_sha256 ON media_assets(sha256);
 
 CREATE TABLE IF NOT EXISTS segments (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,6 +84,7 @@ CREATE TABLE IF NOT EXISTS segments (
     closed_at       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_segments_chan ON segments(channel_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_segments_open_idle ON segments(closed_at, last_active_at);
 
 CREATE TABLE IF NOT EXISTS frames (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,6 +108,7 @@ CREATE TABLE IF NOT EXISTS deliveries (
     sent_json    TEXT NOT NULL DEFAULT '[]',
     created_at   INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_deliveries_ts ON deliveries(created_at DESC);
 
 CREATE TABLE IF NOT EXISTS kv_metrics (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,6 +141,7 @@ CREATE TABLE IF NOT EXISTS episodes (
     created_at        INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_episodes_chan_ts ON episodes(channel_id, end_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_episodes_chan_seq ON episodes(channel_id, end_seq DESC, start_seq);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
     tokens, channel_id UNINDEXED, content='', contentless_delete=1, tokenize='unicode61'
@@ -199,6 +203,7 @@ CREATE TABLE IF NOT EXISTS sticker_uses (
     used_at    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sticker_uses_chan ON sticker_uses(channel_id, used_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sticker_uses_ts ON sticker_uses(used_at DESC);
 
 CREATE TABLE IF NOT EXISTS schedules (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,

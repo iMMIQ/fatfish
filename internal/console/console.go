@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"io/fs"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -121,6 +122,13 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("POST /api/travel/weather", s.auth(http.HandlerFunc(s.handleTravelWeatherNow)))
 	mux.Handle("GET /logs", s.auth(http.HandlerFunc(s.handleLogsPage)))
 	mux.Handle("GET /api/logs/stream", s.auth(http.HandlerFunc(s.handleLogsStream)))
+
+	// Authenticated pprof endpoints (bound on 127.0.0.1:6185 for SSH-tunneled diagnostics).
+	mux.Handle("GET /debug/pprof/", s.auth(http.HandlerFunc(pprof.Index)))
+	mux.Handle("GET /debug/pprof/cmdline", s.auth(http.HandlerFunc(pprof.Cmdline)))
+	mux.Handle("GET /debug/pprof/profile", s.auth(http.HandlerFunc(pprof.Profile)))
+	mux.Handle("GET /debug/pprof/symbol", s.auth(http.HandlerFunc(pprof.Symbol)))
+	mux.Handle("GET /debug/pprof/trace", s.auth(http.HandlerFunc(pprof.Trace)))
 
 	return mux
 }

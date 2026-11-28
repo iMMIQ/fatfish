@@ -30,8 +30,9 @@ type Service struct {
 	dim   int
 
 	mu            sync.RWMutex
-	epIndex       *vec.FlatF16Index // key: "ep:<id>"
-	epChannels    map[string]model.ChannelID
+	epIndices     map[model.ChannelID]*vec.FlatF16Index // per-channel compact float16 index (zero cross-channel scan)
+	epLoadedCnt   int
+	epLoadedMaxID int64
 	ignoredBots   map[string]struct{}
 	profileShards [64]sync.Mutex // Striped per-(channel,member) locks for L2 profile RMW
 }
@@ -63,8 +64,7 @@ func NewService(st *store.Store, hub *infer.Hub, dim int, logger *slog.Logger) *
 		hub:         hub,
 		log:         logger,
 		dim:         dim,
-		epIndex:     vec.NewFlatF16Index(dim, 0.0), // diverse episodes -> alpha=0
-		epChannels:  make(map[string]model.ChannelID),
+		epIndices:   make(map[model.ChannelID]*vec.FlatF16Index),
 		ignoredBots: make(map[string]struct{}),
 	}
 }
@@ -92,26 +92,36 @@ func (s *Service) ignoredBotsCopy() map[string]bool {
 	return out
 }
 
-// LoadIndex loads resident float16 episode vectors from SQLite into RAM outside the write lock,
-// swapping pointers in O(1) so concurrent Recall queries never stall during hourly reloads.
+// LoadIndex streams resident float16 episode vectors from SQLite directly into per-channel RAM
+// indices outside the write lock (avoiding full Episode JSON decoding and 2x peak RAM),
+// then swaps pointers in O(1) so concurrent Recall queries never stall.
 func (s *Service) LoadIndex(ctx context.Context) (int, error) {
-	eps, blobs, err := s.store.AllEpisodesWithEmbeds(ctx)
+	newIndices := make(map[model.ChannelID]*vec.FlatF16Index)
+	loaded := 0
+	var maxID int64
+	_, err := s.store.StreamEpisodeEmbeds(ctx, func(id int64, ch model.ChannelID, blob []byte) {
+		if len(blob) != s.dim*2 {
+			return
+		}
+		idx := newIndices[ch]
+		if idx == nil {
+			idx = vec.NewFlatF16Index(s.dim, 0.0)
+			newIndices[ch] = idx
+		}
+		if idx.UpsertPreencoded(episodeKey(id), blob) {
+			loaded++
+			if id > maxID {
+				maxID = id
+			}
+		}
+	})
 	if err != nil {
 		return 0, err
 	}
-	newIdx := vec.NewFlatF16Index(s.dim, 0.0)
-	newCh := make(map[string]model.ChannelID, len(eps))
-	loaded := 0
-	for i, ep := range eps {
-		key := episodeKey(ep.ID)
-		newCh[key] = ep.ChannelID
-		if len(blobs[i]) == s.dim*2 && newIdx.UpsertPreencoded(key, blobs[i]) {
-			loaded++
-		}
-	}
 	s.mu.Lock()
-	s.epIndex = newIdx
-	s.epChannels = newCh
+	s.epIndices = newIndices
+	s.epLoadedCnt = loaded
+	s.epLoadedMaxID = maxID
 	s.mu.Unlock()
 	return loaded, nil
 }
@@ -426,7 +436,8 @@ func (s *Service) recallHybridMemory(ctx context.Context, opts RecallOptions) (R
 	)
 
 	s.mu.RLock()
-	hasEpVecs := s.epIndex.Len() > 0
+	chIdx := s.epIndices[opts.ChannelID]
+	hasEpVecs := chIdx != nil && chIdx.Len() > 0
 	s.mu.RUnlock()
 
 	var wg sync.WaitGroup
@@ -453,10 +464,11 @@ func (s *Service) recallHybridMemory(ctx context.Context, opts RecallOptions) (R
 			defer wg.Done()
 			if embs, err := s.hub.Embed(ctx, []string{opts.Query}); err == nil && len(embs) == 1 && len(embs[0]) == s.dim {
 				s.mu.RLock()
-				vecHits = s.epIndex.Search(embs[0], 20, func(id string) bool {
-					return s.epChannels[id] == opts.ChannelID
-				})
+				idx := s.epIndices[opts.ChannelID]
 				s.mu.RUnlock()
+				if idx != nil {
+					vecHits = idx.Search(embs[0], 20, nil)
+				}
 			}
 		}()
 	}
@@ -925,9 +937,16 @@ Rules:
 	}
 	if len(rawVec) == s.dim {
 		s.mu.Lock()
-		key := episodeKey(ep.ID)
-		s.epChannels[key] = ch
-		s.epIndex.Upsert(key, rawVec)
+		idx := s.epIndices[ch]
+		if idx == nil {
+			idx = vec.NewFlatF16Index(s.dim, 0.0)
+			s.epIndices[ch] = idx
+		}
+		idx.Upsert(episodeKey(ep.ID), rawVec)
+		s.epLoadedCnt++
+		if ep.ID > s.epLoadedMaxID {
+			s.epLoadedMaxID = ep.ID
+		}
 		s.mu.Unlock()
 	}
 
@@ -1155,8 +1174,19 @@ func isValidLoreTerm(term string) bool {
 	return hasLetterOrHan
 }
 
-// ReloadIndex refreshes the in-memory float16 episode index from SQLite (picks up external CLI distill runs).
+// ReloadIndex refreshes the in-memory float16 episode index from SQLite (picks up external CLI distill runs),
+// skipping the full stream in O(1) when episode count and max ID are unchanged.
 func (s *Service) ReloadIndex(ctx context.Context) (int, error) {
+	cnt, maxID, err := s.store.EpisodeEmbedStats(ctx)
+	if err == nil {
+		s.mu.RLock()
+		same := cnt == s.epLoadedCnt && maxID == s.epLoadedMaxID
+		curCnt := s.epLoadedCnt
+		s.mu.RUnlock()
+		if same {
+			return curCnt, nil
+		}
+	}
 	return s.LoadIndex(ctx)
 }
 

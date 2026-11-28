@@ -3,6 +3,7 @@ package travel
 import (
 	"math"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/iMMIQ/fatfish/internal/model"
@@ -327,9 +328,19 @@ func transportModeZH(mode string) string {
 	}
 }
 
+var cityLocationCache sync.Map // map[string]*time.Location
+
 func loadCityLocation(tz string) *time.Location {
-	if loc, err := time.LoadLocation(tz); err == nil {
-		return loc
+	if tz == "" || tz == "UTC" {
+		return time.UTC
 	}
-	return time.UTC
+	if v, ok := cityLocationCache.Load(tz); ok {
+		return v.(*time.Location)
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		return time.UTC
+	}
+	cityLocationCache.Store(tz, loc)
+	return loc
 }

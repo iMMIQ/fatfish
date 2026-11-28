@@ -35,6 +35,7 @@ type Client struct {
 	conn    *websocket.Conn
 	writeMu sync.Mutex
 	revSrv  *http.Server
+	httpCli *http.Client
 
 	pendingMu sync.Mutex
 	pending   map[string]chan apiResponse
@@ -59,8 +60,17 @@ func New(cfg config.OneBotConfig, logger *slog.Logger) *Client {
 		logger = slog.Default()
 	}
 	c := &Client{
-		cfg:     cfg,
-		log:     logger,
+		cfg: cfg,
+		log: logger,
+		httpCli: &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http.Transport{
+				Proxy:               nil,
+				MaxIdleConns:        16,
+				MaxIdleConnsPerHost: 8,
+				IdleConnTimeout:     60 * time.Second,
+			},
+		},
 		pending: make(map[string]chan apiResponse),
 		stopCh:  make(chan struct{}),
 	}
@@ -169,6 +179,9 @@ func (c *Client) Stop() error {
 			_ = c.conn.Close()
 		}
 		c.connMu.Unlock()
+		if c.httpCli != nil {
+			c.httpCli.CloseIdleConnections()
+		}
 	})
 	return nil
 }
@@ -272,29 +285,82 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn, onMessage f
 	}
 }
 
+type onebotRawFrame struct {
+	// API response fields
+	Echo    string          `json:"echo"`
+	Status  string          `json:"status"`
+	RetCode int             `json:"retcode"`
+	Data    json.RawMessage `json:"data"`
+	RespMsg string          `json:"wording"`
+
+	// Event fields
+	PostType    string          `json:"post_type"`
+	MessageType string          `json:"message_type"`
+	NoticeType  string          `json:"notice_type"`
+	SubType     string          `json:"sub_type"`
+	SelfID      any             `json:"self_id"`
+	GroupID     any             `json:"group_id"`
+	UserID      any             `json:"user_id"`
+	OperatorID  any             `json:"operator_id"`
+	TargetID    any             `json:"target_id"`
+	MessageID   any             `json:"message_id"`
+	Time        int64           `json:"time"`
+	RawMessage  string          `json:"raw_message"`
+	Message     json.RawMessage `json:"message"`
+	Sender      struct {
+		UserID   any    `json:"user_id"`
+		Nickname string `json:"nickname"`
+		Card     string `json:"card"`
+		Role     string `json:"role"`
+	} `json:"sender"`
+}
+
+type onebotSegment struct {
+	Type string `json:"type"`
+	Data struct {
+		Text     any    `json:"text"`
+		QQ       any    `json:"qq"`
+		ID       any    `json:"id"`
+		Summary  any    `json:"summary"`
+		URL      any    `json:"url"`
+		File     any    `json:"file"`
+		FileID   any    `json:"file_id"`
+		FileSize any    `json:"file_size"`
+		Duration any    `json:"duration"`
+		Time     any    `json:"time"`
+		Data     any    `json:"data"`
+		Raw      *struct {
+			FaceText any `json:"faceText"`
+		} `json:"raw"`
+	} `json:"data"`
+}
+
 func (c *Client) handleFrame(raw []byte, onMessage func(*model.Message)) {
-	// Check if it's an API response (has echo).
-	var probe struct {
-		Echo     string `json:"echo"`
-		PostType string `json:"post_type"`
-		SelfID   any    `json:"self_id"`
-	}
-	if err := json.Unmarshal(raw, &probe); err != nil {
+	// Single-pass top-level JSON decode handles both API echo responses and inbound events.
+	var frame onebotRawFrame
+	if err := json.Unmarshal(raw, &frame); err != nil {
 		return
 	}
-	if sid := anyToString(probe.SelfID); sid != "" && c.SelfID() == "" {
+	if sid := anyToString(frame.SelfID); sid != "" && c.SelfID() == "" {
 		c.selfID.Store(sid)
 	}
-	if probe.Echo != "" && probe.PostType == "" {
-		var resp apiResponse
-		if err := json.Unmarshal(raw, &resp); err == nil {
-			c.pendingMu.Lock()
-			ch := c.pending[resp.Echo]
-			delete(c.pending, resp.Echo)
-			c.pendingMu.Unlock()
-			if ch != nil {
-				ch <- resp
-			}
+	if frame.Echo != "" && frame.PostType == "" {
+		var apiMsg string
+		_ = json.Unmarshal(frame.Message, &apiMsg)
+		resp := apiResponse{
+			Status:  frame.Status,
+			RetCode: frame.RetCode,
+			Data:    frame.Data,
+			Message: apiMsg,
+			Wording: frame.RespMsg,
+			Echo:    frame.Echo,
+		}
+		c.pendingMu.Lock()
+		ch := c.pending[resp.Echo]
+		delete(c.pending, resp.Echo)
+		c.pendingMu.Unlock()
+		if ch != nil {
+			ch <- resp
 		}
 		return
 	}
@@ -303,7 +369,7 @@ func (c *Client) handleFrame(raw []byte, onMessage func(*model.Message)) {
 	if c.inboundStopped.Load() {
 		return
 	}
-	if msg := ParseEvent(raw, c.SelfID()); msg != nil && onMessage != nil {
+	if msg := parseEventFrame(&frame, c.SelfID()); msg != nil && onMessage != nil {
 		onMessage(msg)
 	}
 }
@@ -311,31 +377,14 @@ func (c *Client) handleFrame(raw []byte, onMessage func(*model.Message)) {
 // ParseEvent decodes a OneBot v11 JSON event into a normalized model.Message.
 // Exported for unit tests.
 func ParseEvent(raw []byte, fallbackSelfID string) *model.Message {
-	var ev struct {
-		PostType    string          `json:"post_type"`
-		MessageType string          `json:"message_type"`
-		NoticeType  string          `json:"notice_type"`
-		SubType     string          `json:"sub_type"`
-		SelfID      any             `json:"self_id"`
-		GroupID     any             `json:"group_id"`
-		UserID      any             `json:"user_id"`
-		OperatorID  any             `json:"operator_id"`
-		TargetID    any             `json:"target_id"`
-		MessageID   any             `json:"message_id"`
-		Time        int64           `json:"time"`
-		RawMessage  string          `json:"raw_message"`
-		Message     json.RawMessage `json:"message"`
-		Sender      struct {
-			UserID   any    `json:"user_id"`
-			Nickname string `json:"nickname"`
-			Card     string `json:"card"`
-			Role     string `json:"role"`
-		} `json:"sender"`
-	}
+	var ev onebotRawFrame
 	if err := json.Unmarshal(raw, &ev); err != nil {
 		return nil
 	}
+	return parseEventFrame(&ev, fallbackSelfID)
+}
 
+func parseEventFrame(ev *onebotRawFrame, fallbackSelfID string) *model.Message {
 	selfID := anyToString(ev.SelfID)
 	if selfID == "" {
 		selfID = fallbackSelfID
@@ -445,20 +494,19 @@ func ParseEvent(raw []byte, fallbackSelfID string) *model.Message {
 		CreatedAt:     ts,
 	}
 
-	// Parse OneBot v11 message segments array.
-	var segs []struct {
-		Type string         `json:"type"`
-		Data map[string]any `json:"data"`
-	}
+	// Parse OneBot v11 message segments array using typed structs (avoiding per-segment map[string]any allocs).
+	var segs []onebotSegment
 	if err := json.Unmarshal(ev.Message, &segs); err == nil && len(segs) > 0 {
-		for _, seg := range segs {
+		msg.Parts = make([]model.Part, 0, len(segs))
+		for i := range segs {
+			seg := &segs[i]
 			switch seg.Type {
 			case "text":
-				if txt := anyToString(seg.Data["text"]); txt != "" {
+				if txt := anyToString(seg.Data.Text); txt != "" {
 					msg.Parts = append(msg.Parts, model.Part{Kind: model.PartText, Text: txt})
 				}
 			case "at":
-				qq := anyToString(seg.Data["qq"])
+				qq := anyToString(seg.Data.QQ)
 				if qq == selfID {
 					msg.MentionedBot = true
 				} else if qq == "all" {
@@ -467,66 +515,70 @@ func ParseEvent(raw []byte, fallbackSelfID string) *model.Message {
 					msg.Parts = append(msg.Parts, model.Part{Kind: model.PartMention, TargetID: qq, Text: "@" + qq})
 				}
 			case "face":
-				if ftxt := formatQQFace(seg.Data); ftxt != "" {
+				faceText := ""
+				if seg.Data.Raw != nil {
+					faceText = anyToString(seg.Data.Raw.FaceText)
+				}
+				if ftxt := formatQQFace(anyToString(seg.Data.ID), faceText); ftxt != "" {
 					msg.Parts = append(msg.Parts, model.Part{Kind: model.PartText, Text: ftxt})
 				}
 			case "mface":
-				sum := strings.TrimSpace(anyToString(seg.Data["summary"]))
+				sum := strings.TrimSpace(anyToString(seg.Data.Summary))
 				if sum == "" {
 					sum = "[大表情]"
 				}
 				msg.Parts = append(msg.Parts, model.Part{Kind: model.PartText, Text: sum})
 			case "reply":
-				rid := anyToString(seg.Data["id"])
+				rid := anyToString(seg.Data.ID)
 				if rid != "" {
 					msg.ReplyToMsgID = rid
 					msg.Parts = append(msg.Parts, model.Part{Kind: model.PartQuote, RefMsgID: rid})
 				}
 			case "image":
-				u := anyToString(seg.Data["url"])
+				u := anyToString(seg.Data.URL)
 				if u == "" {
-					u = anyToString(seg.Data["file"])
+					u = anyToString(seg.Data.File)
 				}
 				msg.Parts = append(msg.Parts, model.Part{
 					Kind:   model.PartImage,
 					URL:    u,
-					FileID: anyToString(seg.Data["file"]),
+					FileID: anyToString(seg.Data.File),
 				})
 			case "record":
-				durSec, _ := strconv.Atoi(anyToString(seg.Data["duration"]))
+				durSec, _ := strconv.Atoi(anyToString(seg.Data.Duration))
 				if durSec <= 0 {
-					durSec, _ = strconv.Atoi(anyToString(seg.Data["time"]))
+					durSec, _ = strconv.Atoi(anyToString(seg.Data.Time))
 				}
 				msg.Parts = append(msg.Parts, model.Part{
 					Kind:       model.PartAudio,
-					URL:        anyToString(seg.Data["url"]),
-					FileID:     anyToString(seg.Data["file"]),
+					URL:        anyToString(seg.Data.URL),
+					FileID:     anyToString(seg.Data.File),
 					DurationMs: durSec * 1000,
 					ASRStatus:  "pending",
 				})
 			case "video":
 				msg.Parts = append(msg.Parts, model.Part{
 					Kind:   model.PartVideo,
-					URL:    anyToString(seg.Data["url"]),
-					FileID: anyToString(seg.Data["file"]),
+					URL:    anyToString(seg.Data.URL),
+					FileID: anyToString(seg.Data.File),
 				})
 			case "file":
-				sz, _ := strconv.ParseInt(anyToString(seg.Data["file_size"]), 10, 64)
+				sz, _ := strconv.ParseInt(anyToString(seg.Data.FileSize), 10, 64)
 				msg.Parts = append(msg.Parts, model.Part{
 					Kind:     model.PartFile,
-					Title:    anyToString(seg.Data["file"]),
-					URL:      anyToString(seg.Data["url"]),
-					FileID:   anyToString(seg.Data["file_id"]),
+					Title:    anyToString(seg.Data.File),
+					URL:      anyToString(seg.Data.URL),
+					FileID:   anyToString(seg.Data.FileID),
 					FileSize: sz,
 				})
 			case "json":
-				if card := parseQQJSONCard(anyToString(seg.Data["data"])); card != nil {
+				if card := parseQQJSONCard(anyToString(seg.Data.Data)); card != nil {
 					msg.Parts = append(msg.Parts, *card)
 				}
 			case "forward":
 				msg.Parts = append(msg.Parts, model.Part{
 					Kind:   model.PartForward,
-					FileID: anyToString(seg.Data["id"]),
+					FileID: anyToString(seg.Data.ID),
 				})
 			}
 		}
@@ -855,9 +907,9 @@ func (c *Client) FetchAudio(ctx context.Context, fileID, outFormat string) ([]by
 		if err != nil {
 			return nil, "", err
 		}
-		hcli := &http.Client{
-			Timeout:   10 * time.Second,
-			Transport: &http.Transport{Proxy: nil},
+		hcli := c.httpCli
+		if hcli == nil {
+			hcli = http.DefaultClient
 		}
 		hresp, err := hcli.Do(req)
 		if err != nil {

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime/debug"
 
 	"gopkg.in/yaml.v3"
 
@@ -65,6 +66,11 @@ func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	cfgPath := fs.String("c", "configs/fatfish.example.yaml", "path to YAML config")
 	_ = fs.Parse(args)
+
+	// Default soft memory limit for 512 MiB container deployments unless overridden via GOMEMLIMIT.
+	if os.Getenv("GOMEMLIMIT") == "" {
+		debug.SetMemoryLimit(360 << 20)
+	}
 
 	application, err := app.New(*cfgPath, true)
 	if err != nil {

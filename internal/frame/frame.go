@@ -64,16 +64,33 @@ type AssembleResult struct {
 // SnapshotInput provides the channel-scoped memory components used ONCE when opening a new segment.
 type SnapshotInput = model.SnapshotInput
 
+type cachedCalBudget struct {
+	textMult   float64
+	imgReserve int
+}
+
 // Builder manages segments, Segment-Pinned Memory Snapshots, FrozenFrames, batch trimming (80%->50%),
 // and the Adaptive Token Budget Calibrator.
 type Builder struct {
 	store *store.Store
 	mu    sync.RWMutex
 	cfg   config.FrameConfig
+
+	calMu    sync.RWMutex
+	calCache map[string]cachedCalBudget
+
+	sysMu         sync.RWMutex
+	lastPersona   string
+	lastSysPrompt string
+	lastSysTokens int
 }
 
 func NewBuilder(st *store.Store, cfg config.FrameConfig) *Builder {
-	return &Builder{store: st, cfg: cfg}
+	return &Builder{
+		store:    st,
+		cfg:      cfg,
+		calCache: make(map[string]cachedCalBudget),
+	}
 }
 
 // UpdateConfig hot-swaps FrameConfig safely.
@@ -81,6 +98,28 @@ func (b *Builder) UpdateConfig(cfg config.FrameConfig) {
 	b.mu.Lock()
 	b.cfg = cfg
 	b.mu.Unlock()
+	b.calMu.Lock()
+	b.calCache = make(map[string]cachedCalBudget)
+	b.calMu.Unlock()
+}
+
+func (b *Builder) cachedSystemPrompt(personaText string) (string, int) {
+	b.sysMu.RLock()
+	if b.lastSysPrompt != "" && b.lastPersona == personaText {
+		sp, tok := b.lastSysPrompt, b.lastSysTokens
+		b.sysMu.RUnlock()
+		return sp, tok
+	}
+	b.sysMu.RUnlock()
+
+	sp := SystemPrompt(personaText)
+	tok := EstimateTextTokens(sp)
+	b.sysMu.Lock()
+	b.lastPersona = personaText
+	b.lastSysPrompt = sp
+	b.lastSysTokens = tok
+	b.sysMu.Unlock()
+	return sp, tok
 }
 
 func (b *Builder) getConfig() config.FrameConfig {
@@ -371,7 +410,8 @@ func (b *Builder) AssemblePlan(
 	highWater := int(float64(budget) * cfg.TrimHighWater)
 	lowWater := int(float64(budget) * cfg.TrimLowWater)
 
-	baseRawText := EstimateTextTokens(SystemPrompt(personaText)) + EstimateTextTokens(seg.PinnedSnapshot) + toolTokens
+	sysPrompt, sysTokens := b.cachedSystemPrompt(personaText)
+	baseRawText := sysTokens + EstimateTextTokens(seg.PinnedSnapshot) + toolTokens
 	curRawText := 0
 	curImgs := 0
 	if hasCur {
@@ -403,7 +443,7 @@ func (b *Builder) AssemblePlan(
 	msgs := make([]infer.ChatMessage, 0, len(frames)+3)
 	msgs = append(msgs, infer.ChatMessage{
 		Role:    "system",
-		Content: SystemPrompt(personaText),
+		Content: sysPrompt,
 	})
 	msgs = append(msgs, infer.ChatMessage{
 		Role:    "user",
@@ -420,8 +460,8 @@ func (b *Builder) AssemblePlan(
 		estTextTokens += frameRawText[i]
 	}
 
-	// Prefix hash covers [msg 0..k] using lightweight SHA-256 media refs instead of multi-MB base64 payloads.
-	prefixHash := hashCanonicalPrefix(SystemPrompt(personaText), seg.PinnedSnapshot, parsed)
+	// Prefix hash covers [msg 0..k] directly over stored canonical PayloadJSON without re-marshaling.
+	prefixHash := hashCanonicalPrefixRaw(sysPrompt, seg.PinnedSnapshot, frames)
 
 	var effUser *StoredFramePayload
 	if hasCur {
@@ -475,15 +515,14 @@ func (b *Builder) AppendFrozenFramesWithTrim(ctx context.Context, seg *store.Seg
 	return b.store.CommitTurnFrames(ctx, seg.ID, trimUpToIdx, recs, now)
 }
 
-func hashCanonicalPrefix(sysPrompt, pinnedSnapshot string, frames []StoredFramePayload) string {
+func hashCanonicalPrefixRaw(sysPrompt, pinnedSnapshot string, frames []store.FrameRecord) string {
 	h := sha256.New()
 	_, _ = h.Write([]byte(sysPrompt))
 	_, _ = h.Write([]byte{0})
 	_, _ = h.Write([]byte(pinnedSnapshot))
 	for _, f := range frames {
 		_, _ = h.Write([]byte{0})
-		raw, _ := json.Marshal(f)
-		_, _ = h.Write(raw)
+		_, _ = h.Write([]byte(f.PayloadJSON))
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -641,6 +680,11 @@ func (b *Builder) rehydratePayload(p StoredFramePayload, includeImages bool) (in
 		return cm, 0
 	}
 	cm.Content = parts
+	// Pre-encode multimodal messages containing base64 data URIs once so multi-step tool loops
+	// never re-marshal multi-MB base64 strings on iterations 2..N.
+	if raw, err := json.Marshal(cm); err == nil {
+		cm.PreencodedJSON = raw
+	}
 	return cm, loaded
 }
 
@@ -693,7 +737,7 @@ func findImageTurnTrimCutoff(frames []store.FrameRecord, frameImgs []int, imgsTo
 }
 
 // RecordCalibratorSample feeds first-attempt real prompt_tokens (against raw uncalibrated estText)
-// into the rolling 96-sample calibrator.
+// into the rolling 96-sample calibrator and invalidates the in-memory budget cache for modelKey.
 func (b *Builder) RecordCalibratorSample(ctx context.Context, modelKey string, estText, actualTok, imageCount int) {
 	if b.store == nil || estText <= 0 || actualTok <= 0 {
 		return
@@ -705,11 +749,24 @@ func (b *Builder) RecordCalibratorSample(ctx context.Context, modelKey string, e
 		ImageCount: imageCount,
 		CreatedAt:  time.Now(),
 	})
+	b.calMu.Lock()
+	delete(b.calCache, modelKey)
+	b.calMu.Unlock()
 }
 
 // CalibratedBudget computes both the adaptive text multiplier (+20% safety margin) and
-// upward-only calibrated per-image token reserve from the rolling 96-sample window (SPEC §6.2).
+// upward-only calibrated per-image token reserve from the rolling 96-sample window (SPEC §6.2),
+// served from an in-memory per-model cache invalidated whenever new samples arrive.
 func (b *Builder) CalibratedBudget(ctx context.Context, modelKey string) (textMult float64, imgReserve int) {
+	if modelKey != "" {
+		b.calMu.RLock()
+		if cached, ok := b.calCache[modelKey]; ok {
+			b.calMu.RUnlock()
+			return cached.textMult, cached.imgReserve
+		}
+		b.calMu.RUnlock()
+	}
+
 	cfg := b.getConfig()
 	baseReserve := defaultIfNonPos(cfg.ImageTokenReserve, 1600)
 	textMult = 1.20
@@ -720,6 +777,12 @@ func (b *Builder) CalibratedBudget(ctx context.Context, modelKey string) (textMu
 	}
 	samples, err := b.store.RecentCalibratorSamples(ctx, modelKey, 96)
 	if err != nil || len(samples) == 0 {
+		b.calMu.Lock()
+		if b.calCache == nil {
+			b.calCache = make(map[string]cachedCalBudget)
+		}
+		b.calCache[modelKey] = cachedCalBudget{textMult: textMult, imgReserve: imgReserve}
+		b.calMu.Unlock()
 		return textMult, imgReserve
 	}
 
@@ -753,6 +816,12 @@ func (b *Builder) CalibratedBudget(ctx context.Context, modelKey string) (textMu
 	if imgReserve > 8192 {
 		imgReserve = 8192
 	}
+	b.calMu.Lock()
+	if b.calCache == nil {
+		b.calCache = make(map[string]cachedCalBudget)
+	}
+	b.calCache[modelKey] = cachedCalBudget{textMult: textMult, imgReserve: imgReserve}
+	b.calMu.Unlock()
 	return textMult, imgReserve
 }
 

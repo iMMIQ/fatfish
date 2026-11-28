@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -225,18 +226,30 @@ func SafeDialer(timeout time.Duration, allowHosts []string) *net.Dialer {
 	}
 }
 
-// NewSafeHTTPClient builds an http.Client with post-DNS SSRF blocking, hostname/IP allowlisting,
-// optional default User-Agent, and redirect validation.
-func NewSafeHTTPClient(opts SafeClientOptions) *http.Client {
-	if opts.Timeout <= 0 {
-		opts.Timeout = 20 * time.Second
-	}
-	dialTimeout := minDuration(opts.Timeout, 10*time.Second)
-	al := parseAllowlist(opts.AllowHosts)
-	safeDialer := SafeDialer(dialTimeout, opts.AllowHosts)
-	plainDialer := &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
+var (
+	sharedTrMu sync.RWMutex
+	sharedTrs  = make(map[string]*http.Transport)
+)
 
-	tr := &http.Transport{
+func allowHostsKey(allowHosts []string) string {
+	if len(allowHosts) == 0 {
+		return ""
+	}
+	norm := make([]string, 0, len(allowHosts))
+	for _, h := range allowHosts {
+		if s := strings.ToLower(strings.TrimSpace(h)); s != "" {
+			norm = append(norm, s)
+		}
+	}
+	sort.Strings(norm)
+	return strings.Join(norm, ",")
+}
+
+func newSafeTransport(dialTimeout time.Duration, allowHosts []string) *http.Transport {
+	al := parseAllowlist(allowHosts)
+	safeDialer := SafeDialer(dialTimeout, allowHosts)
+	plainDialer := &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
+	return &http.Transport{
 		Proxy: nil, // Never proxy untrusted SSRF-checked requests through arbitrary local proxies
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 			host, _, err := net.SplitHostPort(address)
@@ -251,6 +264,48 @@ func NewSafeHTTPClient(opts SafeClientOptions) *http.Client {
 		IdleConnTimeout:       60 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+	}
+}
+
+// SharedSafeTransport returns a shared SSRF-safe *http.Transport for allowHosts (10s dial timeout),
+// pooling TCP/TLS connections across tools (parser, web_search, read_source, quote, weather, travel, room).
+func SharedSafeTransport(allowHosts []string) *http.Transport {
+	key := allowHostsKey(allowHosts)
+	sharedTrMu.RLock()
+	tr, ok := sharedTrs[key]
+	sharedTrMu.RUnlock()
+	if ok {
+		return tr
+	}
+	sharedTrMu.Lock()
+	defer sharedTrMu.Unlock()
+	if tr, ok := sharedTrs[key]; ok {
+		return tr
+	}
+	// Bound cached transport variants to prevent unbounded growth across repeated allowlist edits.
+	if len(sharedTrs) >= 8 {
+		for k, old := range sharedTrs {
+			old.CloseIdleConnections()
+			delete(sharedTrs, k)
+		}
+	}
+	tr = newSafeTransport(10*time.Second, allowHosts)
+	sharedTrs[key] = tr
+	return tr
+}
+
+// NewSafeHTTPClient builds an http.Client with post-DNS SSRF blocking, hostname/IP allowlisting,
+// shared TCP/TLS connection pooling, optional default User-Agent, and redirect validation.
+func NewSafeHTTPClient(opts SafeClientOptions) *http.Client {
+	if opts.Timeout <= 0 {
+		opts.Timeout = 20 * time.Second
+	}
+	dialTimeout := minDuration(opts.Timeout, 10*time.Second)
+	var tr *http.Transport
+	if dialTimeout == 10*time.Second {
+		tr = SharedSafeTransport(opts.AllowHosts)
+	} else {
+		tr = newSafeTransport(dialTimeout, opts.AllowHosts)
 	}
 	var rt http.RoundTripper = tr
 	if strings.TrimSpace(opts.UserAgent) != "" {

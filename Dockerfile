@@ -26,6 +26,7 @@ COPY configs/fatfish.example.yaml /app/configs/fatfish.example.yaml
 COPY configs/personas/example.md /app/configs/personas/example.md
 
 ENV TZ=Asia/Shanghai
+ENV GOMEMLIMIT=360MiB
 EXPOSE 6185
 
 ENTRYPOINT ["fatfish"]

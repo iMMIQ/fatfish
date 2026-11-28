@@ -120,18 +120,20 @@ func MimeTypeFor(st model.Sticker) string {
 	}
 }
 
-// LoadIndex loads all ready stickers and their pre-centered float16 dual vectors into RAM.
+// LoadIndex streams all ready stickers and their pre-centered float16 dual vectors into RAM
+// with pre-reserved backing slices to avoid intermediate slice allocations and 2x peak RAM.
 func (e *Engine) LoadIndex(ctx context.Context) (int, error) {
 	cfg := e.getConfig()
-	rows, err := e.store.ListStickers(ctx, "ready")
-	if err != nil {
-		return 0, err
-	}
+	cnt, _ := e.store.CountStickers(ctx, "ready")
 	intentIdx := vec.NewFlatF16Index(e.dim, float32(cfg.DocCenteringAlpha))
 	contentIdx := vec.NewFlatF16Index(e.dim, float32(cfg.DocCenteringAlpha))
-	stMap := make(map[string]model.Sticker, len(rows))
+	if cnt > 0 {
+		intentIdx.Reserve(cnt)
+		contentIdx.Reserve(cnt)
+	}
+	stMap := make(map[string]model.Sticker, cnt)
 
-	for _, r := range rows {
+	_, err := e.store.StreamStickers(ctx, "ready", func(r store.StickerRow) {
 		stMap[r.Sticker.StickerID] = r.Sticker
 		if len(r.IntentF16) == e.dim*2 {
 			intentIdx.UpsertPreencoded(r.Sticker.StickerID, r.IntentF16)
@@ -139,6 +141,9 @@ func (e *Engine) LoadIndex(ctx context.Context) (int, error) {
 		if len(r.ContentF16) == e.dim*2 {
 			contentIdx.UpsertPreencoded(r.Sticker.StickerID, r.ContentF16)
 		}
+	})
+	if err != nil {
+		return 0, err
 	}
 	if mean := e.loadMeanMeta(ctx, "sticker_mean_intent"); len(mean) == e.dim {
 		intentIdx.SetMean(mean, float32(cfg.DocCenteringAlpha))
@@ -379,22 +384,39 @@ func (e *Engine) Search(ctx context.Context, opts SearchOptions) ([]SearchHit, e
 		return cands[i].FinalScore > cands[j].FinalScore
 	})
 
-	// 6. MMR diversity across Top-K.
+	// 6. MMR diversity across Top-K directly on compact float16 vectors (single batch lock, zero float32 allocs).
 	mmrIn := make([]vec.Hit, len(cands))
+	candIDs := make([]string, len(cands))
 	candByID := make(map[string]SearchHit, len(cands))
 	for i, c := range cands {
 		mmrIn[i] = vec.Hit{ID: c.Sticker.StickerID, Score: float32(c.FinalScore)}
+		candIDs[i] = c.Sticker.StickerID
 		candByID[c.Sticker.StickerID] = c
 	}
-	vecLookup := func(id string) ([]float32, bool) {
-		e.mu.RLock()
-		defer e.mu.RUnlock()
-		if v, ok := e.intentIdx.Vector(id); ok {
-			return v, true
+	e.mu.RLock()
+	f16Vecs := e.intentIdx.LookupF16Batch(candIDs)
+	if len(f16Vecs) < len(candIDs) {
+		var missing []string
+		for _, id := range candIDs {
+			if _, ok := f16Vecs[id]; !ok {
+				missing = append(missing, id)
+			}
 		}
-		return e.contentIdx.Vector(id)
+		if len(missing) > 0 {
+			if cVecs := e.contentIdx.LookupF16Batch(missing); len(cVecs) > 0 {
+				if f16Vecs == nil {
+					f16Vecs = cVecs
+				} else {
+					for id, v := range cVecs {
+						f16Vecs[id] = v
+					}
+				}
+			}
+		}
 	}
-	diverse := vec.MMRRerank(mmrIn, vecLookup, float32(cfg.MMRLambda), opts.TopK)
+	e.mu.RUnlock()
+
+	diverse := vec.MMRRerankF16(mmrIn, f16Vecs, float32(cfg.MMRLambda), opts.TopK)
 	out := make([]SearchHit, 0, len(diverse))
 	for _, d := range diverse {
 		out = append(out, candByID[d.ID])
@@ -600,50 +622,72 @@ func (e *Engine) EnrichAndTag(ctx context.Context, tagUntagged bool) (enriched i
 	return int(enrichedCnt.Load()), int(taggedCnt.Load()), nil
 }
 
-// ReindexOne embeds a single sticker (used when approving a sticker in the Console) and refreshes RAM index.
+// ReindexOne embeds a single sticker (used when approving a sticker in the Console) and updates RAM index in-place.
 func (e *Engine) ReindexOne(ctx context.Context, stickerID string) error {
+	row, err := e.store.GetStickerByID(ctx, stickerID)
+	if err != nil {
+		// Fallback to removing stale entry if deleted or unavailable.
+		e.mu.Lock()
+		delete(e.stickers, stickerID)
+		e.intentIdx.Delete(stickerID)
+		e.contentIdx.Delete(stickerID)
+		e.mu.Unlock()
+		return err
+	}
+	if row.Sticker.Status != "ready" {
+		e.mu.Lock()
+		delete(e.stickers, stickerID)
+		e.intentIdx.Delete(stickerID)
+		e.contentIdx.Delete(stickerID)
+		e.mu.Unlock()
+		return nil
+	}
+
+	intentBlob := row.IntentF16
+	contentBlob := row.ContentF16
 	if e.hub != nil {
-		rows, err := e.store.ListStickers(ctx, "ready")
-		if err != nil {
-			return err
+		it := strings.TrimSpace(row.Sticker.IntentText)
+		ct := strings.TrimSpace(row.Sticker.ContentText + " " + row.Sticker.OCRText)
+		if it == "" {
+			it = ct
 		}
-		for _, r := range rows {
-			if r.Sticker.StickerID != stickerID {
-				continue
-			}
-			it := strings.TrimSpace(r.Sticker.IntentText)
-			ct := strings.TrimSpace(r.Sticker.ContentText + " " + r.Sticker.OCRText)
-			if it == "" {
-				it = ct
-			}
-			if ct == "" {
-				ct = it
-			}
-			if it != "" {
-				if embs, err := e.hub.Embed(ctx, []string{it, ct}); err == nil && len(embs) == 2 && len(embs[0]) == e.dim && len(embs[1]) == e.dim {
-					alpha := float32(e.getConfig().DocCenteringAlpha)
-					iv := embs[0]
-					cv := embs[1]
-					if mean := e.loadMeanMeta(ctx, "sticker_mean_intent"); len(mean) == e.dim && alpha > 0 {
-						for j := range iv {
-							iv[j] -= alpha * mean[j]
-						}
+		if ct == "" {
+			ct = it
+		}
+		if it != "" {
+			if embs, err := e.hub.Embed(ctx, []string{it, ct}); err == nil && len(embs) == 2 && len(embs[0]) == e.dim && len(embs[1]) == e.dim {
+				alpha := float32(e.getConfig().DocCenteringAlpha)
+				iv := embs[0]
+				cv := embs[1]
+				if mean := e.loadMeanMeta(ctx, "sticker_mean_intent"); len(mean) == e.dim && alpha > 0 {
+					for j := range iv {
+						iv[j] -= alpha * mean[j]
 					}
-					if mean := e.loadMeanMeta(ctx, "sticker_mean_content"); len(mean) == e.dim && alpha > 0 {
-						for j := range cv {
-							cv[j] -= alpha * mean[j]
-						}
-					}
-					vec.NormalizeInPlace(iv)
-					vec.NormalizeInPlace(cv)
-					_ = e.store.UpdateStickerVectors(ctx, stickerID, vec.EncodeFloat16(iv), vec.EncodeFloat16(cv))
 				}
+				if mean := e.loadMeanMeta(ctx, "sticker_mean_content"); len(mean) == e.dim && alpha > 0 {
+					for j := range cv {
+						cv[j] -= alpha * mean[j]
+					}
+				}
+				vec.NormalizeInPlace(iv)
+				vec.NormalizeInPlace(cv)
+				intentBlob = vec.EncodeFloat16(iv)
+				contentBlob = vec.EncodeFloat16(cv)
+				_ = e.store.UpdateStickerVectors(ctx, stickerID, intentBlob, contentBlob)
 			}
-			break
 		}
 	}
-	_, err := e.LoadIndex(ctx)
-	return err
+
+	e.mu.Lock()
+	e.stickers[stickerID] = row.Sticker
+	if len(intentBlob) == e.dim*2 {
+		e.intentIdx.UpsertPreencoded(stickerID, intentBlob)
+	}
+	if len(contentBlob) == e.dim*2 {
+		e.contentIdx.UpsertPreencoded(stickerID, contentBlob)
+	}
+	e.mu.Unlock()
+	return nil
 }
 
 // Reindex computes embeddings for all ready stickers, applies doc-only centering with alpha,

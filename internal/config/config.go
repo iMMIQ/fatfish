@@ -38,10 +38,11 @@ type Config struct {
 	Console   ConsoleConfig   `yaml:"console"`
 
 	// Runtime-populated metadata (not serialized to YAML).
-	ConfigPath  string `yaml:"-"`
-	PersonaPath string `yaml:"-"`
-	PersonaText string `yaml:"-"`
-	PersonaHash string `yaml:"-"`
+	ConfigPath  string         `yaml:"-"`
+	PersonaPath string         `yaml:"-"`
+	PersonaText string         `yaml:"-"`
+	PersonaHash string         `yaml:"-"`
+	loc         *time.Location `yaml:"-"`
 }
 
 type TransportConfig struct {
@@ -709,10 +710,29 @@ func loadPersona(cfg *Config, baseDir string) error {
 	return nil
 }
 
+var tzLocationCache sync.Map // map[string]*time.Location
+
+func loadCachedLocation(tz string) (*time.Location, error) {
+	if tz == "" || tz == "UTC" {
+		return time.UTC, nil
+	}
+	if v, ok := tzLocationCache.Load(tz); ok {
+		return v.(*time.Location), nil
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		return nil, err
+	}
+	tzLocationCache.Store(tz, loc)
+	return loc, nil
+}
+
 func validateBasic(cfg *Config) error {
-	if _, err := time.LoadLocation(cfg.Timezone); err != nil {
+	loc, err := loadCachedLocation(cfg.Timezone)
+	if err != nil {
 		return fmt.Errorf("config: invalid timezone %q: %w", cfg.Timezone, err)
 	}
+	cfg.loc = loc
 	if cfg.Frame.TrimHighWater <= 0 || cfg.Frame.TrimHighWater >= 1 {
 		return errors.New("config: frame.trim_high_water must be in (0, 1)")
 	}
@@ -762,9 +782,15 @@ func EnsureConsoleToken(cfg *Config) (string, bool, error) {
 	return tok, true, nil
 }
 
-// Location returns the parsed time.Location for cfg.Timezone (falling back to UTC).
+// Location returns the cached parsed time.Location for cfg.Timezone (falling back to UTC).
 func (c *Config) Location() *time.Location {
-	loc, err := time.LoadLocation(c.Timezone)
+	if c == nil {
+		return time.UTC
+	}
+	if c.loc != nil {
+		return c.loc
+	}
+	loc, err := loadCachedLocation(c.Timezone)
 	if err != nil {
 		return time.UTC
 	}

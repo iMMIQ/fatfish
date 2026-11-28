@@ -50,10 +50,44 @@ type CompiledRules struct {
 
 // Engine holds compiled base rules and per-channel overrides with safe atomic swapping.
 type Engine struct {
-	mu        sync.RWMutex
-	cfg       config.PolicyConfig
-	base      *CompiledRules
-	overrides map[string]*CompiledRules
+	mu            sync.RWMutex
+	cfg           config.PolicyConfig
+	base          *CompiledRules
+	overrides     map[string]*CompiledRules
+	enabledSet    map[string]struct{}
+	disabledSet   map[string]struct{}
+	ignoredBotSet map[string]struct{}
+	lowerNicks    []string
+}
+
+func buildPolicySets(cfg config.PolicyConfig) (enabledSet, disabledSet, ignoredBotSet map[string]struct{}, lowerNicks []string) {
+	if len(cfg.EnabledChannels) > 0 {
+		enabledSet = make(map[string]struct{}, len(cfg.EnabledChannels))
+		for _, item := range cfg.EnabledChannels {
+			enabledSet[item] = struct{}{}
+		}
+	}
+	if len(cfg.DisabledChannels) > 0 {
+		disabledSet = make(map[string]struct{}, len(cfg.DisabledChannels))
+		for _, item := range cfg.DisabledChannels {
+			disabledSet[item] = struct{}{}
+		}
+	}
+	if len(cfg.IgnoredBots) > 0 {
+		ignoredBotSet = make(map[string]struct{}, len(cfg.IgnoredBots))
+		for _, id := range cfg.IgnoredBots {
+			ignoredBotSet[id] = struct{}{}
+		}
+	}
+	if len(cfg.Nicknames) > 0 {
+		lowerNicks = make([]string, 0, len(cfg.Nicknames))
+		for _, n := range cfg.Nicknames {
+			if n != "" {
+				lowerNicks = append(lowerNicks, strings.ToLower(n))
+			}
+		}
+	}
+	return enabledSet, disabledSet, ignoredBotSet, lowerNicks
 }
 
 // NewEngine compiles all base and per-channel policy expressions.
@@ -62,10 +96,15 @@ func NewEngine(cfg config.PolicyConfig) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+	enSet, disSet, ignSet, lowNicks := buildPolicySets(cfg)
 	return &Engine{
-		cfg:       cfg,
-		base:      base,
-		overrides: ov,
+		cfg:           cfg,
+		base:          base,
+		overrides:     ov,
+		enabledSet:    enSet,
+		disabledSet:   disSet,
+		ignoredBotSet: ignSet,
+		lowerNicks:    lowNicks,
 	}, nil
 }
 
@@ -81,10 +120,15 @@ func (e *Engine) Update(cfg config.PolicyConfig) error {
 	if err != nil {
 		return err
 	}
+	enSet, disSet, ignSet, lowNicks := buildPolicySets(cfg)
 	e.mu.Lock()
 	e.cfg = cfg
 	e.base = base
 	e.overrides = ov
+	e.enabledSet = enSet
+	e.disabledSet = disSet
+	e.ignoredBotSet = ignSet
+	e.lowerNicks = lowNicks
 	e.mu.Unlock()
 	return nil
 }
@@ -217,21 +261,34 @@ func (e *Engine) rulesFor(ch model.ChannelID) *CompiledRules {
 	return e.base
 }
 
-// ChannelAllowed checks enabled_channels / disabled_channels allow/deny lists.
+// ChannelAllowed checks enabled_channels / disabled_channels allow/deny lists in O(1).
 func (e *Engine) ChannelAllowed(ch model.ChannelID) bool {
 	e.mu.RLock()
-	enabled := e.cfg.EnabledChannels
-	disabled := e.cfg.DisabledChannels
+	enabled := e.enabledSet
+	disabled := e.disabledSet
 	e.mu.RUnlock()
 
+	if len(disabled) == 0 && len(enabled) == 0 {
+		return true
+	}
 	idStr := string(ch)
 	nativeID := ch.NativeID()
-	matches := func(list []string) bool {
-		for _, item := range list {
-			if item == idStr || item == nativeID {
-				return true
-			}
-			if _, _, kind, nid, ok := model.ParseChannelID(ch); ok && item == string(kind)+":"+nid {
+	shortKey := ""
+	if _, _, kind, nid, ok := model.ParseChannelID(ch); ok {
+		shortKey = string(kind) + ":" + nid
+	}
+	matches := func(set map[string]struct{}) bool {
+		if len(set) == 0 {
+			return false
+		}
+		if _, ok := set[idStr]; ok {
+			return true
+		}
+		if _, ok := set[nativeID]; ok {
+			return true
+		}
+		if shortKey != "" {
+			if _, ok := set[shortKey]; ok {
 				return true
 			}
 		}
@@ -246,16 +303,12 @@ func (e *Engine) ChannelAllowed(ch model.ChannelID) bool {
 	return true
 }
 
-// IsIgnoredBot returns true if senderID is listed in policy.ignored_bots.
+// IsIgnoredBot returns true if senderID is listed in policy.ignored_bots in O(1).
 func (e *Engine) IsIgnoredBot(senderID string) bool {
 	e.mu.RLock()
-	defer e.mu.RUnlock()
-	for _, id := range e.cfg.IgnoredBots {
-		if id == senderID {
-			return true
-		}
-	}
-	return false
+	_, ok := e.ignoredBotSet[senderID]
+	e.mu.RUnlock()
+	return ok
 }
 
 // HitNickname returns true if text contains any configured bot nickname (case-insensitive).
@@ -263,12 +316,15 @@ func (e *Engine) HitNickname(text string) bool {
 	if strings.TrimSpace(text) == "" {
 		return false
 	}
-	lower := strings.ToLower(text)
 	e.mu.RLock()
-	nicks := e.cfg.Nicknames
+	nicks := e.lowerNicks
 	e.mu.RUnlock()
+	if len(nicks) == 0 {
+		return false
+	}
+	lower := strings.ToLower(text)
 	for _, n := range nicks {
-		if n != "" && strings.Contains(lower, strings.ToLower(n)) {
+		if strings.Contains(lower, n) {
 			return true
 		}
 	}

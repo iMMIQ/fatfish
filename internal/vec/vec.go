@@ -58,6 +58,29 @@ func NewFlatF16Index(dim int, docCenteringAlpha float32) *FlatF16Index {
 	}
 }
 
+// Reserve pre-allocates backing storage for at least n vectors to avoid repeated slice doubling during bulk loads.
+func (idx *FlatF16Index) Reserve(n int) {
+	if n <= 0 {
+		return
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if cap(idx.ids) < n {
+		newIDs := make([]string, len(idx.ids), n)
+		copy(newIDs, idx.ids)
+		idx.ids = newIDs
+	}
+	needData := n * idx.dim
+	if cap(idx.data) < needData {
+		newData := make([]uint16, len(idx.data), needData)
+		copy(newData, idx.data)
+		idx.data = newData
+	}
+	if len(idx.pos) == 0 {
+		idx.pos = make(map[string]int, n)
+	}
+}
+
 // SetMean configures the corpus mean vector used for document-only centering.
 func (idx *FlatF16Index) SetMean(mean []float32, alpha float32) {
 	idx.mu.Lock()
@@ -234,6 +257,67 @@ func (idx *FlatF16Index) Vector(id string) ([]float32, bool) {
 	return out, true
 }
 
+// LookupF16Batch copies float16 vectors for the requested IDs into a single contiguous slab
+// under one RLock, avoiding per-ID mutex contention and float32 decoding allocations during MMR.
+func (idx *FlatF16Index) LookupF16Batch(ids []string) map[string][]uint16 {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if len(ids) == 0 || len(idx.ids) == 0 {
+		return nil
+	}
+	dim := idx.dim
+	found := 0
+	for _, id := range ids {
+		if _, ok := idx.pos[id]; ok {
+			found++
+		}
+	}
+	if found == 0 {
+		return nil
+	}
+	slab := make([]uint16, found*dim)
+	out := make(map[string][]uint16, found)
+	cursor := 0
+	for _, id := range ids {
+		if _, dup := out[id]; dup {
+			continue
+		}
+		if slot, ok := idx.pos[id]; ok {
+			dst := slab[cursor : cursor+dim]
+			off := slot * dim
+			copy(dst, idx.data[off:off+dim])
+			out[id] = dst
+			cursor += dim
+		}
+	}
+	return out
+}
+
+// DotF16 computes the inner product of two equal-length IEEE 754 binary16 slices using the static LUT.
+func DotF16(a, b []uint16) float32 {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	if n == 0 {
+		return 0
+	}
+	lut := &f16ToF32LUT
+	a = a[:n]
+	b = b[:n]
+	var dot0, dot1 float32
+	i := 0
+	for ; i+3 < n; i += 4 {
+		dot0 += lut[a[i]]*lut[b[i]] + lut[a[i+1]]*lut[b[i+1]]
+		dot1 += lut[a[i+2]]*lut[b[i+2]] + lut[a[i+3]]*lut[b[i+3]]
+	}
+	dot := dot0 + dot1
+	for ; i < n; i++ {
+		dot += lut[a[i]] * lut[b[i]]
+	}
+	return dot
+}
+
 func hitBetter(a, b Hit) bool {
 	if a.Score == b.Score {
 		return a.ID < b.ID
@@ -269,23 +353,35 @@ func (h *hitMinHeap) pushTopK(cand Hit, k int) {
 
 func scanRangeTopK(ids []string, data []uint16, dim int, qn []float32, start, end, k int, filter func(id string) bool) []Hit {
 	hp := make(hitMinHeap, 0, k)
+	if dim <= 0 || start >= end {
+		return hp
+	}
+	lut := &f16ToF32LUT
+	qn = qn[:dim:dim]
+	_ = qn[dim-1]
 	for slot := start; slot < end; slot++ {
 		id := ids[slot]
 		if filter != nil && !filter(id) {
 			continue
 		}
 		off := slot * dim
-		vecSlice := data[off : off+dim]
-		var dot float32
+		vecSlice := data[off : off+dim : off+dim]
+		_ = vecSlice[dim-1]
+		var dot0, dot1 float32
 		i := 0
-		for ; i+3 < dim; i += 4 {
-			dot += qn[i]*f16ToF32LUT[vecSlice[i]] +
-				qn[i+1]*f16ToF32LUT[vecSlice[i+1]] +
-				qn[i+2]*f16ToF32LUT[vecSlice[i+2]] +
-				qn[i+3]*f16ToF32LUT[vecSlice[i+3]]
+		for ; i+7 < dim; i += 8 {
+			dot0 += qn[i]*lut[vecSlice[i]] +
+				qn[i+1]*lut[vecSlice[i+1]] +
+				qn[i+2]*lut[vecSlice[i+2]] +
+				qn[i+3]*lut[vecSlice[i+3]]
+			dot1 += qn[i+4]*lut[vecSlice[i+4]] +
+				qn[i+5]*lut[vecSlice[i+5]] +
+				qn[i+6]*lut[vecSlice[i+6]] +
+				qn[i+7]*lut[vecSlice[i+7]]
 		}
+		dot := dot0 + dot1
 		for ; i < dim; i++ {
-			dot += qn[i] * f16ToF32LUT[vecSlice[i]]
+			dot += qn[i] * lut[vecSlice[i]]
 		}
 		hp.pushTopK(Hit{ID: id, Score: dot}, k)
 	}
@@ -498,6 +594,74 @@ func MMRRerank(candidates []Hit, vecLookup func(id string) ([]float32, bool), la
 				for _, s := range selected {
 					if vs, ok2 := vecs[s.ID]; ok2 {
 						sim := Dot(vc, vs)
+						if sim > maxSim {
+							maxSim = sim
+						}
+					}
+				}
+			}
+			score := lambda*rel - (1-lambda)*maxSim
+			if score > bestVal {
+				bestVal = score
+				bestIdx = i
+			}
+		}
+		if bestIdx < 0 {
+			break
+		}
+		used[bestIdx] = true
+		selected = append(selected, candidates[bestIdx])
+	}
+	return selected
+}
+
+// MMRRerankF16 selects topK diverse candidates directly over compact float16 vectors
+// without allocating decoded float32 slices per candidate.
+func MMRRerankF16(candidates []Hit, vecs map[string][]uint16, lambda float32, topK int) []Hit {
+	if len(candidates) == 0 || topK <= 0 {
+		return nil
+	}
+	if topK > len(candidates) {
+		topK = len(candidates)
+	}
+	if lambda <= 0 {
+		lambda = 0.7
+	}
+	if lambda > 1 {
+		lambda = 1
+	}
+
+	minS, maxS := candidates[0].Score, candidates[0].Score
+	for _, c := range candidates[1:] {
+		if c.Score < minS {
+			minS = c.Score
+		}
+		if c.Score > maxS {
+			maxS = c.Score
+		}
+	}
+	normScore := func(s float32) float32 {
+		if maxS == minS {
+			return 1
+		}
+		return (s - minS) / (maxS - minS)
+	}
+
+	selected := make([]Hit, 0, topK)
+	used := make([]bool, len(candidates))
+	for len(selected) < topK {
+		bestIdx := -1
+		bestVal := float32(math.Inf(-1))
+		for i, c := range candidates {
+			if used[i] {
+				continue
+			}
+			rel := normScore(c.Score)
+			var maxSim float32
+			if vc, ok := vecs[c.ID]; ok {
+				for _, s := range selected {
+					if vs, ok2 := vecs[s.ID]; ok2 {
+						sim := DotF16(vc, vs)
 						if sim > maxSim {
 							maxSim = sim
 						}

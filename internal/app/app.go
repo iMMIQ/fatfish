@@ -155,6 +155,9 @@ func New(configPath string, enableTransport bool) (*App, error) {
 	reg.Freeze()
 
 	runner := agent.NewRunner(hub, st, fb, reg, logger)
+	if enableTransport {
+		runner.EnableAsyncTelemetry()
+	}
 	roomDisp = room.NewManager(room.Dependencies{
 		Config:    cfgMgr,
 		Store:     st,
@@ -173,6 +176,7 @@ func New(configPath string, enableTransport bool) (*App, error) {
 	sched.SetMemoryHooks(memSvc, pol)
 	travelSvc.SetHooks(roomDisp, pol)
 	sched.SetTravelHooks(travelSvc)
+	sched.SetSegmentHooks(roomDisp)
 
 	var conSrv *console.Server
 	if cfg.Console.Enabled {
@@ -375,10 +379,13 @@ func (a *App) Serve(ctx context.Context) error {
 	if a.Trans != nil {
 		_ = a.Trans.StopInbound()
 	}
-	// 2. Drain Rooms first (up to 12s), then drain any post-ACK async stickers spawned by those turns
+	// 2. Drain Rooms first (up to 12s), then drain any post-ACK async stickers and telemetry writes
 	//    within the remaining 15s total drain budget.
 	drainDeadline := time.Now().Add(15 * time.Second)
 	a.Rooms.Drain(12 * time.Second)
+	if a.Runner != nil {
+		a.Runner.Drain(2 * time.Second)
+	}
 	if a.Stickers != nil {
 		rem := time.Until(drainDeadline)
 		if rem < 2*time.Second {

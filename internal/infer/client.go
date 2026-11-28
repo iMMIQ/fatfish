@@ -2,6 +2,7 @@ package infer
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
@@ -40,13 +41,39 @@ func isContentFilterBody(b []byte) bool {
 
 // ChatMessage represents a wire-level OpenAI Chat Completions message.
 // Content is either string or []ContentPart (marshaled canonically).
+// Optional PreencodedJSON caches the marshaled wire JSON of immutable multimodal frames
+// so multi-iteration tool loops never re-marshal multi-MB base64 payloads.
 type ChatMessage struct {
-	Role             string     `json:"role"`
-	Content          any        `json:"content,omitempty"`
-	ReasoningContent string     `json:"reasoning_content,omitempty"`
-	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID       string     `json:"tool_call_id,omitempty"`
-	Name             string     `json:"name,omitempty"`
+	Role             string          `json:"role"`
+	Content          any             `json:"content,omitempty"`
+	ReasoningContent string          `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall      `json:"tool_calls,omitempty"`
+	ToolCallID       string          `json:"tool_call_id,omitempty"`
+	Name             string          `json:"name,omitempty"`
+	PreencodedJSON   json.RawMessage `json:"-"`
+}
+
+// MarshalJSON returns PreencodedJSON verbatim when populated, otherwise standard JSON encoding.
+func (m ChatMessage) MarshalJSON() ([]byte, error) {
+	if len(m.PreencodedJSON) > 0 {
+		return m.PreencodedJSON, nil
+	}
+	type wireChatMessage struct {
+		Role             string     `json:"role"`
+		Content          any        `json:"content,omitempty"`
+		ReasoningContent string     `json:"reasoning_content,omitempty"`
+		ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+		ToolCallID       string     `json:"tool_call_id,omitempty"`
+		Name             string     `json:"name,omitempty"`
+	}
+	return json.Marshal(wireChatMessage{
+		Role:             m.Role,
+		Content:          m.Content,
+		ReasoningContent: m.ReasoningContent,
+		ToolCalls:        m.ToolCalls,
+		ToolCallID:       m.ToolCallID,
+		Name:             m.Name,
+	})
 }
 
 // ContentPart represents a multimodal element inside ChatMessage.Content.
@@ -123,6 +150,13 @@ type RerankResult struct {
 	Score float64 `json:"relevance_score"`
 }
 
+const defaultEmbedCacheMaxBytes = 4 << 20 // 4 MiB bounded RAM LRU (~500 x 2048d float32 vectors)
+
+type embedCacheEntry struct {
+	key string
+	vec []float32
+}
+
 // Hub manages all OpenAI-compatible & local inference clients, circuit breakers, and GPU concurrency limits.
 type Hub struct {
 	mu       sync.RWMutex
@@ -132,6 +166,12 @@ type Hub struct {
 	fgActive atomic.Int32 // Active foreground local GPU requests (embed/rerank/asr/translate)
 
 	breakers map[string]*CircuitBreaker
+
+	embMu    sync.Mutex
+	embOrder *list.List
+	embItems map[string]*list.Element
+	embBytes int64
+	embMax   int64
 }
 
 // NewHub builds an inference Hub with dedicated circuit breakers per capability.
@@ -162,6 +202,9 @@ func NewHub(cfg config.ModelsConfig) *Hub {
 			"asr":              NewCircuitBreaker("asr", 3, 30*time.Second),
 			"translate":        NewCircuitBreaker("translate", 3, 30*time.Second),
 		},
+		embOrder: list.New(),
+		embItems: make(map[string]*list.Element),
+		embMax:   defaultEmbedCacheMaxBytes,
 	}
 	return h
 }
@@ -409,7 +452,8 @@ func (h *Hub) chatOnce(ctx context.Context, role string, req ChatRequest) (*Chat
 	}, nil
 }
 
-// Embed embeds texts using POST /v1/embeddings with strict max_batch chunking (1..128).
+// Embed embeds texts using POST /v1/embeddings with strict max_batch chunking (1..128)
+// and a bounded 4 MiB LRU cache (deduplicating repeated hot sticker intents and profile facts).
 func (h *Hub) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
@@ -422,19 +466,109 @@ func (h *Hub) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	if maxBatch <= 0 || maxBatch > 128 {
 		maxBatch = 64
 	}
+
+	keyPrefix := strings.TrimRight(ep.BaseURL, "/") + "|" + ep.Model + "\x00"
 	results := make([][]float32, len(texts))
-	for start := 0; start < len(texts); start += maxBatch {
-		end := start + maxBatch
-		if end > len(texts) {
-			end = len(texts)
+	var missTexts []string
+	missIdxByKey := make(map[string]int)
+	missPositions := make([][]int, 0)
+
+	for i, txt := range texts {
+		ck := keyPrefix + txt
+		if cached, ok := h.embedCacheGet(ck); ok {
+			results[i] = cached
+			continue
 		}
-		chunk, err := h.embedChunk(ctx, ep, cb, texts[start:end])
+		if mPos, dup := missIdxByKey[ck]; dup {
+			missPositions[mPos] = append(missPositions[mPos], i)
+			continue
+		}
+		missIdxByKey[ck] = len(missTexts)
+		missTexts = append(missTexts, txt)
+		missPositions = append(missPositions, []int{i})
+	}
+	if len(missTexts) == 0 {
+		return results, nil
+	}
+
+	for start := 0; start < len(missTexts); start += maxBatch {
+		end := start + maxBatch
+		if end > len(missTexts) {
+			end = len(missTexts)
+		}
+		chunk, err := h.embedChunk(ctx, ep, cb, missTexts[start:end])
 		if err != nil {
 			return nil, err
 		}
-		copy(results[start:end], chunk)
+		for j, v := range chunk {
+			mIdx := start + j
+			h.embedCachePut(keyPrefix+missTexts[mIdx], v)
+			positions := missPositions[mIdx]
+			for pi, origIdx := range positions {
+				if pi == 0 {
+					results[origIdx] = v
+				} else {
+					cp := make([]float32, len(v))
+					copy(cp, v)
+					results[origIdx] = cp
+				}
+			}
+		}
 	}
 	return results, nil
+}
+
+func (h *Hub) embedCacheGet(key string) ([]float32, bool) {
+	h.embMu.Lock()
+	defer h.embMu.Unlock()
+	if h.embItems == nil {
+		return nil, false
+	}
+	if el, ok := h.embItems[key]; ok {
+		h.embOrder.MoveToFront(el)
+		src := el.Value.(*embedCacheEntry).vec
+		// Return a defensive copy because callers (e.g. memory/sticker) normalize/center in place.
+		cp := make([]float32, len(src))
+		copy(cp, src)
+		return cp, true
+	}
+	return nil, false
+}
+
+func (h *Hub) embedCachePut(key string, v []float32) {
+	if len(v) == 0 || h.embMax <= 0 {
+		return
+	}
+	sz := int64(len(v) * 4)
+	if sz > h.embMax/4 {
+		return
+	}
+	cp := make([]float32, len(v))
+	copy(cp, v)
+
+	h.embMu.Lock()
+	defer h.embMu.Unlock()
+	if h.embItems == nil {
+		h.embOrder = list.New()
+		h.embItems = make(map[string]*list.Element)
+	}
+	if el, ok := h.embItems[key]; ok {
+		ent := el.Value.(*embedCacheEntry)
+		h.embBytes += sz - int64(len(ent.vec)*4)
+		ent.vec = cp
+		h.embOrder.MoveToFront(el)
+	} else {
+		el = h.embOrder.PushFront(&embedCacheEntry{key: key, vec: cp})
+		h.embItems[key] = el
+		h.embBytes += sz
+	}
+	for h.embBytes > h.embMax && h.embOrder.Len() > 0 {
+		tail := h.embOrder.Back()
+		ent := tail.Value.(*embedCacheEntry)
+		h.embOrder.Remove(tail)
+		delete(h.embItems, ent.key)
+		h.embBytes -= int64(len(ent.vec) * 4)
+	}
 }
 
 func (h *Hub) yieldForForeground(ctx context.Context) error {

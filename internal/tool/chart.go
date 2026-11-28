@@ -9,12 +9,13 @@ import (
 	"image/draw"
 	"image/png"
 	"math"
-	"os"
 	"sync"
 
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/opentype"
 	"golang.org/x/image/math/fixed"
+
+	"github.com/iMMIQ/fatfish/internal/fontcache"
 )
 
 // ChartRenderer renders publication-grade PNG charts (line, bar, pie, scatter, kline)
@@ -35,13 +36,9 @@ func (c *ChartRenderer) loadFont() (*opentype.Font, error) {
 	if c.parsed != nil {
 		return c.parsed, nil
 	}
-	raw, err := os.ReadFile(c.fontPath)
+	f, err := fontcache.Load(c.fontPath)
 	if err != nil {
-		return nil, fmt.Errorf("chart: read font %s: %w", c.fontPath, err)
-	}
-	f, err := opentype.Parse(raw)
-	if err != nil {
-		return nil, fmt.Errorf("chart: parse truetype font %s: %w", c.fontPath, err)
+		return nil, fmt.Errorf("chart: %w", err)
 	}
 	c.parsed = f
 	return f, nil
