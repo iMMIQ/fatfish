@@ -281,3 +281,34 @@ func TestLoreCorroborationPruningAndTermFilter(t *testing.T) {
 		t.Fatalf("expected 大肥鱼 preserved after prune, got %+v", list2)
 	}
 }
+
+func TestFactBigramCorroborationAndFamiliarity(t *testing.T) {
+	st, err := store.Open(t.TempDir(), 512, 5)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	ch := model.MakeChannelID("onebot", "1", model.ChannelGroup, "101")
+	svc := NewService(st, nil, 4, nil)
+
+	// Paraphrased facts across two distinct episodes should corroborate via bigram Dice overlap.
+	if err := svc.MergeCandidateFact(ctx, ch, "u1", "在佛山从事后端开发工作", 1, true); err != nil {
+		t.Fatalf("MergeCandidateFact #1: %v", err)
+	}
+	if err := svc.MergeCandidateFact(ctx, ch, "u1", "佛山后端开发工作者", 2, true); err != nil {
+		t.Fatalf("MergeCandidateFact #2: %v", err)
+	}
+	p, err := st.GetProfile(ctx, ch, "u1")
+	if err != nil || len(p.Facts) != 1 {
+		t.Fatalf("expected 1 merged fact, got %+v err=%v", p, err)
+	}
+	if p.Facts[0].Tentative || p.Facts[0].Confidence < 0.7 {
+		t.Fatalf("expected corroborated fact to graduate from tentative, got %+v", p.Facts[0])
+	}
+
+	card := FormatMemberCardWithFamiliarity(*p, "Alice", familiarityLabel(95))
+	if !strings.Contains(card, "熟人常客") || !strings.Contains(card, "在佛山从事后端开发工作") {
+		t.Fatalf("expected familiarity label and confirmed fact in card, got %q", card)
+	}
+}

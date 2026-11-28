@@ -17,6 +17,26 @@ import (
 	"github.com/iMMIQ/fatfish/internal/config"
 )
 
+// ErrContentFiltered indicates the upstream provider rejected the prompt/response due to safety/content filtering (e.g. HTTP 400 code 1301).
+var ErrContentFiltered = errors.New("infer: content filtered")
+
+// IsContentFiltered reports whether err represents an upstream safety/content-filter rejection.
+func IsContentFiltered(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrContentFiltered) {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "contentFilter") || strings.Contains(s, `"code":"1301"`) || strings.Contains(s, "content_filter")
+}
+
+func isContentFilterBody(b []byte) bool {
+	s := string(b)
+	return strings.Contains(s, "contentFilter") || strings.Contains(s, `"code":"1301"`) || strings.Contains(s, "content_filter")
+}
+
 // ChatMessage represents a wire-level OpenAI Chat Completions message.
 // Content is either string or []ContentPart (marshaled canonically).
 type ChatMessage struct {
@@ -315,6 +335,11 @@ func (h *Hub) chatOnce(ctx context.Context, role string, req ChatRequest) (*Chat
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusBadRequest && isContentFilterBody(respBytes) {
+			// A content-filter rejection on one channel's payload must not trip the global breaker.
+			cb.AbortProbe()
+			return nil, fmt.Errorf("%w: chat %s HTTP %d: %s", ErrContentFiltered, role, resp.StatusCode, truncateStr(string(respBytes), 400))
+		}
 		apiErr := fmt.Errorf("infer: chat %s HTTP %d: %s", role, resp.StatusCode, truncateStr(string(respBytes), 400))
 		cb.Record(apiErr)
 		return nil, apiErr

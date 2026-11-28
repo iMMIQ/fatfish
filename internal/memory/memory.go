@@ -137,19 +137,38 @@ func (s *Service) BuildSnapshotWithTime(ctx context.Context, ch model.ChannelID,
 	notes, _ := s.store.ListNotes(ctx, ch, true)
 	names, _ := s.store.GetMemberNames(ctx, ch)
 
+	ignored := s.ignoredBotsCopy()
 	memberSet := make(map[string]struct{}, len(activeMemberIDs))
 	for _, id := range activeMemberIDs {
-		memberSet[id] = struct{}{}
+		if !ignored[id] {
+			memberSet[id] = struct{}{}
+		}
 	}
 	profiles, _ := s.store.ListProfiles(ctx, ch, 30)
-	var cards []string
+	actIDs := make([]string, 0, len(profiles))
 	for _, p := range profiles {
+		if ignored[p.MemberID] {
+			continue
+		}
 		if len(memberSet) > 0 {
 			if _, ok := memberSet[p.MemberID]; !ok {
 				continue
 			}
 		}
-		if card := FormatMemberCard(p, names[p.MemberID]); card != "" {
+		actIDs = append(actIDs, p.MemberID)
+	}
+	actCounts, _ := s.store.MemberActivityCounts(ctx, ch, actIDs, now.AddDate(0, 0, -30))
+	var cards []string
+	for _, p := range profiles {
+		if ignored[p.MemberID] {
+			continue
+		}
+		if len(memberSet) > 0 {
+			if _, ok := memberSet[p.MemberID]; !ok {
+				continue
+			}
+		}
+		if card := FormatMemberCardWithFamiliarity(p, names[p.MemberID], familiarityLabel(actCounts[p.MemberID])); card != "" {
 			cards = append(cards, card)
 		}
 	}
@@ -204,6 +223,11 @@ func formatSessionTime(t time.Time) string {
 // FormatMemberCard formats corroborated (non-tentative) facts ranked by time-decayed confidence,
 // interaction style note, and recent jokes cleanly for prompt injection.
 func FormatMemberCard(p model.MemberProfile, displayName string) string {
+	return FormatMemberCardWithFamiliarity(p, displayName, "")
+}
+
+// FormatMemberCardWithFamiliarity extends FormatMemberCard with an optional activity-based familiarity tag.
+func FormatMemberCardWithFamiliarity(p model.MemberProfile, displayName, familiarity string) string {
 	nowMs := time.Now().UnixMilli()
 	type scoredFact struct {
 		text  string
@@ -227,14 +251,18 @@ func FormatMemberCard(p model.MemberProfile, displayName string) string {
 		}
 	}
 	style := strings.TrimSpace(p.StyleNote)
-	if len(facts) == 0 && len(p.Jokes) == 0 && style == "" {
+	fam := strings.TrimSpace(familiarity)
+	if len(facts) == 0 && len(p.Jokes) == 0 && style == "" && fam == "" {
 		return ""
 	}
 	label := p.MemberID
 	if displayName != "" && displayName != p.MemberID {
 		label = fmt.Sprintf("%s(%s)", displayName, p.MemberID)
 	}
-	parts := make([]string, 0, 3)
+	parts := make([]string, 0, 4)
+	if fam != "" {
+		parts = append(parts, fam)
+	}
 	if style != "" {
 		parts = append(parts, "互动风格: "+style)
 	}
@@ -259,13 +287,30 @@ func FormatMemberCard(p model.MemberProfile, displayName string) string {
 	return fmt.Sprintf("- %s: %s", label, strings.Join(parts, " | "))
 }
 
+func familiarityLabel(msgCount30d int) string {
+	switch {
+	case msgCount30d >= 80:
+		return "熟人常客"
+	case msgCount30d >= 20:
+		return "活跃群友"
+	case msgCount30d > 0 && msgCount30d <= 3:
+		return "新面孔"
+	default:
+		return ""
+	}
+}
+
 // MemberCardDelta returns a compact one-time context line for a newly appearing mid-segment member.
 func (s *Service) MemberCardDelta(ctx context.Context, ch model.ChannelID, memberID, displayName string) string {
+	if s.ignoredBotsCopy()[memberID] {
+		return ""
+	}
 	p, err := s.store.GetProfile(ctx, ch, memberID)
 	if err != nil || p == nil {
 		return ""
 	}
-	return FormatMemberCard(*p, displayName)
+	counts, _ := s.store.MemberActivityCounts(ctx, ch, []string{memberID}, time.Now().AddDate(0, 0, -30))
+	return FormatMemberCardWithFamiliarity(*p, displayName, familiarityLabel(counts[memberID]))
 }
 
 // RecallOptions configures channel-scoped memory search.
@@ -732,7 +777,8 @@ Rules:
 5. candidate_lore: ONLY genuine recurring group slang, inside jokes, or nicknames (at most 3 items). NEVER record standalone numbers/prices, ordinary dictionary words, or generic product/library names.
 6. For member_styles, capture brief interaction vibe with the group/bot when clear (e.g. "爱互怼的熟人", "爱聊技术的老哥", "话少但爱发图"), at most 12 chars.
 7. Keep arrays compact (at most 5 items each) so the JSON stays concise and valid.
-8. Output ONLY valid compact JSON matching:
+8. Keep all summaries, facts, jokes, and lore SFW and neutral: if chat contains explicit sexual, vulgar, or politically sensitive details, abstract them neutrally in Chinese (e.g. "成人玩笑", "敏感话题调侃") and NEVER copy explicit sexual/vulgar/political terms verbatim into lore, summary, or facts.
+9. Output ONLY valid compact JSON matching:
 {"topic":"...","summary":"...","participants":[{"id":"...","role_in_topic":"..."}],"notable_quotes":["..."],"candidate_facts":[{"member_id":"...","fact":"...","serious":true}],"candidate_jokes":[{"member_id":"...","joke":"..."}],"member_styles":[{"member_id":"...","style":"..."}],"candidate_lore":[{"term":"...","meaning":"..."}]}`
 
 	resp, err := s.hub.Chat(ctx, role, infer.ChatRequest{
@@ -838,22 +884,45 @@ func (s *Service) MergeCandidateFact(ctx context.Context, ch model.ChannelID, me
 	}
 	norm := strings.ToLower(strings.TrimSpace(factText))
 	now := time.Now().UnixMilli()
-	matched := false
+	matchIdx := -1
 	for i := range p.Facts {
-		if strings.ToLower(strings.TrimSpace(p.Facts[i].Text)) == norm ||
-			strings.Contains(strings.ToLower(p.Facts[i].Text), norm) ||
-			strings.Contains(norm, strings.ToLower(p.Facts[i].Text)) {
-			matched = true
-			if !containsInt64(p.Facts[i].EvidenceEpisodes, episodeID) {
-				p.Facts[i].EvidenceEpisodes = append(p.Facts[i].EvidenceEpisodes, episodeID)
-			}
-			if len(p.Facts[i].EvidenceEpisodes) >= 2 {
-				p.Facts[i].Tentative = false
-				p.Facts[i].Confidence = minFloat(0.95, 0.55+0.15*float64(len(p.Facts[i].EvidenceEpisodes)))
-			}
-			p.Facts[i].UpdatedAt = now
+		existing := strings.ToLower(strings.TrimSpace(p.Facts[i].Text))
+		if existing == norm || strings.Contains(existing, norm) || strings.Contains(norm, existing) || factBigramDice(existing, norm) >= 0.45 {
+			matchIdx = i
 			break
 		}
+	}
+	if matchIdx < 0 && s.hub != nil && len(p.Facts) > 0 {
+		texts := make([]string, 0, len(p.Facts)+1)
+		texts = append(texts, strings.TrimSpace(factText))
+		for _, f := range p.Facts {
+			texts = append(texts, strings.TrimSpace(f.Text))
+		}
+		embCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		embs, eerr := s.hub.Embed(embCtx, texts)
+		cancel()
+		if eerr == nil && len(embs) == len(texts) {
+			bestSim := 0.0
+			for i := range p.Facts {
+				if sim := cosineSim(embs[0], embs[i+1]); sim > bestSim {
+					bestSim = sim
+					if sim >= 0.78 {
+						matchIdx = i
+					}
+				}
+			}
+		}
+	}
+	matched := matchIdx >= 0
+	if matched {
+		if !containsInt64(p.Facts[matchIdx].EvidenceEpisodes, episodeID) {
+			p.Facts[matchIdx].EvidenceEpisodes = append(p.Facts[matchIdx].EvidenceEpisodes, episodeID)
+		}
+		if len(p.Facts[matchIdx].EvidenceEpisodes) >= 2 {
+			p.Facts[matchIdx].Tentative = false
+			p.Facts[matchIdx].Confidence = minFloat(0.95, 0.55+0.15*float64(len(p.Facts[matchIdx].EvidenceEpisodes)))
+		}
+		p.Facts[matchIdx].UpdatedAt = now
 	}
 	if !matched {
 		conf := 0.35
@@ -1079,4 +1148,53 @@ func truncateText(s string, maxRunes int) string {
 		return s
 	}
 	return string(r[:maxRunes]) + "..."
+}
+
+func factBigramDice(a, b string) float64 {
+	ba := charBigrams(a)
+	bb := charBigrams(b)
+	if len(ba) == 0 || len(bb) == 0 {
+		return 0
+	}
+	inter := 0
+	for k := range ba {
+		if _, ok := bb[k]; ok {
+			inter++
+		}
+	}
+	return float64(2*inter) / float64(len(ba)+len(bb))
+}
+
+func charBigrams(s string) map[string]struct{} {
+	var runes []rune
+	for _, r := range strings.ToLower(s) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			runes = append(runes, r)
+		}
+	}
+	if len(runes) < 2 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(runes)-1)
+	for i := 0; i < len(runes)-1; i++ {
+		out[string(runes[i:i+2])] = struct{}{}
+	}
+	return out
+}
+
+func cosineSim(a, b []float32) float64 {
+	if len(a) == 0 || len(a) != len(b) {
+		return 0
+	}
+	var dot, na, nb float64
+	for i := range a {
+		fa, fb := float64(a[i]), float64(b[i])
+		dot += fa * fb
+		na += fa * fa
+		nb += fb * fb
+	}
+	if na == 0 || nb == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(na) * math.Sqrt(nb))
 }

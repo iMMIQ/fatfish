@@ -634,7 +634,7 @@ policy:
 		RawText:   "line1\nline2\nline3",
 		Bubbles:   []string{"line1", "line2", "line3"},
 	}
-	ok := r.deliverPlan(ctx, seg, plan, nil, -1, agent.TurnStats{ModelUsed: "test"}, triggerState{kind: "mention"}, cfg)
+	ok := r.deliverPlan(ctx, seg, plan, nil, -1, false, agent.TurnStats{ModelUsed: "test"}, triggerState{kind: "mention"}, cfg)
 	if !ok {
 		t.Fatal("expected deliverPlan to commit")
 	}
@@ -693,5 +693,96 @@ policy:
 	})
 	if armP2 || waitP2 != 0 {
 		t.Fatalf("expected poke within 15s cooldown to be suppressed, got wait=%v arm=%v", waitP2, armP2)
+	}
+}
+
+func TestSocialTargetingSuppressesThreadAndSameNameBot(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "fatfish.yaml")
+	yamlCfg := `data_dir: "` + filepath.ToSlash(dir) + `"
+timezone: "UTC"
+policy:
+  nicknames: ["大肥鱼"]
+  ignored_bots: ["9990001"]
+  thread_continuation_sec: 60
+  thread_min_interval_sec: 0
+  thread_max_turns: 3
+  proactive_cooldown_sec: 0
+  rules:
+    reply_gate: "mentioned || replied_to_bot || poked || (in_thread && thread_turns < 3) || (cooldown_ok && !mentioned_other && !replied_to_other && hit_nickname)"
+`
+	if err := os.WriteFile(cfgPath, []byte(yamlCfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfgMgr, err := config.NewManager(cfgPath, policy.ValidateConfig)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	st, err := store.Open(dir, 512, 5)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+	pol, _ := policy.NewEngine(cfgMgr.Get().Policy)
+	mgr := NewManager(Dependencies{
+		Config: cfgMgr,
+		Store:  st,
+		Policy: pol,
+		Frames: frame.NewBuilder(st, cfgMgr.Get().Frame),
+	})
+	ch := model.MakeChannelID("onebot", "10001", model.ChannelGroup, "88888")
+	_ = st.UpsertMember(context.Background(), model.Member{
+		ChannelID:   ch,
+		MemberID:    "9990001",
+		DisplayName: "大肥鱼",
+		UpdatedAt:   time.Now(),
+	})
+
+	r := newRoom(mgr, ch)
+	r.threadUserID = "u1"
+	r.threadTurns = 1
+	r.threadLastAt = time.Now().Add(-10 * time.Second)
+
+	// 1. User in active thread explicitly @-mentions another bot named "大肥鱼" -> must NOT trigger thread or hit_nickname!
+	_, arm1 := r.onMessage(&model.Message{
+		ChannelID:  ch,
+		SenderID:   "u1",
+		SenderName: "Alice",
+		Parts: []model.Part{
+			{Kind: model.PartMention, TargetID: "9990001", Text: "@9990001"},
+			{Kind: model.PartText, Text: "帮我查一下天气"},
+		},
+		CreatedAt: time.Now(),
+	})
+	if arm1 {
+		t.Fatal("expected @OtherSameNameBot to NOT trigger thread continuation or nickname match")
+	}
+
+	// 2. Same user quoting someone else's message -> must NOT trigger thread continuation!
+	_, arm2 := r.onMessage(&model.Message{
+		ChannelID:    ch,
+		SenderID:     "u1",
+		SenderName:   "Alice",
+		ReplyToMsgID: "other_msg_1",
+		Parts: []model.Part{
+			{Kind: model.PartQuote, RefMsgID: "other_msg_1", Text: "Bob: hi"},
+			{Kind: model.PartText, Text: "确实"},
+		},
+		CreatedAt: time.Now(),
+	})
+	if arm2 {
+		t.Fatal("expected quoting another user to NOT trigger thread continuation")
+	}
+
+	// 3. Same user talking normally without @other or quote -> SHOULD continue thread!
+	_, arm3 := r.onMessage(&model.Message{
+		ChannelID:  ch,
+		SenderID:   "u1",
+		SenderName: "Alice",
+		Parts:      []model.Part{{Kind: model.PartText, Text: "那接下来怎么办"}},
+		CreatedAt:  time.Now(),
+	})
+	if !arm3 {
+		t.Fatal("expected direct follow-up from active thread user to trigger continuation")
 	}
 }

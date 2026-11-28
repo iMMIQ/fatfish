@@ -17,9 +17,11 @@ type PolicyEnv struct {
 	IsGroup      bool    `expr:"is_group"`
 	FromBot      bool    `expr:"from_bot"`
 	IsAdmin      bool    `expr:"is_admin"`
-	Mentioned    bool    `expr:"mentioned"`
-	RepliedToBot bool    `expr:"replied_to_bot"`
-	Poked        bool    `expr:"poked"`
+	Mentioned      bool    `expr:"mentioned"`
+	MentionedOther bool    `expr:"mentioned_other"`
+	RepliedToBot   bool    `expr:"replied_to_bot"`
+	RepliedToOther bool    `expr:"replied_to_other"`
+	Poked          bool    `expr:"poked"`
 	HitNickname  bool    `expr:"hit_nickname"`
 	InThread     bool    `expr:"in_thread"`
 	ThreadTurns  int     `expr:"thread_turns"`

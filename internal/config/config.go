@@ -144,8 +144,10 @@ type PolicyConfig struct {
 	SplitNewlineBubbles    bool                           `yaml:"split_newline_bubbles"`
 	MaxReplyBubbles        int                            `yaml:"max_reply_bubbles"`
 	BubbleTypingDelayMax   float64                        `yaml:"bubble_typing_delay_max_sec"`
-	StripTrailingPeriod    bool                           `yaml:"strip_trailing_period"`
-	PlusOne                PlusOneConfig                  `yaml:"plus_one"`
+	StripTrailingPeriod     bool                           `yaml:"strip_trailing_period"`
+	RecallGossipProb        float64                        `yaml:"recall_gossip_prob"`
+	RecallGossipCooldownSec int                            `yaml:"recall_gossip_cooldown_sec"`
+	PlusOne                 PlusOneConfig                  `yaml:"plus_one"`
 	Poke                   PokeConfig                     `yaml:"poke"`
 	Rules                  PolicyRulesConfig              `yaml:"rules"`
 	Overrides              map[string]PolicyOverrideBlock `yaml:"overrides"`
@@ -346,8 +348,10 @@ func defaultConfig() *Config {
 			SmartReplyDecoration:  true,
 			SplitNewlineBubbles:   true,
 			MaxReplyBubbles:       4,
-			BubbleTypingDelayMax:  1.0,
-			StripTrailingPeriod:   true,
+			BubbleTypingDelayMax:    1.0,
+			StripTrailingPeriod:     true,
+			RecallGossipProb:        0.15,
+			RecallGossipCooldownSec: 300,
 			PlusOne: PlusOneConfig{
 				Enabled:     true,
 				MinUsers:    3,
@@ -486,6 +490,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Policy.Poke.CooldownSec < 0 {
 		cfg.Policy.Poke.CooldownSec = 15
+	}
+	if cfg.Policy.RecallGossipCooldownSec <= 0 {
+		cfg.Policy.RecallGossipCooldownSec = 300
 	}
 	if cfg.LinkParser.CooldownSec < 0 {
 		cfg.LinkParser.CooldownSec = 15

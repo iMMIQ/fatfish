@@ -301,7 +301,7 @@ func (e *Engine) Search(ctx context.Context, opts SearchOptions) ([]SearchHit, e
 		}
 	}
 
-	// 5. Exponential anti-repeat decay for stickers recently used in this channel.
+	// 5. Exponential anti-repeat decay for stickers recently used in this channel (plus lighter global decay).
 	if opts.ChannelID != "" {
 		recent, _ := e.store.RecentStickerUses(ctx, opts.ChannelID, cfg.RecentWindow)
 		if len(recent) > 0 {
@@ -315,9 +315,24 @@ func (e *Engine) Search(ctx context.Context, opts SearchOptions) ([]SearchHit, e
 				if pos, used := lastPos[cands[i].Sticker.StickerID]; used {
 					// Strongly penalize most recent sends (decay ~0.15 -> 0.85 over window).
 					decay := 1.0 - 0.85*math.Exp(-float64(pos)/8.0)
-					cands[i].DecayFactor = decay
+					cands[i].DecayFactor *= decay
 					cands[i].FinalScore *= decay
 				}
+			}
+		}
+	}
+	if globalRecent, err := e.store.RecentStickerUsesGlobal(ctx, 12); err == nil && len(globalRecent) > 0 {
+		gPos := make(map[string]int, len(globalRecent))
+		for idx, id := range globalRecent {
+			if _, seen := gPos[id]; !seen {
+				gPos[id] = idx
+			}
+		}
+		for i := range cands {
+			if pos, used := gPos[cands[i].Sticker.StickerID]; used {
+				decay := 1.0 - 0.45*math.Exp(-float64(pos)/5.0)
+				cands[i].DecayFactor *= decay
+				cands[i].FinalScore *= decay
 			}
 		}
 	}
@@ -352,10 +367,10 @@ func (e *Engine) Search(ctx context.Context, opts SearchOptions) ([]SearchHit, e
 	return out, nil
 }
 
-// PickOne selects a sticker from Top-5 using low-temperature softmax sampling for natural variety,
+// PickOne selects a sticker from Top-8 using calibrated softmax sampling for natural variety,
 // preferring files within cfg.MaxSendMiB to avoid OneBot base64 WS timeouts and memory spikes.
 func (e *Engine) PickOne(ctx context.Context, opts SearchOptions) (*SearchHit, error) {
-	opts.TopK = 5
+	opts.TopK = 8
 	hits, err := e.Search(ctx, opts)
 	if err != nil || len(hits) == 0 {
 		return nil, err
@@ -375,12 +390,12 @@ func (e *Engine) PickOne(ctx context.Context, opts SearchOptions) (*SearchHit, e
 	if len(hits) == 1 {
 		return &hits[0], nil
 	}
-	temp := 0.15
+	temp := 0.25
 	maxS := hits[0].FinalScore
 	minS := hits[len(hits)-1].FinalScore
 	if span := maxS - minS; span > 0 && span < 0.1 {
 		// Calibrate softmax temperature when rerank was skipped and RRF scores are compressed (~0.01-0.04).
-		temp = math.Max(span*0.4, 0.002)
+		temp = math.Max(span*0.55, 0.003)
 	}
 	weights := make([]float64, len(hits))
 	sum := 0.0

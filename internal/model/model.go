@@ -175,6 +175,50 @@ func (m Message) PlainText() string {
 	return b.String()
 }
 
+// TextOnly concatenates user-authored text (text, audio transcript, card title/summary),
+// excluding synthetic mention/poke/notice labels so nickname matching never misfires on @OtherBot(id).
+func (m Message) TextOnly() string {
+	var b strings.Builder
+	for _, p := range m.Parts {
+		var s string
+		switch p.Kind {
+		case PartText:
+			s = strings.TrimSpace(p.Text)
+		case PartAudio:
+			s = strings.TrimSpace(p.Transcript)
+		case PartCard:
+			s = strings.TrimSpace(p.Title + " " + p.Summary)
+		}
+		if s != "" {
+			if b.Len() > 0 {
+				b.WriteByte(' ')
+			}
+			b.WriteString(s)
+		}
+	}
+	return b.String()
+}
+
+// MentionedOther reports whether the message explicitly @-mentions someone other than the bot
+// without also mentioning the bot itself.
+func (m Message) MentionedOther() bool {
+	if m.MentionedBot {
+		return false
+	}
+	for _, p := range m.Parts {
+		if p.Kind == PartMention && p.TargetID != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// RepliedToOther reports whether the message quotes/replies to a message not sent by the bot
+// (without explicitly @-mentioning the bot).
+func (m Message) RepliedToOther() bool {
+	return m.ReplyToMsgID != "" && !m.RepliedToBot && !m.MentionedBot
+}
+
 // DedupHash computes a stable SHA-256 hex digest of plain text for idempotent ingest.
 func DedupHash(plainText string) string {
 	sum := sha256.Sum256([]byte(plainText))

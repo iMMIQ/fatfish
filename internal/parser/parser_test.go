@@ -240,4 +240,12 @@ func TestTier1ExtractorsAndCache(t *testing.T) {
 	if _, err := svc.extractWeixin(ctx, fastCli, srv.URL+"/wx-captcha", false); !errors.Is(err, ErrBlockedBySite) {
 		t.Fatalf("expected ErrBlockedBySite for weixin captcha, got %v", err)
 	}
+
+	// 8. Low-value login-wall shell page must be rejected instead of spamming bare brand titles.
+	if !isLowValueGenericPage("小红书 - 你的生活兴趣社区", "", "") {
+		t.Fatal("expected bare site login-wall title with empty body to be flagged as low-value")
+	}
+	if isLowValueGenericPage("小红书 - 你的生活兴趣社区", "这是一篇完整详细的笔记正文描述内容超过十五字", "") {
+		t.Fatal("expected page with substantive description not to be flagged as low-value")
+	}
 }

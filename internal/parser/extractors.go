@@ -1178,7 +1178,7 @@ func (s *Service) extractGenericHTML(ctx context.Context, cli *http.Client, targ
 	if title == "" && desc == "" && len([]rune(mainText)) < 20 {
 		return nil, ErrEmptyContent
 	}
-	if isBlockedBody(title, mainText) {
+	if isBlockedBody(title, mainText) || isLowValueGenericPage(title, desc, mainText) {
 		return nil, ErrBlockedBySite
 	}
 
@@ -1293,8 +1293,41 @@ func isBlockedPageTitle(title string) bool {
 		"安全验证",
 		"访问受限",
 		"人机验证",
+		"安全中心",
+		"请先登录",
+		"登录验证",
+		"页面不存在",
 	} {
 		if strings.Contains(low, bad) {
+			return true
+		}
+	}
+	return false
+}
+
+// isLowValueGenericPage rejects login-walled or SPA shell pages that only yield a bare site slogan/brand title
+// with no meaningful description or article content (e.g. "小红书 - 你的生活兴趣社区").
+func isLowValueGenericPage(title, desc, body string) bool {
+	if len([]rune(strings.TrimSpace(desc))) >= 15 || len([]rune(strings.TrimSpace(body))) >= 40 {
+		return false
+	}
+	low := strings.ToLower(strings.TrimSpace(title))
+	if low == "" {
+		return true
+	}
+	for _, shell := range []string{
+		"小红书 - 你的生活兴趣社区",
+		"小红书",
+		"知乎 - 有问题",
+		"抖音-记录美好生活",
+		"微博",
+		"哔哩哔哩 (゜-゜)つロ 干杯",
+		"登录",
+		"注册",
+		"sign in",
+		"log in",
+	} {
+		if low == shell || strings.HasPrefix(low, shell) {
 			return true
 		}
 	}

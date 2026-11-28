@@ -273,6 +273,9 @@ type Room struct {
 	lastPlusOne       time.Time
 	lastPokeReply     time.Time
 	lastReversePoke   time.Time
+	lastRecallGossip  time.Time
+	pokeWindowAt      time.Time
+	pokeStreak        int
 	outMu             sync.Mutex
 	outSent           []time.Time // rolling 60s outbound message timestamps (group rate-limit guard)
 	recentLinks       map[string]time.Time // per-channel canonical URL dedup map (actor-owned)
@@ -639,11 +642,34 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 	// Enrich poke targets, @mentions, and silent group notices (recall/join) with known member display names.
 	r.enrichInboundEvent(ctx, msg)
 
-	// Silent background notices (e.g. group_recall, group_increase) enter pendingMsgs without triggering a turn.
+	// Silent background notices (e.g. group_recall, group_increase) enter pendingMsgs without triggering a turn,
+	// except optional low-probability playful recall gossip when substantive text was recalled during daytime.
 	if msg.SilentNotice {
 		r.pendingMsgs = append(r.pendingMsgs, cloneMessage(*msg))
 		if len(r.pendingMsgs) > 60 {
 			r.pendingMsgs = r.pendingMsgs[len(r.pendingMsgs)-60:]
+		}
+		if r.ch.IsGroup() && !r.isMuted(time.Now()) && !r.mgr.policy.IsIgnoredBot(msg.SenderID) && cfg.Policy.RecallGossipProb > 0 {
+			now := time.Now()
+			hour := now.In(cfg.Location()).Hour()
+			isNight := hour < 7 || hour >= 23
+			cd := time.Duration(cfg.Policy.RecallGossipCooldownSec) * time.Second
+			if cd <= 0 {
+				cd = 300 * time.Second
+			}
+			if !isNight && (r.lastRecallGossip.IsZero() || now.Sub(r.lastRecallGossip) >= cd) &&
+				(r.pendingTrigger == nil || r.pendingTrigger.proactive) &&
+				hasSubstantiveRecall(msg) && rand.Float64() < cfg.Policy.RecallGossipProb {
+				r.lastRecallGossip = now
+				r.pendingTrigger = &triggerState{
+					msg:        cloneMessage(*msg),
+					kind:       "recall_gossip",
+					proactive:  true,
+					enqueuedAt: now,
+					enqMsgCnt:  r.msgCount.Load(),
+				}
+				return 3 * time.Second, true
+			}
 		}
 		return 0, false
 	}
@@ -782,10 +808,26 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		default: // "bot_only"
 			pokedForPolicy = msg.PokedBot
 		}
-		// Enforce per-channel direct-poke reply cooldown so rapid poke storms coalesce instead of spamming QQ rate limits.
+		// Enforce per-channel direct-poke reply cooldown and humanlike poke fatigue curve
+		// so rapid poke storms coalesce or respond lightly (reverse-poke / sticker / ignore) instead of spamming LLM turns.
 		if msg.PokedBot && pokedForPolicy && r.ch.IsGroup() && cfg.Policy.Poke.CooldownSec > 0 {
 			if !r.lastPokeReply.IsZero() && now.Sub(r.lastPokeReply) < time.Duration(cfg.Policy.Poke.CooldownSec)*time.Second {
 				pokedForPolicy = false
+			}
+		}
+		if msg.PokedBot && pokedForPolicy && r.ch.IsGroup() {
+			if r.pokeWindowAt.IsZero() || now.Sub(r.pokeWindowAt) > 2*time.Minute {
+				r.pokeStreak = 0
+			}
+			r.pokeStreak++
+			r.pokeWindowAt = now
+			if r.pokeStreak >= 3 && rand.Float64() < 0.80 {
+				pokedForPolicy = false
+			} else if r.pokeStreak == 2 && rand.Float64() < 0.55 {
+				// Second poke in 2 minutes: respond lightly without burning an LLM turn (sticker or reverse poke).
+				pokedForPolicy = false
+				r.lastPokeReply = now
+				r.dispatchLightPokeResponse(msg, cfg)
 			}
 		}
 		// Only reverse-poke when the bot itself was poked, with a humanlike 1.0~2.5s delay and 10s anti-spam cooldown.
@@ -827,8 +869,13 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 	nowLocal := now.In(cfg.Location())
 	hour := nowLocal.Hour()
 	isNight := hour < 7 || hour >= 23
+	mentionedOther := msg.MentionedOther()
+	repliedToOther := msg.RepliedToOther()
+	mentionedIgnoredBot := r.mentionsIgnoredBot(msg)
 	threadMax := r.mgr.policy.ThreadMaxTurns(r.ch)
 	inThread := r.threadUserID == msg.SenderID &&
+		!mentionedOther &&
+		!repliedToOther &&
 		r.threadTurns < threadMax &&
 		time.Since(r.threadLastAt) <= time.Duration(cfg.Policy.ThreadContinuationSec)*time.Second &&
 		time.Since(r.threadLastAt) >= time.Duration(cfg.Policy.ThreadMinIntervalSec*float64(time.Second))
@@ -836,22 +883,24 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 	cooldownOK := time.Since(r.lastProactive) >= time.Duration(cooldownSec)*time.Second
 
 	env := policy.PolicyEnv{
-		IsGroup:      r.ch.IsGroup(),
-		FromBot:      msg.FromBot,
-		IsAdmin:      cfg.IsAdmin(msg.SenderID),
-		Mentioned:    msg.MentionedBot,
-		RepliedToBot: msg.RepliedToBot,
-		Poked:        pokedForPolicy,
-		HitNickname:  r.mgr.policy.HitNickname(plain),
-		InThread:     inThread,
-		ThreadTurns:  r.threadTurns,
-		CooldownOK:   cooldownOK,
-		IsNight:      isNight,
-		Hour:         hour,
-		BurstUsers:   burstUsers,
-		HasLink:      hasLinkCandidate,
-		TextLen:      len([]rune(plain)),
-		Rand:         rand.Float64(),
+		IsGroup:        r.ch.IsGroup(),
+		FromBot:        msg.FromBot,
+		IsAdmin:        cfg.IsAdmin(msg.SenderID),
+		Mentioned:      msg.MentionedBot,
+		MentionedOther: mentionedOther,
+		RepliedToBot:   msg.RepliedToBot,
+		RepliedToOther: repliedToOther,
+		Poked:          pokedForPolicy,
+		HitNickname:    !mentionedIgnoredBot && r.mgr.policy.HitNickname(msg.TextOnly()),
+		InThread:       inThread,
+		ThreadTurns:    r.threadTurns,
+		CooldownOK:     cooldownOK,
+		IsNight:        isNight,
+		Hour:           hour,
+		BurstUsers:     burstUsers,
+		HasLink:        hasLinkCandidate,
+		TextLen:        len([]rune(plain)),
+		Rand:           rand.Float64(),
 	}
 
 	shouldReply := !r.ch.IsGroup() || plusOneBreakTriggered // Always reply in DMs or +1 chain break
@@ -1133,10 +1182,25 @@ func (r *Room) runPerception(msg *model.Message, cfg *config.Config) perceptionR
 			var raw []byte
 			var err error
 			if strings.HasPrefix(p.URL, "http://") || strings.HasPrefix(p.URL, "https://") {
+				imgHeaders := map[string]string{
+					"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+				}
 				var code int
-				raw, _, code, err = netutil.FetchLimited(ctx, r.mgr.httpClient(), p.URL, int64(cfg.Frame.MaxImageMiB)<<20, nil)
-				if err != nil || code >= 400 {
+				for attempt := 0; attempt < 2; attempt++ {
+					raw, _, code, err = netutil.FetchLimited(ctx, r.mgr.httpClient(), p.URL, int64(cfg.Frame.MaxImageMiB)<<20, imgHeaders)
+					if err == nil && code < 400 && len(raw) > 0 {
+						break
+					}
 					raw = nil
+					if attempt == 0 && ctx.Err() == nil {
+						select {
+						case <-time.After(300 * time.Millisecond):
+						case <-ctx.Done():
+						}
+					}
+				}
+				if len(raw) == 0 {
+					r.mgr.log.Warn("image perception fetch failed", "channel", r.ch, "status", code, "err", err)
 				}
 			}
 			// Fallback to NapCat local file path when configured locally.
@@ -1233,9 +1297,22 @@ func (r *Room) runPerception(msg *model.Message, cfg *config.Config) perceptionR
 			lCtx, lCancel := context.WithTimeout(ctx, lTimeout)
 			results := r.mgr.parser.ParseMessageLinks(lCtx, msg, cfg.LinkParser.MaxURLsPerMsg)
 			lCancel()
+			hasRichCard := false
+			for _, p := range msg.Parts {
+				if p.Kind == model.PartCard && strings.TrimSpace(p.Title) != "" {
+					hasRichCard = true
+					break
+				}
+			}
 			for _, res := range results {
 				compact := res.CompactForContext(450)
 				if compact == "" {
+					continue
+				}
+				// Skip redundant low-info generic preview when the QQ share card already carries title/summary.
+				isRedundantGeneric := res.Platform == "generic" && hasRichCard &&
+					strings.TrimSpace(res.Summary) == "" && strings.TrimSpace(res.Author) == "" && strings.TrimSpace(res.Stats) == ""
+				if isRedundantGeneric {
 					continue
 				}
 				msg.Parts = append(msg.Parts, model.Part{
@@ -1617,8 +1694,12 @@ func (r *Room) runTurnWorker(
 		userPayload.Text += "\n[提示: 多名群友正在刷屏复读同一句话，用一句简短俏皮的话自然打断复读。]"
 	} else if trig.kind == "poke_bystander" {
 		userPayload.Text += "\n[提示: 这是群友之间互戳，不是戳你；觉得有节目效果就随口吃瓜调侃一句，没必要接就回复 [[skip]]。]"
+	} else if trig.kind == "recall_gossip" {
+		userPayload.Text += "\n[提示: 群友刚秒撤回了一条消息，顺口吃瓜调侃一句（1~12字，别原封不动复述敏感或隐私内容），没意思就直接输出 [[skip]]。]"
 	} else if trig.kind == "link" {
 		userPayload.Text += "\n[提示: 系统已将这条链接的纯文本基础解析发到群里了，不要重复复读标题和播放量等基础信息；只按你的性格顺口吐槽、接梗或补一句有意思的点评，觉得解析本身已经够清楚、没必要再补话就直接输出 [[skip]]。]"
+	} else if trig.kind == "thread" && !hasRichMediaPart(trig.msg) && len([]rune(strings.TrimSpace(trig.msg.TextOnly()))) <= 6 {
+		userPayload.Text += "\n[提示: 这是续聊且对方回复很简短，若已自然收尾可直接输出 [[skip]] 闭嘴，或只输出 [[sticker: 情绪]] 纯发表情包，不必硬接文字。]"
 	}
 	out, err := r.mgr.runner.Run(ctx, agent.TurnInput{
 		ChannelID:    r.ch,
@@ -1633,6 +1714,11 @@ func (r *Room) runTurnWorker(
 		TriggerKind:  trig.kind,
 	})
 	if err != nil {
+		if infer.IsContentFiltered(err) && r.mgr.store != nil {
+			_ = r.mgr.store.CloseSegment(ctx, seg.ID, "")
+			_ = r.mgr.store.SetChannelActiveSegment(ctx, r.ch, 0)
+			r.mgr.log.Warn("closed content-filtered segment to prevent sticky failure", "channel", r.ch, "segment", seg.ID)
+		}
 		if ctx.Err() == nil {
 			r.mgr.log.Error("agent turn failed", "channel", r.ch, "err", err)
 		}
@@ -1687,7 +1773,7 @@ func (r *Room) runTurnWorker(
 		PokeAfterReply: pokeAfter,
 	}
 
-	committed := r.deliverPlan(ctx, seg, plan, out.NewFrames, out.TrimUpToIndex, out.Stats, trig, cfg)
+	committed := r.deliverPlan(ctx, seg, plan, out.NewFrames, out.TrimUpToIndex, out.ContentFilterRecovered, out.Stats, trig, cfg)
 	if committed {
 		outcome.committed = true
 		outcome.uncommittedBatch = nil
@@ -1695,7 +1781,7 @@ func (r *Room) runTurnWorker(
 	return outcome
 }
 
-func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan model.TurnPlan, newFrames []frame.StoredFramePayload, trimUpToIdx int, stats agent.TurnStats, trig triggerState, cfg *config.Config) bool {
+func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan model.TurnPlan, newFrames []frame.StoredFramePayload, trimUpToIdx int, contentFilterRecovered bool, stats agent.TurnStats, trig triggerState, cfg *config.Config) bool {
 	delID, _ := r.mgr.store.CreateDelivery(ctx, plan)
 	var sent []model.SentItem
 	status := model.DeliverySent
@@ -1966,6 +2052,16 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 	// Invariant (SPEC Section 3): ONLY delivered turns enter the FrozenFrame timeline
 	// and commit any deferred whole-turn frame trim!
 	if len(sent) > 0 || stickerDispatched || r.mgr.tr == nil {
+		// If this turn succeeded via content-filter safe fallback (bypassing poisoned segment history),
+		// rotate the poisoned segment cleanly so subsequent turns start from a fresh segment.
+		if contentFilterRecovered {
+			if r.mgr.store != nil {
+				_ = r.mgr.store.CloseSegment(ctx, seg.ID, "")
+				_ = r.mgr.store.SetChannelActiveSegment(ctx, r.ch, 0)
+			}
+			r.mgr.log.Warn("rotated poisoned segment after content-filter recovery", "channel", r.ch, "segment", seg.ID)
+			return true
+		}
 		// If partial delivery occurred, trim assistant frame text to what was actually sent.
 		if status != model.DeliverySent && len(newFrames) > 0 && newFrames[len(newFrames)-1].Role == "assistant" {
 			var parts []string
@@ -2028,10 +2124,10 @@ func (r *Room) runProactiveGate(ctx context.Context, trig triggerState, cfg *con
 	if len(lines) == 0 {
 		lines = append(lines, fmt.Sprintf("%s: %s", trig.msg.SenderName, trig.msg.PlainText()))
 	}
-	gatePrompt := fmt.Sprintf(`你是群友“%s”，正在潜水看群聊。判断对最新一条消息应该怎么反应，不要抢话、不要强行插嘴：
-- "reply"：真的有接梗/吐槽/搭话空间，或者别人提到了你感兴趣的话题/在叫你。
-- "react"：不需要说话，悄悄给最新消息贴一个 QQ 表情表态更有活人感（例如附和、吃瓜、觉得好笑或无语）。
-- "ignore"：别人正在聊私事/互怼/无聊灌水，或者你刚发过言，保持潜水。
+	gatePrompt := fmt.Sprintf(`你是群友“%s”，正在潜水看群聊。判断对最新一条消息应该怎么反应，核心原则是“轻存在感、少刷屏、懂闭嘴”：
+- "react"：首选轻量互动！看到好笑、离谱、发梗图、吃瓜、或者群友日常分享时，不用打字，悄悄给最新消息贴一个 QQ 表情表态（比插话更有活人感）。
+- "reply"：仅当真的有极佳接梗/吐槽/反击点，或明确在聊你/叫你且适合短句接话时才选（不要强行凑话，不要打断别人明显在 @ 别人或互怼的对话）。
+- "ignore"：普通灌水、行情播报、别人正在私聊或你刚发过言，保持潜水。
 
 若选 "react"，emoji_id 必须从以下数字 ID 中选一个：
 76(赞), 66(爱心), 182(笑哭), 179(doge/狗头), 271(吃瓜), 357(裂开/无语), 424(续火/热闹), 181(戳一戳), 319(比心)
@@ -2209,14 +2305,21 @@ func (r *Room) generateSegmentSummary(ctx context.Context, seg *store.SegmentRec
 	}
 	resp, err := r.mgr.hub.Chat(ctx, "fast", infer.ChatRequest{
 		Messages: []infer.ChatMessage{
-			{Role: "system", Content: "Summarize this completed conversation segment in <=180 words for continuity in the next segment."},
+			{Role: "system", Content: "用简体中文简明概括这段已结束群聊的脉络与未完结话题（不超过120字），纯文本不要Markdown标题或列表；若涉及粗俗、色情、敏感或争吵细节，必须中性脱敏概括（如“聊了成人玩笑”），绝不复述露骨词汇、脏话或直接照抄原聊天记录。"},
 			{Role: "user", Content: strings.Join(lines, "\n")},
 		},
+		MaxTokens:          256,
+		ChatTemplateKwargs: map[string]any{"enable_thinking": false},
 	})
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(resp.Content)
+	summary := strings.TrimSpace(resp.Content)
+	// Guard against models echoing raw transcript prefixes back as summary.
+	if strings.HasPrefix(summary, "user: [") || strings.HasPrefix(summary, "[") && strings.Contains(summary, "]: ") {
+		return ""
+	}
+	return summary
 }
 
 func (r *Room) summarizeClosedSegment(seg *store.SegmentRecord) {
@@ -2286,7 +2389,19 @@ func FormatBubbles(text string, pol config.PolicyConfig) []string {
 		maxB = 4
 	}
 	if len(bubbles) > maxB {
-		tail := strings.Join(bubbles[maxB-1:], "\n")
+		tailSlice := bubbles[maxB-1:]
+		allShort := true
+		for _, s := range tailSlice {
+			if len([]rune(s)) > 14 {
+				allShort = false
+				break
+			}
+		}
+		sep := "\n"
+		if allShort {
+			sep = " "
+		}
+		tail := strings.Join(tailSlice, sep)
 		bubbles = append(bubbles[:maxB-1], tail)
 	}
 	for i := range bubbles {
@@ -2343,4 +2458,108 @@ func uniqueSenders(msgs []model.Message) []string {
 		}
 	}
 	return out
+}
+
+func (r *Room) mentionsIgnoredBot(msg *model.Message) bool {
+	if msg == nil || r.mgr.policy == nil {
+		return false
+	}
+	for _, p := range msg.Parts {
+		if p.Kind == model.PartMention && p.TargetID != "" && r.mgr.policy.IsIgnoredBot(p.TargetID) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSubstantiveRecall(msg *model.Message) bool {
+	if msg == nil {
+		return false
+	}
+	for _, p := range msg.Parts {
+		if p.Kind == model.PartNotice && strings.HasPrefix(p.Text, "[撤回了刚才的消息:") {
+			// Ensure the recalled content itself is non-trivial (>= 4 runes beyond wrapper).
+			return len([]rune(p.Text)) >= 16
+		}
+	}
+	return false
+}
+
+func hasRichMediaPart(msg model.Message) bool {
+	for _, p := range msg.Parts {
+		switch p.Kind {
+		case model.PartImage, model.PartAudio, model.PartCard, model.PartFile, model.PartForward, model.PartLink:
+			return true
+		}
+	}
+	return false
+}
+
+// dispatchLightPokeResponse handles repeated pokes playfully without invoking the primary LLM:
+// sends either an async reaction sticker or a delayed reverse poke.
+func (r *Room) dispatchLightPokeResponse(msg *model.Message, cfg *config.Config) {
+	if r.mgr.tr == nil || msg == nil {
+		return
+	}
+	expEpoch := r.epoch.Load()
+	maxPerMin := cfg.Policy.MaxMsgsPerMin
+	if r.mgr.stickers != nil && cfg.Sticker.Enabled && r.outboundRemaining(time.Now(), maxPerMin) >= 2 && rand.Float64() < 0.65 {
+		intents := []string{"无语叹气 别戳了", "气鼓鼓 哈气", "摊手摆烂 懒得理你", "暗中观察 嫌弃"}
+		intent := intents[rand.Intn(len(intents))]
+		botName := r.botDisplayName(cfg)
+		r.mgr.stickers.DispatchAsync(
+			r.mgr.shutdownCtx,
+			r.ch,
+			expEpoch,
+			intent,
+			"[戳了你]",
+			func() int64 { return r.epoch.Load() },
+			func(sctx context.Context, st model.Sticker, imgBytes []byte) error {
+				mime := sticker.MimeTypeFor(st)
+				pid, err := r.mgr.tr.SendImage(sctx, r.ch, imgBytes, mime, transport.SendOptions{})
+				if err != nil {
+					if errors.Is(err, transport.ErrRiskMuted) {
+						r.engageMute(sctx, cfg)
+					}
+					return err
+				}
+				r.recordOutbound(time.Now())
+				_ = r.mgr.store.AppendMessage(sctx, &model.Message{
+					ChannelID:     r.ch,
+					PlatformMsgID: pid,
+					SenderID:      r.mgr.tr.SelfID(),
+					SenderName:    botName,
+					FromBot:       true,
+					Parts: []model.Part{{
+						Kind:     model.PartImage,
+						SHA256:   st.SHA256,
+						MimeType: mime,
+						Text:     "[sticker:" + st.StickerID + "]",
+					}},
+					CreatedAt: time.Now(),
+				})
+				return nil
+			},
+		)
+		return
+	}
+	if r.lastReversePoke.IsZero() || time.Since(r.lastReversePoke) >= 10*time.Second {
+		r.lastReversePoke = time.Now()
+		delay := time.Duration((0.8 + rand.Float64()*1.2) * float64(time.Second))
+		r.mgr.wg.Add(1)
+		go func(target string, d time.Duration, ep int64) {
+			defer r.mgr.wg.Done()
+			select {
+			case <-time.After(d):
+			case <-r.mgr.shutdownCtx.Done():
+				return
+			}
+			if r.epoch.Load() != ep {
+				return
+			}
+			pctx, cancel := context.WithTimeout(r.mgr.shutdownCtx, 2*time.Second)
+			defer cancel()
+			_ = r.mgr.tr.SendPoke(pctx, r.ch, target)
+		}(msg.SenderID, delay, expEpoch)
+	}
 }

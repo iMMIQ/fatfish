@@ -1753,6 +1753,65 @@ func (s *Store) RecentStickerUses(ctx context.Context, ch model.ChannelID, limit
 	return ids, rows.Err()
 }
 
+// RecentStickerUsesGlobal returns the most recently sent sticker IDs across all channels
+// so cross-group sends avoid repeating the exact same sticker back-to-back.
+func (s *Store) RecentStickerUsesGlobal(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 12
+	}
+	rows, err := s.readDB.QueryContext(ctx,
+		`SELECT sticker_id FROM sticker_uses ORDER BY used_at DESC LIMIT ?`,
+		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// MemberActivityCounts returns non-bot message counts per member in ch since the given timestamp.
+func (s *Store) MemberActivityCounts(ctx context.Context, ch model.ChannelID, memberIDs []string, since time.Time) (map[string]int, error) {
+	out := make(map[string]int, len(memberIDs))
+	if len(memberIDs) == 0 {
+		return out, nil
+	}
+	ph := make([]string, len(memberIDs))
+	args := make([]any, 0, len(memberIDs)+2)
+	args = append(args, string(ch), since.UnixMilli())
+	for i, id := range memberIDs {
+		ph[i] = "?"
+		args = append(args, id)
+	}
+	rows, err := s.readDB.QueryContext(ctx,
+		`SELECT sender_id, COUNT(*) FROM messages
+		 WHERE channel_id = ? AND from_bot = 0 AND created_at >= ? AND sender_id IN (`+strings.Join(ph, ",")+`)
+		 GROUP BY sender_id`,
+		args...,
+	)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var cnt int
+		if err := rows.Scan(&id, &cnt); err != nil {
+			return out, err
+		}
+		out[id] = cnt
+	}
+	return out, rows.Err()
+}
+
 // --- Schedules & Daily Digests ---
 
 func (s *Store) CreateSchedule(ctx context.Context, sc *model.Schedule, maxPerChannel int) error {

@@ -81,13 +81,14 @@ type TurnStats struct {
 // TurnOutput returns the text reply, direct media, optional async sticker intent,
 // deferred frame trim index, and newly generated FrozenFrames ready to be persisted after delivery succeeds.
 type TurnOutput struct {
-	Text          string
-	DirectMedia   []model.DirectMedia
-	StickerIntent string
-	Skipped       bool
-	NewFrames     []frame.StoredFramePayload
-	TrimUpToIndex int // >= 0 if AssemblePlan deferred a whole-turn trim; -1 otherwise
-	Stats         TurnStats
+	Text                   string
+	DirectMedia            []model.DirectMedia
+	StickerIntent          string
+	Skipped                bool
+	ContentFilterRecovered bool
+	NewFrames              []frame.StoredFramePayload
+	TrimUpToIndex          int // >= 0 if AssemblePlan deferred a whole-turn trim; -1 otherwise
+	Stats                  TurnStats
 }
 
 // Run executes the agent loop and returns a TurnOutput without mutating the public timeline yet
@@ -128,6 +129,7 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 	var finalText string
 	var stats TurnStats
 	exhaustedTools := false
+	contentFilterRecovered := false
 	for iter := 1; iter <= maxToolIterations; iter++ {
 		req := infer.ChatRequest{
 			Messages: msgs,
@@ -141,7 +143,25 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 		}
 		resp, err := r.hub.Chat(ctx, "primary", req)
 		if err != nil {
-			return nil, err
+			// Self-heal poisoned segment history / pinned snapshot when upstream rejects with content filter (e.g. 1301):
+			// retry once with only immutable system prompt + current turn so a single dirty history segment cannot brick a channel.
+			if iter == 1 && infer.IsContentFiltered(err) && len(msgs) > 2 {
+				r.log.Warn("content filter triggered on segment context, retrying without pinned history", "channel", in.ChannelID, "segment", in.Segment.ID)
+				safeMsgs := []infer.ChatMessage{msgs[0], msgs[len(msgs)-1]}
+				safeResp, safeErr := r.hub.Chat(ctx, "primary", infer.ChatRequest{
+					Messages: safeMsgs,
+					Tools:    defs,
+				})
+				if safeErr == nil {
+					msgs = safeMsgs
+					resp = safeResp
+					err = nil
+					contentFilterRecovered = true
+				}
+			}
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		stats.Iterations = iter
@@ -297,13 +317,14 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 	}
 
 	return &TurnOutput{
-		Text:          cleanText,
-		DirectMedia:   directMedia,
-		StickerIntent: stickerIntent,
-		Skipped:       skipped,
-		NewFrames:     newFrames,
-		TrimUpToIndex: assembled.TrimUpToIndex,
-		Stats:         stats,
+		Text:                   cleanText,
+		DirectMedia:            directMedia,
+		StickerIntent:          stickerIntent,
+		Skipped:                skipped,
+		ContentFilterRecovered: contentFilterRecovered,
+		NewFrames:              newFrames,
+		TrimUpToIndex:          assembled.TrimUpToIndex,
+		Stats:                  stats,
 	}, nil
 }
 
