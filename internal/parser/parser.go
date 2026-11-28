@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +41,7 @@ type Options struct {
 	GitHubToken     string
 	BilibiliCookie  string
 	IgnoreDomains   []string
+	Logger          *slog.Logger
 }
 
 // ParseOptions controls per-request parsing depth.
@@ -55,17 +58,26 @@ type ExtractedLink struct {
 
 // Result is the structured plain-text representation of a parsed web link.
 type Result struct {
-	Platform     string    `json:"platform"`
-	OriginalURL  string    `json:"original_url"`
-	CanonicalURL string    `json:"canonical_url"`
-	Title        string    `json:"title,omitempty"`
-	Author       string    `json:"author,omitempty"`
-	PublishedAt  string    `json:"published_at,omitempty"`
-	Stats        string    `json:"stats,omitempty"`
-	Summary      string    `json:"summary,omitempty"`
-	Extra        string    `json:"extra,omitempty"`
-	RawText      string    `json:"raw_text,omitempty"`
-	FetchedAt    time.Time `json:"fetched_at"`
+	Platform      string    `json:"platform"`
+	OriginalURL   string    `json:"original_url"`
+	CanonicalURL  string    `json:"canonical_url"`
+	Title         string    `json:"title,omitempty"`
+	Author        string    `json:"author,omitempty"`
+	PublishedAt   string    `json:"published_at,omitempty"`
+	Stats         string    `json:"stats,omitempty"`
+	Summary       string    `json:"summary,omitempty"`
+	Extra         string    `json:"extra,omitempty"`
+	RawText       string    `json:"raw_text,omitempty"`
+	CoverURL      string    `json:"cover_url,omitempty"`
+	AISummary     string    `json:"ai_summary,omitempty"`
+	PinnedComment string    `json:"pinned_comment,omitempty"`
+	TopComments   string    `json:"top_comments,omitempty"`
+	ArgueMsg      string    `json:"argue_msg,omitempty"`
+	DurationSec   int       `json:"duration_sec,omitempty"`
+	VideoBvid     string    `json:"video_bvid,omitempty"`
+	VideoCid      int64     `json:"video_cid,omitempty"`
+	HasTranscript bool      `json:"has_transcript,omitempty"`
+	FetchedAt     time.Time `json:"fetched_at"`
 }
 
 // CompactForContext formats a bounded plain-text summary suitable for L0 persistence, FTS5, and LLM turn context.
@@ -81,7 +93,11 @@ func (r *Result) CompactForContext(maxRunes int) string {
 		head = append(head, r.Title)
 	}
 	if r.Author != "" {
-		head = append(head, "作者: "+r.Author)
+		if r.Platform == "bilibili" {
+			head = append(head, "UP: "+r.Author)
+		} else {
+			head = append(head, "作者: "+r.Author)
+		}
 	}
 	if r.Stats != "" {
 		head = append(head, r.Stats)
@@ -94,11 +110,22 @@ func (r *Result) CompactForContext(maxRunes int) string {
 		fmt.Fprintf(&b, "[%s] ", r.Platform)
 	}
 	b.WriteString(strings.Join(head, " | "))
-	if s := strings.TrimSpace(r.Summary); s != "" {
+	if r.ArgueMsg != "" {
+		b.WriteString("\n官方提示: " + r.ArgueMsg)
+	}
+	if r.AISummary != "" {
+		b.WriteString("\nAI总结: " + r.AISummary)
+	} else if s := strings.TrimSpace(r.Summary); s != "" {
 		if b.Len() > 0 {
 			b.WriteString("\n摘要: ")
 		}
 		b.WriteString(s)
+	}
+	if r.PinnedComment != "" {
+		b.WriteString("\nUP置顶: " + clipRunesCompact(r.PinnedComment, 140))
+	}
+	if r.TopComments != "" && !strings.Contains(b.String(), "热评(") {
+		b.WriteString("\n" + clipRunesCompact(r.TopComments, 180))
 	}
 	return clipRunesCompact(strings.TrimSpace(b.String()), maxRunes)
 }
@@ -154,6 +181,26 @@ func (r *Result) FormatForGroupText() string {
 	}
 	if len(meta) > 0 {
 		lines = append(lines, strings.Join(meta, " | "))
+	}
+
+	if r.Platform == "bilibili" {
+		if r.ArgueMsg != "" {
+			lines = append(lines, "提示: "+clipRunesCompact(r.ArgueMsg, 120))
+		}
+		if r.AISummary != "" {
+			lines = append(lines, "要点: "+clipRunesCompact(r.AISummary, 200))
+		} else if s := strings.TrimSpace(r.Summary); s != "" {
+			lines = append(lines, clipRunesCompact(s, 200))
+		}
+		if r.PinnedComment != "" {
+			lines = append(lines, "UP置顶: "+clipRunesCompact(r.PinnedComment, 110))
+		} else if r.TopComments != "" && r.AISummary != "" {
+			firstLine := strings.SplitN(r.TopComments, "\n", 2)[0]
+			if firstLine != "" {
+				lines = append(lines, clipRunesCompact(firstLine, 110))
+			}
+		}
+		return strings.TrimSpace(strings.Join(lines, "\n"))
 	}
 
 	if s := strings.TrimSpace(r.Summary); s != "" {
@@ -233,6 +280,8 @@ type Service struct {
 
 	// Optional API base overrides (used by tests; production uses standard endpoints).
 	bilibiliAPIBase     string
+	bilibiliLiveAPIBase string
+	bilibiliWebBase     string
 	githubAPIBase       string
 	arxivAPIBase        string
 	arxivPDFBase        string
@@ -240,6 +289,9 @@ type Service struct {
 	hfOriginBase        string
 	twitterAPIBase      string
 	twitterFallbackBase string
+
+	bili   *biliSession
+	biliSF singleflight.Group
 
 	cacheMu sync.RWMutex
 	cache   map[string]cacheEntry
@@ -250,6 +302,8 @@ type Service struct {
 func NewService(opts Options) *Service {
 	s := &Service{
 		bilibiliAPIBase:     "https://api.bilibili.com",
+		bilibiliLiveAPIBase: "https://api.live.bilibili.com",
+		bilibiliWebBase:     "https://www.bilibili.com",
 		githubAPIBase:       "https://api.github.com",
 		arxivAPIBase:        "https://export.arxiv.org",
 		arxivPDFBase:        "https://arxiv.org",
@@ -257,10 +311,45 @@ func NewService(opts Options) *Service {
 		hfOriginBase:        "https://huggingface.co",
 		twitterAPIBase:      "https://api.fxtwitter.com",
 		twitterFallbackBase: "https://api.vxtwitter.com",
+		bili:                newBiliSession(),
 		cache:               make(map[string]cacheEntry),
 	}
 	s.UpdateOptions(opts)
 	return s
+}
+
+func (s *Service) logger() *slog.Logger {
+	s.mu.RLock()
+	l := s.opts.Logger
+	s.mu.RUnlock()
+	if l != nil {
+		return l
+	}
+	return slog.Default()
+}
+
+// SetBilibiliAPIBaseForTest overrides the Bilibili API endpoint for cross-package tests.
+func (s *Service) SetBilibiliAPIBaseForTest(base string) {
+	s.mu.Lock()
+	s.bilibiliAPIBase = strings.TrimRight(strings.TrimSpace(base), "/")
+	s.mu.Unlock()
+}
+
+// CacheDeepResult stores an enriched deep Result (e.g. after on-demand ASR transcription) under its canonical key.
+func (s *Service) CacheDeepResult(res *Result) {
+	if res == nil {
+		return
+	}
+	opts, _, _, _ := s.snapshotConfig()
+	if res.CanonicalURL != "" {
+		s.cachePut(res.CanonicalURL, res, true, opts.CacheTTL, opts.MaxCacheEntries)
+	}
+	if res.OriginalURL != "" {
+		orig := CanonicalizeURL(res.OriginalURL)
+		if orig != "" && orig != res.CanonicalURL {
+			s.cachePut(orig, res, true, opts.CacheTTL, opts.MaxCacheEntries)
+		}
+	}
 }
 
 // UpdateOptions hot-reloads HTTP client allowlists, tokens, timeouts, and ignored domains.
@@ -376,7 +465,11 @@ func (s *Service) Parse(ctx context.Context, rawURL string, popts ParseOptions) 
 	}
 
 	normOrig := CanonicalizeURL(rawURL)
+	startSec := parseStartTimeSeconds(rawURL)
 	if cached, ok := s.cacheGet(normOrig, popts.Deep); ok {
+		if startSec > 0 {
+			applyBilibiliTimestampFocus(cached, startSec)
+		}
 		return cached, nil
 	}
 
@@ -416,6 +509,12 @@ func (s *Service) Parse(ctx context.Context, rawURL string, popts ParseOptions) 
 			return nil, ErrEmptyContent
 		}
 		cp := *r
+		if startSec <= 0 && cp.OriginalURL != "" && cp.OriginalURL != rawURL {
+			startSec = parseStartTimeSeconds(cp.OriginalURL)
+		}
+		if startSec > 0 {
+			applyBilibiliTimestampFocus(&cp, startSec)
+		}
 		return &cp, nil
 	}
 }
@@ -439,9 +538,11 @@ func (s *Service) parseUncached(
 	}
 
 	// Expand known shorteners safely before matching site extractors.
+	expandedStartSec := 0
 	if isShortenerHost(host) {
 		if expanded, eerr := s.expandShortURL(ctx, cli, rawURL); eerr == nil && expanded != "" {
 			targetURL = expanded
+			expandedStartSec = parseStartTimeSeconds(expanded)
 			if eu, perr := url.Parse(expanded); perr == nil {
 				u = eu
 				host = strings.ToLower(u.Hostname())
@@ -453,6 +554,9 @@ func (s *Service) parseUncached(
 	if canon != normOrig {
 		if cached, ok := s.cacheGet(canon, popts.Deep); ok {
 			s.cachePut(normOrig, cached, popts.Deep, opts.CacheTTL, opts.MaxCacheEntries)
+			if expandedStartSec > 0 {
+				applyBilibiliTimestampFocus(cached, expandedStartSec)
+			}
 			return cached, nil
 		}
 	}
@@ -489,6 +593,11 @@ func (s *Service) parseUncached(
 	s.cachePut(normOrig, res, popts.Deep, opts.CacheTTL, opts.MaxCacheEntries)
 	if res.CanonicalURL != "" && res.CanonicalURL != normOrig {
 		s.cachePut(res.CanonicalURL, res, popts.Deep, opts.CacheTTL, opts.MaxCacheEntries)
+	}
+	if expandedStartSec > 0 && parseStartTimeSeconds(rawURL) == 0 {
+		cp := *res
+		applyBilibiliTimestampFocus(&cp, expandedStartSec)
+		return &cp, nil
 	}
 	return res, nil
 }
@@ -545,18 +654,68 @@ func (s *Service) cachePut(key string, res *Result, deep bool, ttl time.Duration
 }
 
 func (s *Service) expandShortURL(ctx context.Context, cli *http.Client, rawURL string) (string, error) {
+	// Zero-RTT fast path: b23.tv/BV... or bili2233.cn/BV... already contains the BV ID.
+	if u, err := url.Parse(rawURL); err == nil {
+		h := strings.ToLower(u.Hostname())
+		if h == "b23.tv" || h == "bili2233.cn" {
+			if bvid := bvidRe.FindString(u.Path); bvid != "" {
+				dest := "https://www.bilibili.com/video/" + bvid
+				if q := u.Query(); q.Get("p") != "" || q.Get("t") != "" {
+					keep := url.Values{}
+					if p := q.Get("p"); p != "" {
+						keep.Set("p", p)
+					}
+					if t := q.Get("t"); t != "" {
+						keep.Set("t", t)
+					}
+					if enc := keep.Encode(); enc != "" {
+						dest += "?" + enc
+					}
+				}
+				return dest, nil
+			}
+		}
+	}
+
+	// Shallow-clone http.Client sharing the SSRF-safe Transport, but stop as soon as redirect leaves
+	// shortener domains so we read the Location header without downloading the destination HTML page.
+	expandCli := &http.Client{
+		Transport: cli.Transport,
+		Timeout:   cli.Timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 6 {
+				return errors.New("netutil: too many redirects")
+			}
+			if err := netutil.ValidateURL(req.URL.String()); err != nil {
+				return err
+			}
+			if !isShortenerHost(req.URL.Hostname()) {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("User-Agent", defaultBrowserUA)
-	resp, err := cli.Do(req)
+	resp, err := expandCli.Do(req)
 	if err != nil {
 		return "", err
 	}
+	defer resp.Body.Close()
+
 	finalURL := resp.Request.URL.String()
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		if loc := strings.TrimSpace(resp.Header.Get("Location")); loc != "" {
+			if nextU, perr := resp.Request.URL.Parse(loc); perr == nil {
+				finalURL = nextU.String()
+			}
+		}
+	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	_ = resp.Body.Close()
 	if err := netutil.ValidateURL(finalURL); err != nil {
 		return "", err
 	}
@@ -568,6 +727,7 @@ func (s *Service) expandShortURL(ctx context.Context, cli *http.Client, rawURL s
 var (
 	rawURLRe  = regexp.MustCompile(`https?://[^\s<>"'\x00-\x1f\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}]+`)
 	bareBVRe  = regexp.MustCompile(`(?:^|[^0-9A-Za-z/])(BV1[0-9A-Za-z]{9})(?:$|[^0-9A-Za-z])`)
+	bareAVRe  = regexp.MustCompile(`(?i)(?:^|[^0-9A-Za-z/])av(\d{5,12})(?:$|[^0-9A-Za-z])`)
 	bvidRe    = regexp.MustCompile(`BV[0-9A-Za-z]{10}`)
 	avidRe    = regexp.MustCompile(`(?i)/(?:video/)?av(\d+)`)
 	arxivIDRe = regexp.MustCompile(`(\d{4}\.\d{4,5})(v\d+)?`)
@@ -642,7 +802,6 @@ var trackingQueryParams = map[string]struct{}{
 	"gclid":          {},
 	"si":             {},
 	"s":              {},
-	"t":              {},
 	"feature":        {},
 	"from":           {},
 	"isappinstalled": {},
@@ -738,6 +897,13 @@ func ExtractURLs(msg *model.Message, maxURLs int, ignoreDomains []string, allowH
 				}
 			}
 		}
+		if len(out) < maxURLs {
+			for _, sub := range bareAVRe.FindAllStringSubmatch(p.Text, -1) {
+				if len(sub) >= 2 {
+					addCandidate("https://www.bilibili.com/video/av"+sub[1], false)
+				}
+			}
+		}
 	}
 	return out
 }
@@ -807,11 +973,22 @@ func CanonicalizeURL(raw string) string {
 	u.Host = strings.ToLower(u.Host)
 	u.Fragment = ""
 
-	// Normalize Bilibili video URLs to canonical BV link.
+	// Normalize Bilibili video URLs to canonical BV link (preserving ?p=N when N > 1).
 	host := u.Hostname()
 	if strings.Contains(host, "bilibili.com") {
 		if bvid := bvidRe.FindString(u.Path); bvid != "" {
-			return "https://www.bilibili.com/video/" + bvid
+			canon := "https://www.bilibili.com/video/" + bvid
+			if p, err := strconv.Atoi(strings.TrimSpace(u.Query().Get("p"))); err == nil && p > 1 {
+				canon += fmt.Sprintf("?p=%d", p)
+			}
+			return canon
+		}
+		if m := avidRe.FindStringSubmatch(u.Path); len(m) >= 2 {
+			canon := "https://www.bilibili.com/video/av" + m[1]
+			if p, err := strconv.Atoi(strings.TrimSpace(u.Query().Get("p"))); err == nil && p > 1 {
+				canon += fmt.Sprintf("?p=%d", p)
+			}
+			return canon
 		}
 	}
 	// Normalize arXiv URLs to canonical /abs/<id>.

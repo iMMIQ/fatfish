@@ -768,6 +768,12 @@ func (h *Hub) rerankChunk(ctx context.Context, ep config.ModelEndpointConfig, cb
 
 // Transcribe calls OpenAI-compatible POST /v1/audio/transcriptions (multipart/form-data).
 func (h *Hub) Transcribe(ctx context.Context, filename string, audioBytes []byte) (string, error) {
+	return h.TranscribeWithTimeout(ctx, filename, audioBytes, 0)
+}
+
+// TranscribeWithTimeout calls OpenAI-compatible POST /v1/audio/transcriptions with an optional timeout override
+// (when timeoutOverride <= 0, falls back to the configured asr endpoint timeout).
+func (h *Hub) TranscribeWithTimeout(ctx context.Context, filename string, audioBytes []byte, timeoutOverride time.Duration) (string, error) {
 	if len(audioBytes) == 0 {
 		return "", errors.New("infer: empty audio bytes")
 	}
@@ -801,7 +807,10 @@ func (h *Hub) Transcribe(ctx context.Context, filename string, audioBytes []byte
 		return "", err
 	}
 
-	timeout := time.Duration(ep.TimeoutSec) * time.Second
+	timeout := timeoutOverride
+	if timeout <= 0 {
+		timeout = time.Duration(ep.TimeoutSec) * time.Second
+	}
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}

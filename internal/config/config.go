@@ -210,20 +210,31 @@ type PolicyOverrideBlock struct {
 
 // LinkParserConfig controls proactive URL extraction, Tier-1 site parsing, caching, and fatfish-decided replies.
 type LinkParserConfig struct {
-	Enabled          bool     `yaml:"enabled"`
-	ProactiveReply   bool     `yaml:"proactive_reply"`
-	CooldownSec      int      `yaml:"cooldown_sec"`
-	DedupTTLSec      int      `yaml:"dedup_ttl_sec"`
-	MaxURLsPerMsg    int      `yaml:"max_urls_per_msg"`
-	WaitSec          float64  `yaml:"wait_sec"`
-	TimeoutSec       int      `yaml:"timeout_sec"`
-	CacheTTLSec      int      `yaml:"cache_ttl_sec"`
-	NightProactive   bool     `yaml:"night_proactive"`
-	TwitterAPIBase   string   `yaml:"twitter_api_base"`
-	GitHubToken      string   `yaml:"github_token"`
-	BilibiliCookie   string   `yaml:"bilibili_cookie"`
-	IgnoreDomains    []string `yaml:"ignore_domains"`
-	DisabledChannels []string `yaml:"disabled_channels"`
+	Enabled             bool     `yaml:"enabled"`
+	ProactiveReply      bool     `yaml:"proactive_reply"`
+	SendVideo           *bool    `yaml:"send_video,omitempty"` // Download & send short Bilibili MP4 asynchronously after text preview (default true)
+	MaxVideoMiB         int      `yaml:"max_video_mib"`        // Hard size cap for downloaded video in MiB (default 20, max 50)
+	MaxVideoDurationSec int      `yaml:"max_video_duration_sec"` // Max video duration eligible for download in seconds (default 300)
+	CooldownSec         int      `yaml:"cooldown_sec"`
+	DedupTTLSec         int      `yaml:"dedup_ttl_sec"`
+	MaxURLsPerMsg       int      `yaml:"max_urls_per_msg"`
+	WaitSec             float64  `yaml:"wait_sec"`
+	TimeoutSec          int      `yaml:"timeout_sec"`
+	CacheTTLSec         int      `yaml:"cache_ttl_sec"`
+	NightProactive      bool     `yaml:"night_proactive"`
+	TwitterAPIBase      string   `yaml:"twitter_api_base"`
+	GitHubToken         string   `yaml:"github_token"`
+	BilibiliCookie      string   `yaml:"bilibili_cookie"`
+	IgnoreDomains       []string `yaml:"ignore_domains"`
+	DisabledChannels    []string `yaml:"disabled_channels"`
+}
+
+// IsSendVideoEnabled returns true when asynchronous post-text video delivery is enabled (defaults to true).
+func (c LinkParserConfig) IsSendVideoEnabled() bool {
+	if c.SendVideo == nil {
+		return true
+	}
+	return *c.SendVideo
 }
 
 type StickerConfig struct {
@@ -614,6 +625,15 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.LinkParser.CacheTTLSec <= 0 {
 		cfg.LinkParser.CacheTTLSec = 1200
+	}
+	if cfg.LinkParser.MaxVideoMiB <= 0 {
+		cfg.LinkParser.MaxVideoMiB = 20
+	}
+	if cfg.LinkParser.MaxVideoMiB > 50 {
+		cfg.LinkParser.MaxVideoMiB = 50
+	}
+	if cfg.LinkParser.MaxVideoDurationSec <= 0 {
+		cfg.LinkParser.MaxVideoDurationSec = 300
 	}
 	if strings.TrimSpace(cfg.LinkParser.TwitterAPIBase) == "" {
 		cfg.LinkParser.TwitterAPIBase = "https://api.fxtwitter.com"

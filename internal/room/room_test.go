@@ -168,6 +168,9 @@ func (m *mockTransport) Probe(context.Context) error                            
 func (m *mockTransport) SendImage(context.Context, model.ChannelID, []byte, string, transport.SendOptions) (string, error) {
 	return "img1", nil
 }
+func (m *mockTransport) SendVideo(context.Context, model.ChannelID, []byte, transport.SendOptions) (string, error) {
+	return "vid1", nil
+}
 func (m *mockTransport) SendForward(_ context.Context, _ model.ChannelID, _ []transport.ForwardNode, _ string) (string, error) {
 	if m.failForward.Load() {
 		return "", errors.New("forward unsupported")

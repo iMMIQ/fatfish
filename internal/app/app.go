@@ -129,7 +129,7 @@ func New(configPath string, enableTransport bool) (*App, error) {
 	sched.SetMediaQuotas(cfg.Frame.RoomMediaMiB, cfg.Frame.TotalMediaMiB)
 
 	// Register all 10 high-leverage built-in tools (SPEC 10.2).
-	linkParser := parser.NewService(buildParserOptions(cfg))
+	linkParser := parser.NewService(buildParserOptions(cfg, logger))
 	webSearchTool := tool.NewWebSearchTool(cfg.Tools.SSRFAllowHosts)
 	readSourceTool := tool.NewReadSourceTool(hub, cfg.Tools.SSRFAllowHosts)
 	readSourceTool.SetParser(linkParser)
@@ -216,7 +216,7 @@ func New(configPath string, enableTransport bool) (*App, error) {
 		sched.UpdateConfig(newCfg.Location(), newCfg.Tools.MaxSchedulesPerChannel, newCfg.Tools.MinCronIntervalMinutes)
 		reg.UpdateDefaultTimeout(time.Duration(newCfg.Tools.DefaultTimeoutSec) * time.Second)
 		roomDisp.UpdateHTTPClient(newCfg.Tools.SSRFAllowHosts)
-		linkParser.UpdateOptions(buildParserOptions(newCfg))
+		linkParser.UpdateOptions(buildParserOptions(newCfg, logger))
 		webSearchTool.UpdateAllowHosts(newCfg.Tools.SSRFAllowHosts)
 		readSourceTool.UpdateAllowHosts(newCfg.Tools.SSRFAllowHosts)
 		quoteTool.UpdateAllowHosts(newCfg.Tools.SSRFAllowHosts)
@@ -248,7 +248,7 @@ func New(configPath string, enableTransport bool) (*App, error) {
 	}, nil
 }
 
-func buildParserOptions(cfg *config.Config) parser.Options {
+func buildParserOptions(cfg *config.Config, logger *slog.Logger) parser.Options {
 	return parser.Options{
 		AllowHosts:     cfg.Tools.SSRFAllowHosts,
 		Timeout:        time.Duration(cfg.LinkParser.TimeoutSec) * time.Second,
@@ -257,6 +257,7 @@ func buildParserOptions(cfg *config.Config) parser.Options {
 		GitHubToken:    cfg.LinkParser.GitHubToken,
 		BilibiliCookie: cfg.LinkParser.BilibiliCookie,
 		IgnoreDomains:  cfg.LinkParser.IgnoreDomains,
+		Logger:         logger,
 	}
 }
 

@@ -154,6 +154,9 @@ policy:
 link_parser:
   enabled: true
   proactive_reply: true       # Proactively parse inbound links and let fatfish decide whether to reply
+  send_video: true            # Download & send short Bilibili MP4 asynchronously after the text preview
+  max_video_mib: 20           # Hard download size limit in MiB (capped at 50 MiB for container RAM safety)
+  max_video_duration_sec: 300 # Skip downloading videos longer than 5 minutes
   cooldown_sec: 15            # Per-channel cooldown between proactive link triggers
   dedup_ttl_sec: 1800         # Skip proactive re-triggering for the same canonical URL within 30 min
   max_urls_per_msg: 2         # Max candidate links parsed per message

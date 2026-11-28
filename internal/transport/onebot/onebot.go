@@ -649,6 +649,10 @@ func parseQQJSONCard(raw string) *model.Part {
 // --- Outbound OneBot v11 Actions ---
 
 func (c *Client) callAPI(ctx context.Context, action string, params map[string]any) (apiResponse, error) {
+	return c.callAPIWithTimeout(ctx, action, params, time.Duration(maxInt(c.cfg.APITimeoutSec, 10))*time.Second)
+}
+
+func (c *Client) callAPIWithTimeout(ctx context.Context, action string, params map[string]any, timeout time.Duration) (apiResponse, error) {
 	c.connMu.Lock()
 	conn := c.conn
 	c.connMu.Unlock()
@@ -677,7 +681,9 @@ func (c *Client) callAPI(ctx context.Context, action string, params map[string]a
 		return apiResponse{}, err
 	}
 
-	timeout := time.Duration(maxInt(c.cfg.APITimeoutSec, 10)) * time.Second
+	if timeout <= 0 {
+		timeout = time.Duration(maxInt(c.cfg.APITimeoutSec, 10)) * time.Second
+	}
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -743,6 +749,18 @@ func (c *Client) SendImage(ctx context.Context, ch model.ChannelID, imgBytes []b
 		"data": map[string]any{"file": "base64://" + base64.StdEncoding.EncodeToString(imgBytes)},
 	})
 	return c.sendSegments(ctx, ch, segs)
+}
+
+func (c *Client) SendVideo(ctx context.Context, ch model.ChannelID, videoBytes []byte, _ transport.SendOptions) (string, error) {
+	if len(videoBytes) == 0 {
+		return "", errors.New("onebot: empty video bytes")
+	}
+	segs := []map[string]any{{
+		"type": "video",
+		"data": map[string]any{"file": "base64://" + base64.StdEncoding.EncodeToString(videoBytes)},
+	}}
+	uploadTimeout := time.Duration(maxInt(c.cfg.APITimeoutSec, 60)) * time.Second
+	return c.sendSegmentsWithTimeout(ctx, ch, segs, uploadTimeout)
 }
 
 // SendForward sends a merged-forward message card via OneBot `send_group_forward_msg` / `send_private_forward_msg`.
@@ -816,6 +834,10 @@ func (c *Client) SendForward(ctx context.Context, ch model.ChannelID, nodes []tr
 }
 
 func (c *Client) sendSegments(ctx context.Context, ch model.ChannelID, segs []map[string]any) (string, error) {
+	return c.sendSegmentsWithTimeout(ctx, ch, segs, 0)
+}
+
+func (c *Client) sendSegmentsWithTimeout(ctx context.Context, ch model.ChannelID, segs []map[string]any, timeout time.Duration) (string, error) {
 	_, _, kind, nativeID, ok := model.ParseChannelID(ch)
 	if !ok {
 		return "", fmt.Errorf("onebot: invalid channel id %q", ch)
@@ -838,7 +860,7 @@ func (c *Client) sendSegments(ctx context.Context, ch model.ChannelID, segs []ma
 		}
 	}
 
-	resp, err := c.callAPI(ctx, action, params)
+	resp, err := c.callAPIWithTimeout(ctx, action, params, timeout)
 	if err != nil {
 		return "", err
 	}

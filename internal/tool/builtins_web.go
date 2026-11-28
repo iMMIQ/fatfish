@@ -246,8 +246,8 @@ func (t *WebSearchTool) searchArxiv(ctx context.Context, q string, limit int) (s
 // --- 4. read_source ---
 
 type ReadSourceArgs struct {
-	URL       string `json:"url" jsonschema:"required,description=URL to read (supports bilibili, b23.tv, github, arxiv, hf-mirror/huggingface, x/twitter, weixin articles, generic web pages, and .pdf/.xlsx/.docx/.txt files)"`
-	Query     string `json:"query,omitempty" jsonschema:"description=Optional question or keywords to semantically extract the most relevant sections from long financial reports, PDFs, or spreadsheets"`
+	URL       string `json:"url" jsonschema:"required,description=URL to read (supports bilibili videos/bangumi/live/articles/dynamics, b23.tv, github, arxiv, hf-mirror/huggingface, x/twitter, weixin articles, generic web pages, and .pdf/.xlsx/.docx/.txt files)"`
+	Query     string `json:"query,omitempty" jsonschema:"description=Optional question or keywords to semantically extract the most relevant sections from long Bilibili video transcripts, financial reports, PDFs, or spreadsheets"`
 	Pages     string `json:"pages,omitempty" jsonschema:"description=Optional PDF page range e.g. '1-5' or '12-18' for targeted reading"`
 	Translate bool   `json:"translate,omitempty" jsonschema:"description=Optionally translate long foreign text to Simplified Chinese via internal translator"`
 }
@@ -317,7 +317,7 @@ func (t *ReadSourceTool) parserSvc() *parser.Service {
 func (t *ReadSourceTool) Name() string   { return "read_source" }
 func (t *ReadSourceTool) ReadOnly() bool { return true }
 func (t *ReadSourceTool) Description() string {
-	return "Deep-read Bilibili videos/dynamics, GitHub repos/issues/PRs, arXiv papers, HuggingFace models, X/Twitter posts, WeChat articles, web pages, and PDF/XLSX/DOCX/TXT documents."
+	return "Deep-read Bilibili videos (AI summary, timestamped subtitles, UP pinned comments, automatic local ASR fallback for unsubtitled short videos), Bilibili dynamics/articles/bangumi/live, GitHub repos/issues/PRs, arXiv papers, HuggingFace models, X/Twitter posts, WeChat articles, web pages, and PDF/XLSX/DOCX/TXT documents."
 }
 
 func (t *ReadSourceTool) Execute(ctx context.Context, _ ToolContext, args ReadSourceArgs) (ToolResult, error) {
@@ -343,6 +343,13 @@ func (t *ReadSourceTool) Execute(ctx context.Context, _ ToolContext, args ReadSo
 	} else if psvc := t.parserSvc(); psvc != nil {
 		res, perr := psvc.Parse(ctx, rawURL, parser.ParseOptions{Deep: true})
 		if perr == nil && res != nil {
+			// On-demand local ASR fallback for unsubtitled short/medium Bilibili videos (<= 10 min, <= 10 MiB audio).
+			if res.Platform == "bilibili" && !res.HasTranscript &&
+				res.VideoBvid != "" && res.VideoCid > 0 &&
+				res.DurationSec > 0 && res.DurationSec <= 600 &&
+				t.hub != nil {
+				t.tryBilibiliASRFallback(ctx, psvc, res)
+			}
 			content = res.FormatForReadSource()
 		} else if errors.Is(perr, parser.ErrUnsupportedContent) {
 			// URL without doc suffix whose Content-Type turned out to be PDF/XLSX/DOCX.
@@ -359,6 +366,8 @@ func (t *ReadSourceTool) Execute(ctx context.Context, _ ToolContext, args ReadSo
 
 	if q := strings.TrimSpace(args.Query); q != "" && len([]rune(content)) > 5000 {
 		content = t.selectRelevantChunks(ctx, content, q, 6, 7500)
+	} else if len([]rune(content)) > 8000 && strings.Contains(content, "\nSubtitles") {
+		content = clipBilibiliTranscriptBalanced(content, 8000)
 	}
 
 	if args.Translate && t.hub != nil && len([]rune(content)) > 40 {
@@ -367,6 +376,72 @@ func (t *ReadSourceTool) Execute(ctx context.Context, _ ToolContext, args ReadSo
 		}
 	}
 	return ToolResult{TextForLLM: netutil.WrapExternalData(rawURL, clipRunes(content, 8000))}, nil
+}
+
+// tryBilibiliASRFallback fetches the lowest-bitrate DASH audio stream and runs local ASR
+// when a short/medium Bilibili video has neither AI summary nor subtitles.
+func (t *ReadSourceTool) tryBilibiliASRFallback(ctx context.Context, psvc *parser.Service, res *parser.Result) {
+	if psvc == nil || res == nil || t.hub == nil {
+		return
+	}
+	asrCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+
+	audioBytes, fname, err := psvc.FetchBilibiliAudio(asrCtx, res.VideoBvid, res.VideoCid, 10<<20)
+	if err != nil || len(audioBytes) == 0 {
+		return
+	}
+	transcript, err := t.hub.TranscribeWithTimeout(asrCtx, fname, audioBytes, 20*time.Second)
+	if err != nil {
+		return
+	}
+	transcript = strings.TrimSpace(transcript)
+	if transcript == "" {
+		return
+	}
+	res.HasTranscript = true
+	res.RawText = strings.TrimSpace(res.RawText) + "\n\nSubtitles (Local ASR):\n" + clipRunes(transcript, 16000)
+	psvc.CacheDeepResult(res)
+}
+
+// clipBilibiliTranscriptBalanced keeps the full video header (metadata, chapters, AI summary, pinned/top comments)
+// and uniformly samples head/middle/tail of long subtitles so conclusions at the end are never truncated away.
+func clipBilibiliTranscriptBalanced(content string, maxRunes int) string {
+	idx := strings.Index(content, "\nSubtitles")
+	if idx < 0 {
+		return clipRunes(content, maxRunes)
+	}
+	header := content[:idx]
+	subSection := content[idx:]
+	nl := strings.IndexByte(subSection[1:], '\n')
+	if nl < 0 {
+		return clipRunes(content, maxRunes)
+	}
+	subHeader := subSection[:nl+2]
+	subBody := strings.TrimSpace(subSection[nl+2:])
+
+	prefix := header + subHeader
+	prefixRunes := len([]rune(prefix))
+	avail := maxRunes - prefixRunes - 64
+	if avail < 600 {
+		return clipRunes(content, maxRunes)
+	}
+	bodyRunes := []rune(subBody)
+	if len(bodyRunes) <= avail {
+		return content
+	}
+	headLen := avail * 30 / 100
+	midLen := avail * 35 / 100
+	tailLen := avail - headLen - midLen
+	midStart := (len(bodyRunes) - midLen) / 2
+	tailStart := len(bodyRunes) - tailLen
+
+	return prefix +
+		strings.TrimSpace(string(bodyRunes[:headLen])) +
+		"\n...(middle excerpt)...\n" +
+		strings.TrimSpace(string(bodyRunes[midStart:midStart+midLen])) +
+		"\n...(ending excerpt)...\n" +
+		strings.TrimSpace(string(bodyRunes[tailStart:]))
 }
 
 func (t *ReadSourceTool) readGenericOrDoc(ctx context.Context, rawURL string, firstPage, lastPage int) (string, error) {

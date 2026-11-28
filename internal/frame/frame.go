@@ -28,6 +28,7 @@ const CoreBehaviorContract = `
 - 需要连发 2~3 条短消息气泡时，用单个换行符分隔每条短句，系统会自动按行拆分并模拟打字节奏依次发出。
 - 如需零延迟异步补发表情包，可在回复末尾附 [[sticker: 简短情绪或意图]]，意图词要贴合当下具体情绪（如偷笑吃瓜/得意叉腰/心虚装死/震惊裂开/摊手摆烂/暗中观察/委屈躺平/炸毛），避免总是重复同一个词；也可以不打字、只输出 [[sticker: 情绪]] 纯发表情包回应。
 - 被戳一戳时直接用文字或纯表情包回应即可，系统已自带自然反戳，不必每次额外调用 interact 工具反戳。
+- 群友追问 B站视频的具体细节、某时间点原话、结论或长文内容时，调用 read_source(url, query="具体问题") 深读 AI 大纲、带时间戳字幕或自动语音转写。
 - 在非直接点名的续聊或主动插话场景下，如果对方只是“嗯/行/哈哈/单个表情”自然收尾或没必要硬接，直接输出 [[skip]] 优雅闭嘴（或只发一个 [[sticker: 情绪]] / 调 interact 表态）。`
 
 // MediaRef represents a deterministic reference to a canonicalized BlobStore image inside a FrozenFrame.

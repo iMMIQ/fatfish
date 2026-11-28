@@ -59,6 +59,7 @@ type Manager struct {
 	wg       sync.WaitGroup
 
 	percSem        chan struct{} // Bounded async perception concurrency (SPEC §5.1)
+	videoSem       chan struct{} // Strict 1-at-a-time video download/upload concurrency to protect 512MiB RAM
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
 }
@@ -89,7 +90,9 @@ func NewManager(deps Dependencies) *Manager {
 		cfg := deps.Config.Get()
 		allowHosts = cfg.Tools.SSRFAllowHosts
 		if linkParser == nil {
-			linkParser = parser.NewService(parserOptionsFromConfig(cfg))
+			opts := parserOptionsFromConfig(cfg)
+			opts.Logger = deps.Logger
+			linkParser = parser.NewService(opts)
 		}
 	}
 	sdCtx, sdCancel := context.WithCancel(context.Background())
@@ -110,6 +113,7 @@ func NewManager(deps Dependencies) *Manager {
 		log:            deps.Logger,
 		rooms:          make(map[model.ChannelID]*Room),
 		percSem:        make(chan struct{}, 16),
+		videoSem:       make(chan struct{}, 1),
 		shutdownCtx:    sdCtx,
 		shutdownCancel: sdCancel,
 	}
@@ -415,6 +419,10 @@ type senderStamp struct {
 type parsedLinkItem struct {
 	canonicalURL string
 	previewText  string
+	platform     string
+	videoBvid    string
+	videoCid     int64
+	durationSec  int
 }
 
 type perceptionResult struct {
@@ -791,9 +799,31 @@ func (r *Room) onPerceptionPatch(patch perceptionPatch) (time.Duration, bool) {
 				triggerCommentary := cfg.LinkParser.ProactiveReply
 				if r.mgr.tr != nil && r.outboundRemaining(now, cfg.Policy.MaxMsgsPerMin) >= 2 {
 					botName := r.botDisplayName(cfg)
+					textSentCh := make(chan struct{})
+					var textSentOK atomic.Bool
+
+					// Pick at most one eligible Bilibili short/medium video to download IN PARALLEL with text preview delivery.
+					var videoTarget *parsedLinkItem
+					if cfg.LinkParser.IsSendVideoEnabled() && r.mgr.parser != nil {
+						maxDur := cfg.LinkParser.MaxVideoDurationSec
+						if maxDur <= 0 {
+							maxDur = 300
+						}
+						for i := range fresh {
+							it := &fresh[i]
+							if it.platform == "bilibili" && it.videoBvid != "" && it.videoCid > 0 &&
+								(it.durationSec <= 0 || it.durationSec <= maxDur) {
+								cp := *it
+								videoTarget = &cp
+								break
+							}
+						}
+					}
+
 					r.mgr.wg.Add(1)
 					go func() {
 						defer r.mgr.wg.Done()
+						defer close(textSentCh)
 						if r.epoch.Load() != expEpoch || r.isMuted(time.Now()) {
 							return
 						}
@@ -810,6 +840,7 @@ func (r *Room) onPerceptionPatch(patch perceptionPatch) (time.Duration, bool) {
 						}
 						var botMsg *model.Message
 						if serr == nil {
+							textSentOK.Store(true)
 							r.recordOutbound(time.Now())
 							bm := model.Message{
 								ChannelID:     r.ch,
@@ -836,6 +867,15 @@ func (r *Room) onPerceptionPatch(patch perceptionPatch) (time.Duration, bool) {
 						case <-r.stopCh:
 						}
 					}()
+
+					if videoTarget != nil {
+						vt := *videoTarget
+						r.mgr.wg.Add(1)
+						go func() {
+							defer r.mgr.wg.Done()
+							r.downloadAndSendBilibiliVideo(vt, expEpoch, cfg, textSentCh, &textSentOK)
+						}()
+					}
 					return 0, false
 				}
 				if triggerCommentary {
@@ -845,6 +885,103 @@ func (r *Room) onPerceptionPatch(patch perceptionPatch) (time.Duration, bool) {
 		}
 	}
 	return 0, false
+}
+
+// downloadAndSendBilibiliVideo downloads the Bilibili MP4 in parallel with text preview delivery
+// (strictly capped at max_video_mib and serialized via videoSem to protect container RAM), then waits
+// for the text preview to finish sending before delivering the video to the channel.
+func (r *Room) downloadAndSendBilibiliVideo(
+	it parsedLinkItem,
+	expEpoch int64,
+	cfg *config.Config,
+	textSentCh <-chan struct{},
+	textSentOK *atomic.Bool,
+) {
+	if r.mgr.parser == nil || r.mgr.tr == nil {
+		return
+	}
+	maxMiB := cfg.LinkParser.MaxVideoMiB
+	if maxMiB <= 0 {
+		maxMiB = 20
+	}
+	if maxMiB > 50 {
+		maxMiB = 50
+	}
+	maxBytes := int64(maxMiB) << 20
+
+	// Acquire global video concurrency slot (1 at a time) so concurrent channels never stack video buffers in RAM.
+	if r.mgr.videoSem != nil {
+		select {
+		case r.mgr.videoSem <- struct{}{}:
+			defer func() { <-r.mgr.videoSem }()
+		case <-r.stopCh:
+			return
+		case <-r.mgr.shutdownCtx.Done():
+			return
+		case <-time.After(15 * time.Second):
+			r.mgr.log.Info("skipped bilibili video send: downloader busy", "channel", r.ch, "bvid", it.videoBvid)
+			return
+		}
+	}
+
+	if r.epoch.Load() != expEpoch || r.isMuted(time.Now()) {
+		return
+	}
+
+	started := time.Now()
+	dlCtx, dlCancel := context.WithTimeout(r.mgr.shutdownCtx, 45*time.Second)
+	videoBytes, err := r.mgr.parser.FetchBilibiliVideoMP4(dlCtx, it.videoBvid, it.videoCid, maxBytes)
+	dlCancel()
+	if err != nil {
+		if errors.Is(err, parser.ErrVideoTooLarge) {
+			r.mgr.log.Info("skipped bilibili video send: exceeds max_video_mib",
+				"channel", r.ch, "bvid", it.videoBvid, "max_mib", maxMiB)
+		} else {
+			r.mgr.log.Warn("bilibili video download failed",
+				"channel", r.ch, "bvid", it.videoBvid, "err", err)
+		}
+		return
+	}
+	if len(videoBytes) == 0 {
+		return
+	}
+
+	// Ensure strict ordering: only send the video AFTER the text preview has been delivered.
+	select {
+	case <-textSentCh:
+	case <-r.stopCh:
+		return
+	case <-r.mgr.shutdownCtx.Done():
+		return
+	}
+	if !textSentOK.Load() || r.epoch.Load() != expEpoch || r.isMuted(time.Now()) {
+		return
+	}
+
+	if r.ch.IsGroup() && cfg.Policy.MaxMsgsPerMin > 0 && r.outboundRemaining(time.Now(), cfg.Policy.MaxMsgsPerMin) <= 0 {
+		if !r.waitForOutboundSlot(r.mgr.shutdownCtx, cfg.Policy.MaxMsgsPerMin, 15*time.Second) {
+			return
+		}
+	}
+	if r.epoch.Load() != expEpoch || r.isMuted(time.Now()) {
+		return
+	}
+
+	sendCtx, sendCancel := context.WithTimeout(r.mgr.shutdownCtx, 60*time.Second)
+	_, serr := r.mgr.tr.SendVideo(sendCtx, r.ch, videoBytes, transport.SendOptions{})
+	sendCancel()
+	if errors.Is(serr, transport.ErrRiskMuted) {
+		r.engageMuteWithErr(r.mgr.shutdownCtx, cfg, serr)
+		return
+	}
+	if serr != nil {
+		r.mgr.log.Warn("bilibili video send failed",
+			"channel", r.ch, "bvid", it.videoBvid, "size_kb", len(videoBytes)/1024, "err", serr)
+		return
+	}
+	r.recordOutbound(time.Now())
+	r.mgr.log.Info("bilibili video sent",
+		"channel", r.ch, "bvid", it.videoBvid, "size_kb", len(videoBytes)/1024, "elapsed_ms", time.Since(started).Milliseconds())
 }
 
 func (r *Room) onLinkPreviewDone(lp linkPreviewOutcome) (time.Duration, bool) {
@@ -1634,14 +1771,23 @@ func (r *Room) runPerception(msg *model.Message, cfg *config.Config) perceptionR
 	var parsedLinks []parsedLinkItem
 	if len(linkResults) > 0 {
 		hasRichCard := false
+		hasExistingImg := false
 		for _, p := range msg.Parts {
 			if p.Kind == model.PartCard && strings.TrimSpace(p.Title) != "" {
 				hasRichCard = true
-				break
+			}
+			if p.Kind == model.PartImage {
+				hasExistingImg = true
 			}
 		}
+		isDirectTrigger := msg.MentionedBot || msg.RepliedToBot || !r.ch.IsGroup()
+		coverAttached := false
 		for _, res := range linkResults {
-			compact := res.CompactForContext(450)
+			maxCompact := 450
+			if res.Platform == "bilibili" {
+				maxCompact = 700
+			}
+			compact := res.CompactForContext(maxCompact)
 			if compact == "" {
 				continue
 			}
@@ -1661,8 +1807,22 @@ func (r *Room) runPerception(msg *model.Message, cfg *config.Config) perceptionR
 			parsedLinks = append(parsedLinks, parsedLinkItem{
 				canonicalURL: res.CanonicalURL,
 				previewText:  res.FormatForGroupText(),
+				platform:     res.Platform,
+				videoBvid:    res.VideoBvid,
+				videoCid:     res.VideoCid,
+				durationSec:  res.DurationSec,
 			})
 			changed = true
+
+			// On-demand visual cover perception for Bilibili links (direct triggers or unsubtitled videos)
+			// before frame freezing so multimodal models see the cover while preserving KV cache invariants.
+			if !hasExistingImg && !coverAttached && res.Platform == "bilibili" && res.CoverURL != "" &&
+				(isDirectTrigger || !res.HasTranscript) && r.mgr.store != nil {
+				if coverPart, ok := r.fetchCoverImagePart(ctx, msg.SenderID, res.CoverURL, cfg, retention); ok {
+					msg.Parts = append(msg.Parts, coverPart)
+					coverAttached = true
+				}
+			}
 		}
 	}
 
@@ -1671,6 +1831,42 @@ func (r *Room) runPerception(msg *model.Message, cfg *config.Config) perceptionR
 	}
 	partsOut := append([]model.Part(nil), msg.Parts...)
 	return perceptionResult{parts: partsOut, changed: changed, imageKB: int(maxImgKB.Load()), parsedLinks: parsedLinks}
+}
+
+func (r *Room) fetchCoverImagePart(ctx context.Context, senderID, coverURL string, cfg *config.Config, retention time.Duration) (model.Part, bool) {
+	if r.mgr.store == nil || coverURL == "" {
+		return model.Part{}, false
+	}
+	cctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	maxBytes := int64(4 << 20)
+	if cfg != nil && cfg.Frame.MaxImageMiB > 0 && int64(cfg.Frame.MaxImageMiB)<<20 < maxBytes {
+		maxBytes = int64(cfg.Frame.MaxImageMiB) << 20
+	}
+	headers := map[string]string{
+		"Referer": "https://www.bilibili.com/",
+	}
+	raw, _, code, err := netutil.FetchLimited(cctx, r.mgr.httpClient(), coverURL, maxBytes, headers)
+	if err != nil || code >= 400 || len(raw) == 0 {
+		return model.Part{}, false
+	}
+	blob, err := r.mgr.store.Blobs().PutImage(raw)
+	if err != nil {
+		return model.Part{}, false
+	}
+	asset, err := r.mgr.store.RegisterMediaAsset(cctx, r.ch, senderID, blob, retention)
+	if err != nil {
+		return model.Part{}, false
+	}
+	return model.Part{
+		Kind:     model.PartImage,
+		URL:      coverURL,
+		MediaID:  asset.MediaID,
+		SHA256:   asset.SHA256,
+		MimeType: asset.MimeType,
+		Width:    asset.Width,
+		Height:   asset.Height,
+	}, true
 }
 
 func (r *Room) collectFreshLinks(items []parsedLinkItem, now time.Time, ttl time.Duration) []parsedLinkItem {
