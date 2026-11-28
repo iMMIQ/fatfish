@@ -17,6 +17,7 @@ import (
 	"github.com/iMMIQ/fatfish/internal/cron"
 	"github.com/iMMIQ/fatfish/internal/frame"
 	"github.com/iMMIQ/fatfish/internal/infer"
+	"github.com/iMMIQ/fatfish/internal/kb"
 	"github.com/iMMIQ/fatfish/internal/memory"
 	"github.com/iMMIQ/fatfish/internal/model"
 	"github.com/iMMIQ/fatfish/internal/parser"
@@ -40,6 +41,7 @@ type App struct {
 	Memory   *memory.Service
 	Stickers *sticker.Engine
 	Travel   *travel.Service
+	KB       *kb.Service
 	Registry *tool.Registry
 	MCP      *tool.MCPBridge
 	Runner   *agent.Runner
@@ -88,6 +90,17 @@ func New(configPath string, enableTransport bool) (*App, error) {
 	memSvc.SetIgnoredBots(cfg.Policy.IgnoredBots)
 	stkEng := sticker.NewEngine(st, hub, cfg.Sticker, cfg.Models.Embed.Dim, logger)
 	travelSvc := travel.NewService(st, hub, cfg.Travel, cfg.Location(), cfg.PersonaText, cfg.Tools.ChartFontPath, cfg.Tools.SSRFAllowHosts, logger)
+	var kbSvc *kb.Service
+	if cfg.KB.Enabled && cfg.KB.Path != "" {
+		kbSvc = kb.NewService(cfg.KB.Path, hub, logger)
+		if kbSvc.Enabled() {
+			if meta, merr := kbSvc.Meta(context.Background()); merr == nil {
+				logger.Info("mounted read-only reference kb", "path", cfg.KB.Path, "books", meta["total_books"], "chunks", meta["total_chunks"])
+			}
+		} else {
+			logger.Warn("kb enabled but file not found yet (will auto-mount on arrival)", "path", cfg.KB.Path)
+		}
+	}
 
 	var tr transport.Transport
 	if enableTransport && (cfg.Transport.OneBot.WSListen != "" || cfg.Transport.OneBot.WSURL != "") {
@@ -124,7 +137,7 @@ func New(configPath string, enableTransport bool) (*App, error) {
 	sched.SetPriceFetcher(quoteTool)
 	weatherTool := tool.NewWeatherTool(cfg.Tools.SSRFAllowHosts)
 	interactTool := tool.NewInteractTool(tr, cfg.Tools.AllowRelayChannels)
-	if err := registerBuiltins(reg, st, memSvc, stkEng, sched, computeTool, webSearchTool, readSourceTool, quoteTool, weatherTool, interactTool, travelSvc, cfg.Travel.Enabled); err != nil {
+	if err := registerBuiltins(reg, st, memSvc, stkEng, sched, computeTool, webSearchTool, readSourceTool, quoteTool, weatherTool, interactTool, travelSvc, cfg.Travel.Enabled, kbSvc, cfg.KB); err != nil {
 		_ = st.Close()
 		return nil, err
 	}
@@ -192,6 +205,9 @@ func New(configPath string, enableTransport bool) (*App, error) {
 		memSvc.SetIgnoredBots(newCfg.Policy.IgnoredBots)
 		stkEng.UpdateConfig(newCfg.Sticker)
 		travelSvc.UpdateConfig(newCfg.Travel, newCfg.Location(), newCfg.PersonaText, newCfg.Tools.ChartFontPath, newCfg.Tools.SSRFAllowHosts)
+		if kbSvc != nil {
+			kbSvc.UpdatePath(newCfg.KB.Path)
+		}
 		sched.SetMediaQuotas(newCfg.Frame.RoomMediaMiB, newCfg.Frame.TotalMediaMiB)
 		sched.UpdateConfig(newCfg.Location(), newCfg.Tools.MaxSchedulesPerChannel, newCfg.Tools.MinCronIntervalMinutes)
 		reg.UpdateDefaultTimeout(time.Duration(newCfg.Tools.DefaultTimeoutSec) * time.Second)
@@ -214,6 +230,7 @@ func New(configPath string, enableTransport bool) (*App, error) {
 		Memory:   memSvc,
 		Stickers: stkEng,
 		Travel:   travelSvc,
+		KB:       kbSvc,
 		Registry: reg,
 		MCP:      mcpBridge,
 		Runner:   runner,
@@ -253,6 +270,8 @@ func registerBuiltins(
 	interact *tool.InteractTool,
 	travelSvc *travel.Service,
 	travelEnabled bool,
+	kbSvc *kb.Service,
+	kbCfg config.KBConfig,
 ) error {
 	if err := tool.Register[tool.RecallArgs](reg, tool.NewRecallTool(mem)); err != nil {
 		return err
@@ -289,6 +308,11 @@ func registerBuiltins(
 	}
 	if travelEnabled && travelSvc != nil {
 		if err := tool.Register[tool.TravelArgs](reg, tool.NewTravelTool(travelSvc)); err != nil {
+			return err
+		}
+	}
+	if kbCfg.Enabled && kbSvc != nil {
+		if err := tool.Register[tool.KBSearchArgs](reg, tool.NewKBSearchTool(kbSvc, kbCfg.MaxResults)); err != nil {
 			return err
 		}
 	}
@@ -385,6 +409,9 @@ func (a *App) Serve(ctx context.Context) error {
 	if a.MCP != nil {
 		a.MCP.Close()
 	}
+	if a.KB != nil {
+		_ = a.KB.Close()
+	}
 	if err := a.Store.Close(); err != nil {
 		return err
 	}
@@ -450,6 +477,9 @@ func (a *App) Check(ctx context.Context) error {
 func (a *App) Close() {
 	if a.MCP != nil {
 		a.MCP.Close()
+	}
+	if a.KB != nil {
+		_ = a.KB.Close()
 	}
 	if a.Store != nil {
 		_ = a.Store.Close()

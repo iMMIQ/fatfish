@@ -32,6 +32,7 @@ type Config struct {
 	LinkParser LinkParserConfig `yaml:"link_parser"`
 	Sticker    StickerConfig    `yaml:"sticker"`
 	Travel     TravelConfig     `yaml:"travel"`
+	KB         KBConfig         `yaml:"kb"`
 	Tools      ToolsConfig      `yaml:"tools"`
 	MCP       MCPConfig       `yaml:"mcp"`
 	Console   ConsoleConfig   `yaml:"console"`
@@ -256,6 +257,13 @@ type TravelConfig struct {
 	ProactiveMinGapHours    float64  `yaml:"proactive_min_gap_hours"`    // Minimum hours between proactive travel posts (default 36)
 }
 
+// KBConfig configures an optional external read-only SQLite FTS5 reference knowledge base (kb.db).
+type KBConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	Path       string `yaml:"path"`        // Path to read-only SQLite kb.db (e.g. "/app/data/kb.db")
+	MaxResults int    `yaml:"max_results"` // Default top-K reference chunks returned per search (default 4, max 6)
+}
+
 type ToolsConfig struct {
 	DefaultTimeoutSec      int      `yaml:"default_timeout_sec"`
 	AllowRelayChannels     []string `yaml:"allow_relay_channels"`
@@ -462,6 +470,11 @@ func defaultConfig() *Config {
 			ProactiveQuietStartHour: 23,
 			ProactiveQuietEndHour:   9,
 			ProactiveMinGapHours:    36,
+		},
+		KB: KBConfig{
+			Enabled:    false,
+			Path:       "",
+			MaxResults: 4,
 		},
 		Tools: ToolsConfig{
 			DefaultTimeoutSec:      30,

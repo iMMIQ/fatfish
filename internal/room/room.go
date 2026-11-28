@@ -1762,7 +1762,7 @@ func (r *Room) runTurnWorker(
 	} else if trig.kind == "link" {
 		userPayload.Text += "\n[提示: 系统已将这条链接的纯文本基础解析发到群里了，不要重复复读标题和播放量等基础信息；只按你的性格顺口吐槽、接梗或补一句有意思的点评，觉得解析本身已经够清楚、没必要再补话就直接输出 [[skip]]。]"
 	} else if advisoryDomain == AdvisoryDomainTravel {
-		userPayload.Text += "\n[提示: 群友在认真问旅游/出行/酒店/美食/航旅攻略，切入“嘴硬但真懂行的旅行老哥”模式：1) 先注意对方群名片或上下文里的常驻地、出发日期、航班车次和预算；2) 涉及时效攻略/酒店/新规/退税/物价，先并发用 web_search_prime(content_size=\"high\", search_recency_filter=\"oneYear\") 查最新实况与避坑，查目的地未来天气/日落用 weather，查外币汇率用 quote，顺手可用 recall(mode=\"memory\"或\"raw\", query=\"目的地\") 翻本群群友近期去过的实测经验；3) 先甩结论，按地理分区排顺路动线不折返跑，落到具体片区/地铁站或店名，补1~2条实战避坑（闭馆日/预约抢票/交通耗时/退税或溢价坑），查不到实时房价舱位就坦诚说明并给查价动作绝不瞎编；4) 多日行程或酒店对比可直接用 compute 的 chart.card/chart.table 出图，正文保持高密度纯文本分段，不要写 Markdown #/** 符号和 AI 客服腔。]"
+		userPayload.Text += "\n[提示: 群友在认真问旅游/出行/酒店/美食/航旅攻略，切入“嘴硬但真懂行的旅行老哥”模式：1) 先注意对方群名片或上下文里的常驻地、出发日期、航班车次和预算；2) 先并发核验：做海外/长线/多日路线或片区选址时，并发调 kb_search（拿地理片区、经典动线骨架与人文深度）和 web_search_prime(content_size=\"high\", search_recency_filter=\"oneYear\")（核验今年最新营业状态、价格、预约、闭馆日与签证退税新政，绝不照搬旧书价格或过时店名），需要未来天气/日落调 weather，需要外币换算调 quote，顺手可用 recall(mode=\"memory\"或\"raw\", query=\"目的地\") 翻本群群友近期去过的实测经验；3) 先甩结论，按地理分区排顺路动线不折返跑，落到具体片区/地铁站或店名，补1~2条实战避坑，查不到实时房价舱位就坦诚说明并给查价动作绝不瞎编；4) 多日行程或酒店对比可直接用 compute 的 chart.card/chart.table 出图，正文保持高密度纯文本分段，不要写 Markdown #/** 符号和 AI 客服腔。]"
 	} else if advisoryMode {
 		userPayload.Text += "\n[提示: 群友在认真问攻略/建议，切入“嘴硬但真懂行的群友”模式：先给结论、给带取舍条件的方案、补1~2条实战避坑（涉及时效价格/版本/新规先并发查证再答）；做多款参数横评或多日行程表可直接用 compute 的 chart.table/chart.card 出图，正文保持高密度纯文本分段，不要写 Markdown #/** 符号和 AI 客服腔。]"
 	} else if trig.kind == "thread" && !hasRichMediaPart(trig.msg) && len([]rune(strings.TrimSpace(trig.msg.TextOnly()))) <= 6 {
