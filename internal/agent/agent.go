@@ -25,8 +25,9 @@ import (
 const maxToolIterations = 6
 
 var (
-	stickerMarkerRe = regexp.MustCompile(`\[\[\s*sticker\s*:\s*([^\]]+?)\s*\]\]`)
-	skipMarkerRe    = regexp.MustCompile(`(?i)\[\[\s*skip\s*\]\]`)
+	stickerMarkerRe       = regexp.MustCompile(`(?i)\[\[\s*sticker\s*[:：]\s*([^\]]+?)\s*\]\]`)
+	singleStickerMarkerRe = regexp.MustCompile(`(?i)\[\s*sticker\s*[:：]\s*([^\[\]\n]{1,40}?)\s*\]`)
+	skipMarkerRe          = regexp.MustCompile(`(?i)\[\[\s*skip\s*\]\]`)
 )
 
 // Runner executes a single LLM turn (with optional multi-step tool calling, parallel read-only tool
@@ -431,7 +432,7 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 		skipped = false
 		assistantText := cleanText
 		if assistantText == "" && stickerIntent != "" {
-			assistantText = "[sticker:" + stickerIntent + "]"
+			assistantText = "[[sticker: " + stickerIntent + "]]"
 		}
 		newFrames = append(newFrames, frame.StoredFramePayload{
 			Role: "assistant",
@@ -510,15 +511,20 @@ func (r *Runner) executeToolBatch(ctx context.Context, tc tool.ToolContext, call
 	return out
 }
 
-// ExtractStickerMarker strips optional trailing [[sticker: intent]] markers without extra LLM round-trips.
+// ExtractStickerMarker strips optional [[sticker: intent]] (and malformed single-bracket [sticker: intent])
+// markers without extra LLM round-trips.
 func ExtractStickerMarker(s string) (clean string, intent string) {
-	matches := stickerMarkerRe.FindAllStringSubmatch(s, -1)
-	if len(matches) == 0 {
-		return strings.TrimSpace(s), ""
+	if matches := stickerMarkerRe.FindAllStringSubmatch(s, -1); len(matches) > 0 {
+		intent = strings.TrimSpace(matches[len(matches)-1][1])
+		s = stickerMarkerRe.ReplaceAllString(s, "")
 	}
-	intent = strings.TrimSpace(matches[len(matches)-1][1])
-	clean = strings.TrimSpace(stickerMarkerRe.ReplaceAllString(s, ""))
-	return clean, intent
+	if matches := singleStickerMarkerRe.FindAllStringSubmatch(s, -1); len(matches) > 0 {
+		if intent == "" {
+			intent = strings.TrimSpace(matches[len(matches)-1][1])
+		}
+		s = singleStickerMarkerRe.ReplaceAllString(s, "")
+	}
+	return strings.TrimSpace(s), intent
 }
 
 // ExtractSkipMarker detects and strips [[skip]] when the model chooses a natural silent close.

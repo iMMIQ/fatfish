@@ -246,3 +246,36 @@ func TestCircuitBreakerAbortProbeAndTranslateFallback(t *testing.T) {
 		t.Fatalf("expected translate fallback to primary, got out=%q err=%v", out, err)
 	}
 }
+
+func TestContentFilterSkipsSameVendorFallback(t *testing.T) {
+	var primaryHits, fallbackHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Model == "glm-5.4" {
+			primaryHits.Add(1)
+		} else {
+			fallbackHits.Add(1)
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"contentFilter":[{"level":2,"role":"user"}],"error":{"code":"1301","message":"blocked"}}`))
+	}))
+	defer srv.Close()
+
+	hub := NewHub(config.ModelsConfig{
+		Primary:         config.ModelEndpointConfig{BaseURL: srv.URL, Model: "glm-5.4", TimeoutSec: 5},
+		PrimaryFallback: config.ModelEndpointConfig{Model: "glm-5.3-flash"},
+	})
+	_, err := hub.Chat(context.Background(), "primary", ChatRequest{
+		Messages: []ChatMessage{{Role: "user", Content: "test"}},
+	})
+	if !IsContentFiltered(err) {
+		t.Fatalf("expected ErrContentFiltered, got %v", err)
+	}
+	if primaryHits.Load() != 1 || fallbackHits.Load() != 0 {
+		t.Fatalf("expected content-filter to skip primary_fallback, got primary=%d fallback=%d",
+			primaryHits.Load(), fallbackHits.Load())
+	}
+}

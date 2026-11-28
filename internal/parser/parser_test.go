@@ -241,11 +241,14 @@ func TestTier1ExtractorsAndCache(t *testing.T) {
 		t.Fatalf("expected ErrBlockedBySite for weixin captcha, got %v", err)
 	}
 
-	// 8. Low-value login-wall shell page must be rejected instead of spamming bare brand titles.
+	// 8. Low-value login-wall / SPA slogan shell pages must be rejected instead of spamming generic titles.
 	if !isLowValueGenericPage("小红书 - 你的生活兴趣社区", "", "") {
 		t.Fatal("expected bare site login-wall title with empty body to be flagged as low-value")
 	}
 	if isLowValueGenericPage("小红书 - 你的生活兴趣社区", "这是一篇完整详细的笔记正文描述内容超过十五字", "") {
 		t.Fatal("expected page with substantive description not to be flagged as low-value")
+	}
+	if !isLowValueGenericPage("爱发电 · 连接创作者与粉丝的会员制平台", "将创作的自由还给创作者！爱发电是让创作者简单地获得稳定收入的粉丝赞助平台。", "") {
+		t.Fatal("expected SPA shell with generic site slogan description and empty body to be flagged as low-value")
 	}
 }

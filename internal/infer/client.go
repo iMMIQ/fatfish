@@ -285,7 +285,7 @@ func (h *Hub) ModelKey(role string) string {
 // it transparently falls back to primary_fallback. Never silently strips images on error.
 func (h *Hub) Chat(ctx context.Context, role string, req ChatRequest) (*ChatResponse, error) {
 	resp, err := h.chatOnce(ctx, role, req)
-	if err != nil && role == "primary" && ctx.Err() == nil {
+	if err != nil && role == "primary" && ctx.Err() == nil && !IsContentFiltered(err) {
 		if _, _, fbErr := h.endpoint("primary_fallback"); fbErr == nil {
 			fbReq := req
 			fbReq.Model = "" // Use primary_fallback's configured model ID

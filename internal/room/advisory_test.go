@@ -152,11 +152,16 @@ func TestTravelAdvisoryRegressionSuiteFromProdHistory(t *testing.T) {
 		{name: "hk 2-day plan", text: "我计划24~25去hk看电影，住一晚丽晶酒店，帮我规划下剩下的行程", trigKind: "mention", want: AdvisoryDomainTravel},
 		{name: "spot photo guide", text: "帮我制定个打卡攻略和最佳出行时间计划吧", trigKind: "mention", want: AdvisoryDomainTravel},
 		{name: "station food recommend", text: "高铁站附近有啥具体到店的推荐", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "must-eat restaurant ask", text: "青浦新城附近有没有什么必吃的饭店", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "metro line must-eat", text: "沿17号线，有什么必吃的", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "city must-eat ask", text: "无锡有啥必吃的", trigKind: "mention", want: AdvisoryDomainTravel},
 
 		// Follow-ups with explicit @mention inside active travel thread must stay in Travel domain!
 		{name: "mention followup exclude region", text: "不要江浙沪", trigKind: "mention", inAdvisoryThread: true, prevDomain: AdvisoryDomainTravel, want: AdvisoryDomainTravel},
 		{name: "mention followup unlimited budget", text: "预算不限，最推荐哪个", trigKind: "mention", inAdvisoryThread: true, prevDomain: AdvisoryDomainTravel, want: AdvisoryDomainTravel},
 		{name: "mention followup add stop", text: "能不能中午再加一个锡林浩特", trigKind: "mention", inAdvisoryThread: true, prevDomain: AdvisoryDomainTravel, want: AdvisoryDomainTravel},
+		{name: "mention followup what to eat", text: "那青浦新城吃什么", trigKind: "mention", inAdvisoryThread: true, prevDomain: AdvisoryDomainTravel, want: AdvisoryDomainTravel},
+		{name: "mention followup parking fee", text: "蟠龙天地停车多少钱", trigKind: "mention", inAdvisoryThread: true, prevDomain: AdvisoryDomainTravel, want: AdvisoryDomainTravel},
 
 		// Non-travel general advisory stays General
 		{name: "monitor buying stays general", text: "预算3000想买个27寸4K显示器，写代码偶尔打FPS，帮我选选", trigKind: "mention", want: AdvisoryDomainGeneral},
@@ -200,6 +205,20 @@ func TestSanitizeReplyMarkdownAndGuideTitle(t *testing.T) {
 	title := ExtractGuideTitle(got, "大肥鱼")
 	if title != "大肥鱼 · 关西4日攻略" {
 		t.Fatalf("ExtractGuideTitle() = %q, want %q", title, "大肥鱼 · 关西4日攻略")
+	}
+
+	// Strip leaked synthetic chat-log transcript prefixes and [@Name] pseudo-mentions.
+	leakedPoke := "[12:23] Alice(123456789): [戳了 Bob]\n[12:23] Alice(123456789): [戳了你] \n戳什么戳 我在吃饭"
+	if gotClean := SanitizeReplyMarkdown(leakedPoke); gotClean != "戳什么戳 我在吃饭" {
+		t.Fatalf("expected leaked transcript lines stripped, got %q", gotClean)
+	}
+	leakedMention := "[@Alice] 你猜是为啥\n潜水不发表情 那叫装死"
+	if gotClean := SanitizeReplyMarkdown(leakedMention); gotClean != "你猜是为啥\n潜水不发表情 那叫装死" {
+		t.Fatalf("expected leaked [@Name] stripped, got %q", gotClean)
+	}
+	leakedOnly := "[12:23] Alice(123456789): [戳了你]"
+	if gotClean := SanitizeReplyMarkdown(leakedOnly); gotClean != "" {
+		t.Fatalf("expected pure leaked synthetic line to sanitize to empty, got %q", gotClean)
 	}
 }
 

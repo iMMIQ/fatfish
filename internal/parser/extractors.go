@@ -1306,18 +1306,38 @@ func isBlockedPageTitle(title string) bool {
 }
 
 // isLowValueGenericPage rejects login-walled or SPA shell pages that only yield a bare site slogan/brand title
-// with no meaningful description or article content (e.g. "小红书 - 你的生活兴趣社区").
+// with no meaningful description or article content (e.g. "小红书 - 你的生活兴趣社区", "爱发电 · 连接创作者与粉丝的会员制平台").
 func isLowValueGenericPage(title, desc, body string) bool {
-	if len([]rune(strings.TrimSpace(desc))) >= 15 || len([]rune(strings.TrimSpace(body))) >= 40 {
+	bodyRunes := len([]rune(strings.TrimSpace(body)))
+	descClean := strings.TrimSpace(desc)
+	descRunes := len([]rune(descClean))
+	low := strings.ToLower(strings.TrimSpace(title))
+	lowDesc := strings.ToLower(descClean)
+
+	// Reject SPA shell pages whose <meta description> is merely a generic site-wide marketing slogan
+	// while the rendered body is empty/minimal.
+	if bodyRunes < 60 {
+		for _, slogan := range []string{
+			"将创作的自由还给创作者",
+			"让创作者简单地获得稳定收入的粉丝赞助平台",
+			"小红书，标记我的生活",
+		} {
+			if strings.Contains(lowDesc, slogan) {
+				return true
+			}
+		}
+	}
+	if descRunes >= 15 || bodyRunes >= 40 {
 		return false
 	}
-	low := strings.ToLower(strings.TrimSpace(title))
 	if low == "" {
 		return true
 	}
 	for _, shell := range []string{
 		"小红书 - 你的生活兴趣社区",
 		"小红书",
+		"爱发电 · 连接创作者与粉丝的会员制平台",
+		"爱发电",
 		"知乎 - 有问题",
 		"抖音-记录美好生活",
 		"微博",

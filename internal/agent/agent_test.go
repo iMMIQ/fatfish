@@ -228,6 +228,68 @@ func TestExtractSkipMarker(t *testing.T) {
 	}
 }
 
+func TestExtractStickerMarkerSingleBracketAndCanonicalFrameHistory(t *testing.T) {
+	// Standard double-bracket, malformed single-bracket, and full-width colon must all extract cleanly.
+	cases := []struct {
+		in         string
+		wantClean  string
+		wantIntent string
+	}{
+		{"[[sticker: 得意叉腰]]", "", "得意叉腰"},
+		{"[sticker:气鼓鼓炸毛]", "", "气鼓鼓炸毛"},
+		{"哼 [sticker：护住饭碗]", "哼", "护住饭碗"},
+		{"好吧 [[sticker：偷笑吃瓜]]", "好吧", "偷笑吃瓜"},
+	}
+	for _, tc := range cases {
+		gotClean, gotIntent := ExtractStickerMarker(tc.in)
+		if gotClean != tc.wantClean || gotIntent != tc.wantIntent {
+			t.Fatalf("ExtractStickerMarker(%q) = (%q, %q), want (%q, %q)",
+				tc.in, gotClean, gotIntent, tc.wantClean, tc.wantIntent)
+		}
+	}
+
+	// Sticker-only turn must persist canonical double-bracket [[sticker: ...]] in FrozenFrames
+	// so future turns are never polluted with single-bracket examples.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"finish_reason": "stop",
+				"message":       map[string]any{"content": "[[sticker: 护住饭碗]]"},
+			}},
+			"usage": map[string]any{"prompt_tokens": 80, "completion_tokens": 8},
+		})
+	}))
+	defer srv.Close()
+
+	st, _ := store.Open(t.TempDir(), 512, 5)
+	defer st.Close()
+	hub := infer.NewHub(config.ModelsConfig{
+		Primary: config.ModelEndpointConfig{BaseURL: srv.URL, Model: "test-model", TimeoutSec: 5},
+	})
+	fb := frame.NewBuilder(st, config.FrameConfig{InputTokenBudget: 32768, TrimHighWater: 0.8, TrimLowWater: 0.5, SegmentIdleMinutes: 30, MaxImagesPerRequest: 6, ImageTokenReserve: 1600})
+	ch := model.MakeChannelID("onebot", "1", model.ChannelGroup, "5")
+	seg, _, _ := fb.EnsureActiveSegment(context.Background(), ch, 1, frame.ScopeHash("p", "", "test-model"), nil)
+
+	out, err := NewRunner(hub, st, fb, nil, nil).Run(context.Background(), TurnInput{
+		ChannelID:   ch,
+		Epoch:       1,
+		Segment:     seg,
+		PersonaText: "persona",
+		UserPayload: frame.StoredFramePayload{Role: "user", Text: "[戳了你]"},
+	})
+	if err != nil {
+		t.Fatalf("Runner.Run: %v", err)
+	}
+	if out.Text != "" || out.StickerIntent != "护住饭碗" {
+		t.Fatalf("unexpected sticker-only output: text=%q intent=%q", out.Text, out.StickerIntent)
+	}
+	last := out.NewFrames[len(out.NewFrames)-1]
+	if last.Role != "assistant" || last.Text != "[[sticker: 护住饭碗]]" {
+		t.Fatalf("expected canonical double-bracket assistant frame, got %+v", last)
+	}
+}
+
 func TestRunnerAdvisoryOverridesAndMaxToolIterations(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

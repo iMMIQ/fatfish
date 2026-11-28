@@ -39,7 +39,7 @@ var (
 	travelTopicKeywords = []string{
 		"旅游", "旅行", "出游", "行程", "路线", "攻略", "景点", "景区", "打卡", "特种兵",
 		"酒店", "民宿", "房晚", "青旅", "度假村", "温泉", "洗浴", "汤泉", "水疗",
-		"美食", "好吃的", "餐厅", "馆子", "探店", "夜市", "小吃", "特产", "到店",
+		"美食", "好吃的", "必吃", "必吃榜", "餐厅", "饭店", "餐馆", "馆子", "苍蝇馆子", "探店", "夜市", "小吃", "宵夜", "早茶", "特产", "到店",
 		"机票", "航班", "航司", "转机", "连程", "联程", "延误险", "高铁站", "火车站", "机场",
 		"签证", "免签", "落地签", "过境签", "退税", "周游券", "通票", "西瓜卡", "租车", "自驾",
 		"极光", "红叶", "滑雪", "海岛", "邮轮", "赶海", "露营", "古镇", "博物馆",
@@ -73,6 +73,7 @@ var (
 		"预算", "加钱", "便宜", "换一个", "换一家", "还有吗", "还有别的", "如果", "那", "不要", "不去", "跳过",
 		"带老人", "带爸妈", "带娃", "情侣", "一个人", "单人", "特种兵", "躺平", "不换酒店", "加一个", "再加",
 		"几天", "顺路", "酒店", "机票", "高铁", "直飞", "红眼", "延误险", "转机", "最推荐", "片区",
+		"吃什么", "吃啥", "必吃", "停车", "几号线", "地铁",
 		"显卡", "内存", "接口", "尺寸", "重量", "续航",
 		"报错", "日志", "还是不行", "改完", "下一步", "具体", "详细", "展开", "对比", "表格",
 	}
@@ -93,6 +94,11 @@ var (
 	mdBoldRe        = regexp.MustCompile(`\*\*([^*\n]+?)\*\*`)
 	mdUnderscoreRe  = regexp.MustCompile(`__([^_\n]+?)__`)
 	mdQuoteLineRe   = regexp.MustCompile(`^\s*>\s?`)
+
+	// Guard against models echoing synthetic chat-log prefixes ("[12:23] Name(123456): ...") or pseudo-mentions ("[@Name]").
+	leakedTranscriptLineRe = regexp.MustCompile(`^\s*\[\d{1,2}:\d{2}\]\s+[^:\n]{1,60}\((?:\d{5,15}|你自己)\):\s*(.*)$`)
+	leakedSyntheticEventRe = regexp.MustCompile(`^\[(戳了[^\]]*|戳一戳|撤回了[^\]]*|图片[^\]]*|语音[^\]]*|卡片[^\]]*|文件[^\]]*|合并转发[^\]]*)\]$`)
+	leakedBracketMentionRe = regexp.MustCompile(`^\s*\[@[^\]\n]{1,40}\]\s*`)
 )
 
 // DetectAdvisoryIntent identifies explicit guide, recommendation, buying-advice, or troubleshooting turns
@@ -209,39 +215,51 @@ func hasAnySubstr(s string, list []string) bool {
 }
 
 // SanitizeReplyMarkdown removes raw Markdown formatting (**bold**, ### headings, > quotes)
-// outside fenced code blocks so QQ chat bubbles and forward cards stay clean plain text.
+// and strips leaked chat-log transcript prefixes / synthetic [@Name] markers outside fenced code blocks
+// so QQ chat bubbles and forward cards stay clean plain text.
 func SanitizeReplyMarkdown(text string) string {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return ""
 	}
 	lines := strings.Split(text, "\n")
+	outLines := make([]string, 0, len(lines))
 	inCode := false
-	for i, ln := range lines {
+	for _, ln := range lines {
 		trimmed := strings.TrimSpace(ln)
 		if strings.HasPrefix(trimmed, "```") {
 			inCode = !inCode
+			outLines = append(outLines, ln)
 			continue
 		}
 		if inCode {
+			outLines = append(outLines, ln)
 			continue
 		}
+		if tm := leakedTranscriptLineRe.FindStringSubmatch(ln); len(tm) == 2 {
+			rest := strings.TrimSpace(tm[1])
+			if rest == "" || leakedSyntheticEventRe.MatchString(rest) {
+				continue
+			}
+			ln = rest
+		}
+		ln = leakedBracketMentionRe.ReplaceAllString(ln, "")
 		if m := mdHeadingLineRe.FindStringSubmatch(ln); len(m) == 2 {
 			heading := strings.TrimSpace(mdBoldRe.ReplaceAllString(m[1], "$1"))
 			if heading != "" {
 				if !strings.HasPrefix(heading, "【") {
 					heading = "【" + heading + "】"
 				}
-				lines[i] = heading
+				outLines = append(outLines, heading)
 				continue
 			}
 		}
 		clean := mdQuoteLineRe.ReplaceAllString(ln, "")
 		clean = mdBoldRe.ReplaceAllString(clean, "$1")
 		clean = mdUnderscoreRe.ReplaceAllString(clean, "$1")
-		lines[i] = clean
+		outLines = append(outLines, clean)
 	}
-	return strings.TrimSpace(strings.Join(lines, "\n"))
+	return strings.TrimSpace(strings.Join(outLines, "\n"))
 }
 
 // ExtractGuideTitle derives a concise forward-card title from the guide text (e.g. "大肥鱼 · 关西4日攻略"),

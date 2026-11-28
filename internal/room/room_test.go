@@ -799,6 +799,35 @@ policy:
 	if !arm3 {
 		t.Fatal("expected direct follow-up from active thread user to trigger continuation")
 	}
+
+	// 4. Same user poking the bot during poke cooldown must NEVER bypass cooldown via in_thread!
+	r.pendingTrigger = nil
+	r.lastPokeReply = time.Now()
+	_, armPokeBypass := r.onMessage(&model.Message{
+		ChannelID:  ch,
+		SenderID:   "u1",
+		SenderName: "Alice",
+		PokedBot:   true,
+		Parts:      []model.Part{{Kind: model.PartPoke, TargetID: "10001", Text: "[戳了你]"}},
+		CreatedAt:  time.Now(),
+	})
+	if armPokeBypass {
+		t.Fatal("expected poke during cooldown to NOT bypass via in_thread")
+	}
+
+	// 5. Committed poke outcome must NOT create or refresh a text thread continuation.
+	r.threadUserID = ""
+	r.threadTurns = 0
+	r.applyTurnOutcome(turnOutcome{
+		committed: true,
+		trig: triggerState{
+			kind: "poke",
+			msg:  model.Message{SenderID: "u9"},
+		},
+	})
+	if r.threadUserID != "" || r.threadTurns != 0 {
+		t.Fatalf("expected poke reply not to open text thread, got user=%q turns=%d", r.threadUserID, r.threadTurns)
+	}
 }
 
 // TestRoomNonBlockingPerceptionAndParallelMultiImage verifies that:

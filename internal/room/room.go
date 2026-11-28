@@ -528,6 +528,10 @@ func (r *Room) waitForOutboundSlot(ctx context.Context, maxPerMin int, maxWait t
 }
 
 func (r *Room) engageMute(ctx context.Context, cfg *config.Config) {
+	r.engageMuteWithErr(ctx, cfg, nil)
+}
+
+func (r *Room) engageMuteWithErr(ctx context.Context, cfg *config.Config, cause error) {
 	now := time.Now()
 	if prev := r.lastRiskAtNano.Load(); prev > 0 && now.Sub(time.Unix(0, prev)) > 15*time.Minute {
 		r.consecRiskHits.Store(0)
@@ -578,6 +582,10 @@ func (r *Room) engageMute(ctx context.Context, cfg *config.Config) {
 	until := now.Add(time.Duration(sec) * time.Second)
 	r.muteUntilNano.Store(until.UnixNano())
 	_ = r.mgr.store.SetChannelMuteUntil(ctx, r.ch, until)
+	causeMsg := ""
+	if cause != nil {
+		causeMsg = cause.Error()
+	}
 	r.mgr.log.Warn("risk/mute detected, engaging backoff",
 		"channel", r.ch,
 		"reason", reason,
@@ -585,6 +593,7 @@ func (r *Room) engageMute(ctx context.Context, cfg *config.Config) {
 		"consec_hits", hits,
 		"backoff_sec", sec,
 		"until", until,
+		"err", causeMsg,
 	)
 }
 
@@ -796,7 +805,7 @@ func (r *Room) onPerceptionPatch(patch perceptionPatch) (time.Duration, bool) {
 						pid, serr := r.mgr.tr.SendText(sctx, r.ch, previewBody, sendOpts)
 						scancel()
 						if errors.Is(serr, transport.ErrRiskMuted) {
-							r.engageMute(r.mgr.shutdownCtx, cfg)
+							r.engageMuteWithErr(r.mgr.shutdownCtx, cfg, serr)
 							return
 						}
 						var botMsg *model.Message
@@ -1021,7 +1030,7 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 				sctx, cancel := context.WithTimeout(r.mgr.shutdownCtx, 5*time.Second)
 				defer cancel()
 				if _, err := r.mgr.tr.SendText(sctx, r.ch, ackText, transport.SendOptions{}); errors.Is(err, transport.ErrRiskMuted) {
-					r.engageMute(r.mgr.shutdownCtx, cfg)
+					r.engageMuteWithErr(r.mgr.shutdownCtx, cfg, err)
 				} else if err == nil {
 					r.recordOutbound(time.Now())
 				}
@@ -1043,7 +1052,7 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 			out, err := r.mgr.hub.Translate(tctx, arg, "Simplified Chinese")
 			if err == nil && out != "" && r.mgr.tr != nil {
 				if _, serr := r.mgr.tr.SendText(tctx, r.ch, out, transport.SendOptions{ReplyToMsgID: replyTo}); errors.Is(serr, transport.ErrRiskMuted) {
-					r.engageMute(tctx, cfg)
+					r.engageMuteWithErr(tctx, cfg, serr)
 				} else if serr == nil {
 					r.recordOutbound(time.Now())
 				}
@@ -1237,7 +1246,8 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 			threadWindowSec = cfg.Policy.Advisory.ThreadContinuationSec
 		}
 	}
-	inThread := r.threadUserID == msg.SenderID &&
+	inThread := !isPokeOnly &&
+		r.threadUserID == msg.SenderID &&
 		!mentionedOther &&
 		!repliedToOther &&
 		r.threadTurns < threadMax &&
@@ -1784,7 +1794,7 @@ func (r *Room) tryPlusOne(ctx context.Context, msg *model.Message, cfg *config.C
 				defer cancel()
 				pid, err := r.mgr.tr.SendText(sctx, r.ch, echoText, transport.SendOptions{})
 				if errors.Is(err, transport.ErrRiskMuted) {
-					r.engageMute(r.mgr.shutdownCtx, cfg)
+					r.engageMuteWithErr(r.mgr.shutdownCtx, cfg, err)
 					return
 				}
 				if err == nil {
@@ -1913,8 +1923,9 @@ func (r *Room) applyTurnOutcome(out turnOutcome) {
 		} else if out.trig.proactive {
 			r.lastProactive = time.Now()
 		}
-		if out.trig.msg.SenderID != "" && out.trig.msg.SenderID != "system" {
-			// Reset threadTurns to 1 on a fresh explicit mention/reply/poke so a user is never permanently locked out.
+		if out.trig.msg.SenderID != "" && out.trig.msg.SenderID != "system" &&
+			out.trig.kind != "poke" && out.trig.kind != "poke_bystander" {
+			// Reset threadTurns to 1 on a fresh explicit mention/reply so a user is never permanently locked out.
 			if r.threadUserID == out.trig.msg.SenderID && out.trig.kind == "thread" {
 				r.threadTurns++
 			} else {
@@ -1970,7 +1981,7 @@ func (r *Room) runTurnWorker(
 			emoji := strings.TrimSpace(strings.TrimPrefix(decision, "react:"))
 			if r.mgr.tr != nil && trig.msg.PlatformMsgID != "" && emoji != "" {
 				if err := r.mgr.tr.SendReaction(ctx, r.ch, trig.msg.PlatformMsgID, emoji); errors.Is(err, transport.ErrRiskMuted) {
-					r.engageMute(ctx, cfg)
+					r.engageMuteWithErr(ctx, cfg, err)
 				} else if err == nil {
 					outcome.proactiveActed = true
 					r.mgr.log.Info("proactive gate reacted", "channel", r.ch, "emoji", emoji)
@@ -2130,6 +2141,17 @@ func (r *Room) runTurnWorker(
 
 	// Build TurnPlan with natural output formatting using LIVE message displacement count.
 	cleanOutText := SanitizeReplyMarkdown(out.Text)
+	if cleanOutText != out.Text && len(out.NewFrames) > 0 && out.NewFrames[len(out.NewFrames)-1].Role == "assistant" {
+		if cleanOutText != "" {
+			out.NewFrames[len(out.NewFrames)-1].Text = cleanOutText
+		} else if out.StickerIntent != "" {
+			out.NewFrames[len(out.NewFrames)-1].Text = "[[sticker: " + out.StickerIntent + "]]"
+		}
+	}
+	if cleanOutText == "" && len(out.DirectMedia) == 0 && out.StickerIntent == "" {
+		r.mgr.log.Warn("dropped empty reply after output sanitization", "channel", r.ch, "trigger", trig.kind)
+		return outcome
+	}
 	bubbles := FormatBubbles(cleanOutText, cfg.Policy)
 	var forwardLead string
 	var forwardNodeTexts []string
@@ -2258,7 +2280,7 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 						})
 					} else if errors.Is(lerr, transport.ErrRiskMuted) {
 						status = model.DeliveryAbortedRisk
-						r.engageMute(ctx, cfg)
+						r.engageMuteWithErr(ctx, cfg, lerr)
 					}
 				}
 				_ = r.mgr.store.AppendMessage(ctx, &model.Message{
@@ -2272,7 +2294,7 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 				})
 			} else if errors.Is(ferr, transport.ErrRiskMuted) {
 				status = model.DeliveryAbortedRisk
-				r.engageMute(ctx, cfg)
+				r.engageMuteWithErr(ctx, cfg, ferr)
 				forwardDelivered = true // Stop without falling back when risk-muted
 			} else {
 				r.mgr.log.Warn("forward guide delivery failed, falling back to plain bubbles", "channel", r.ch, "err", ferr)
@@ -2315,7 +2337,7 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 				if err != nil {
 					if errors.Is(err, transport.ErrRiskMuted) {
 						status = model.DeliveryAbortedRisk
-						r.engageMute(ctx, cfg)
+						r.engageMuteWithErr(ctx, cfg, err)
 					} else if len(sent) > 0 {
 						status = model.DeliveryPartial
 					} else {
@@ -2367,7 +2389,7 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 				if err != nil {
 					if errors.Is(err, transport.ErrRiskMuted) {
 						status = model.DeliveryAbortedRisk
-						r.engageMute(ctx, cfg)
+						r.engageMuteWithErr(ctx, cfg, err)
 					} else if len(sent) > 0 {
 						status = model.DeliveryPartial
 					} else {
@@ -2446,7 +2468,7 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 					pid, err := r.mgr.tr.SendImage(sctx, r.ch, imgBytes, mime, transport.SendOptions{})
 					if err != nil {
 						if errors.Is(err, transport.ErrRiskMuted) {
-							r.engageMute(sctx, cfg)
+							r.engageMuteWithErr(sctx, cfg, err)
 						}
 						return err
 					}
@@ -3016,7 +3038,7 @@ func (r *Room) dispatchLightPokeResponse(msg *model.Message, cfg *config.Config)
 				pid, err := r.mgr.tr.SendImage(sctx, r.ch, imgBytes, mime, transport.SendOptions{})
 				if err != nil {
 					if errors.Is(err, transport.ErrRiskMuted) {
-						r.engageMute(sctx, cfg)
+						r.engageMuteWithErr(sctx, cfg, err)
 					}
 					return err
 				}
