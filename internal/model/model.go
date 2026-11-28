@@ -256,8 +256,11 @@ type TurnPlan struct {
 	TriggerMsgID   string        `json:"trigger_msg_id,omitempty"`
 	TriggerUserID  string        `json:"trigger_user_id,omitempty"`
 	TriggerKind    string        `json:"trigger_kind,omitempty"` // "mention" | "reply" | "poke" | "thread" | "proactive" | "cron" | "dm"
+	Advisory       bool          `json:"advisory,omitempty"`
 	RawText        string        `json:"raw_text"`
 	Bubbles        []string      `json:"bubbles"`
+	ForwardLead    string        `json:"forward_lead,omitempty"`
+	ForwardNodes   []string      `json:"forward_nodes,omitempty"`
 	DirectMedia    []DirectMedia `json:"direct_media,omitempty"`
 	StickerIntent  string        `json:"sticker_intent,omitempty"`
 	ReplyToMsgID   string        `json:"reply_to_msg_id,omitempty"`

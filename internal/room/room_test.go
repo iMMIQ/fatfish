@@ -3,6 +3,7 @@ package room
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -150,7 +151,9 @@ tools:
 }
 
 type mockTransport struct {
-	sentTexts atomic.Int32
+	sentTexts    atomic.Int32
+	sentForwards atomic.Int32
+	failForward  atomic.Bool
 }
 
 func (m *mockTransport) Start(context.Context, func(*model.Message)) error             { return nil }
@@ -160,6 +163,13 @@ func (m *mockTransport) SelfID() string                                         
 func (m *mockTransport) Probe(context.Context) error                                   { return nil }
 func (m *mockTransport) SendImage(context.Context, model.ChannelID, []byte, string, transport.SendOptions) (string, error) {
 	return "img1", nil
+}
+func (m *mockTransport) SendForward(_ context.Context, _ model.ChannelID, _ []transport.ForwardNode, _ string) (string, error) {
+	if m.failForward.Load() {
+		return "", errors.New("forward unsupported")
+	}
+	m.sentForwards.Add(1)
+	return "fwd1", nil
 }
 func (m *mockTransport) SendPoke(context.Context, model.ChannelID, string) error     { return nil }
 func (m *mockTransport) SendReaction(context.Context, model.ChannelID, string, string) error {

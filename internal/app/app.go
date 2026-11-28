@@ -130,6 +130,7 @@ func New(configPath string, enableTransport bool) (*App, error) {
 
 	// Connect MCP servers only for live runtime (serve), skipping network calls during offline CLI commands.
 	mcpBridge := tool.NewMCPBridge(st, logger)
+	mcpBridge.SetHub(hub)
 	if enableTransport && len(cfg.MCP.Servers) > 0 {
 		initCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		mcpBridge.InitAndRegister(initCtx, cfg.MCP.Servers, reg)

@@ -16,6 +16,13 @@ type SendOptions struct {
 	MentionUserID string
 }
 
+// ForwardNode represents a single node inside an outbound merged-forward card.
+type ForwardNode struct {
+	SenderID   string
+	SenderName string
+	Text       string
+}
+
 // Transport abstracts a messaging platform adapter (OneBot v11, Telegram, Discord, etc.).
 type Transport interface {
 	Start(ctx context.Context, onMessage func(*model.Message)) error
@@ -28,6 +35,7 @@ type Transport interface {
 
 	SendText(ctx context.Context, ch model.ChannelID, text string, opts SendOptions) (platformMsgID string, err error)
 	SendImage(ctx context.Context, ch model.ChannelID, imgBytes []byte, mimeType string, opts SendOptions) (platformMsgID string, err error)
+	SendForward(ctx context.Context, ch model.ChannelID, nodes []ForwardNode, summary string) (platformMsgID string, err error)
 	SendPoke(ctx context.Context, ch model.ChannelID, targetUserID string) error
 	SendReaction(ctx context.Context, ch model.ChannelID, platformMsgID string, emojiID string) error
 	FetchAudio(ctx context.Context, fileID, outFormat string) (audioBytes []byte, filename string, err error)

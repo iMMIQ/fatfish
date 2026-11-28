@@ -151,8 +151,29 @@ type PolicyConfig struct {
 	RecallGossipCooldownSec int                            `yaml:"recall_gossip_cooldown_sec"`
 	PlusOne                 PlusOneConfig                  `yaml:"plus_one"`
 	Poke                   PokeConfig                     `yaml:"poke"`
+	Advisory               AdvisoryConfig                 `yaml:"advisory"`
 	Rules                  PolicyRulesConfig              `yaml:"rules"`
 	Overrides              map[string]PolicyOverrideBlock `yaml:"overrides"`
+}
+
+// AdvisoryConfig tunes dynamic reasoning, sampling, tool depth, thread continuation,
+// and optional long-guide forward packaging when a user asks for guides/advice.
+type AdvisoryConfig struct {
+	Enabled               *bool    `yaml:"enabled,omitempty"`
+	ReasoningEffort       string   `yaml:"reasoning_effort,omitempty"`
+	Temperature           *float64 `yaml:"temperature,omitempty"`
+	PresencePenalty       *float64 `yaml:"presence_penalty,omitempty"`
+	MaxToolIterations     int      `yaml:"max_tool_iterations,omitempty"`
+	ThreadContinuationSec int      `yaml:"thread_continuation_sec,omitempty"`
+	ThreadMaxTurns        int      `yaml:"thread_max_turns,omitempty"`
+	ForwardMinChars       int      `yaml:"forward_min_chars,omitempty"`
+}
+
+func (a AdvisoryConfig) IsEnabled() bool {
+	if a.Enabled == nil {
+		return true
+	}
+	return *a.Enabled
 }
 
 type PlusOneConfig struct {
@@ -251,14 +272,16 @@ type MCPConfig struct {
 }
 
 type MCPServerConfig struct {
-	Name       string            `yaml:"name"`
-	Transport  string            `yaml:"transport"` // "streamable_http" | "stdio"
-	URL        string            `yaml:"url"`
-	Command    string            `yaml:"command"`
-	Args       []string          `yaml:"args"`
-	Headers    map[string]string `yaml:"headers"`
-	Env        map[string]string `yaml:"env"`
-	TimeoutSec int               `yaml:"timeout_sec"`
+	Name           string            `yaml:"name"`
+	Transport      string            `yaml:"transport"` // "streamable_http" | "stdio"
+	URL            string            `yaml:"url"`
+	Command        string            `yaml:"command"`
+	Args           []string          `yaml:"args"`
+	Headers        map[string]string `yaml:"headers"`
+	Env            map[string]string `yaml:"env"`
+	TimeoutSec     int               `yaml:"timeout_sec"`
+	ReadOnly       bool              `yaml:"read_only,omitempty"`
+	MaxOutputRunes int               `yaml:"max_output_runes,omitempty"`
 }
 
 type ConsoleConfig struct {
@@ -388,8 +411,15 @@ func defaultConfig() *Config {
 				AfterReplyMaxChars: 35,
 				AfterReplyDelaySec: 0.5,
 			},
+			Advisory: AdvisoryConfig{
+				ReasoningEffort:       "medium",
+				MaxToolIterations:     8,
+				ThreadContinuationSec: 150,
+				ThreadMaxTurns:        5,
+				ForwardMinChars:       380,
+			},
 			Rules: PolicyRulesConfig{
-				ReplyGate:          "mentioned || replied_to_bot || poked || (in_thread && thread_turns < 3) || (!is_night && cooldown_ok && (hit_nickname ? rand < 0.70 : rand < 0.03))",
+				ReplyGate:          "mentioned || replied_to_bot || poked || in_thread || (!is_night && cooldown_ok && (hit_nickname ? rand < 0.70 : rand < 0.03))",
 				DropStale:          "proactive && (new_msgs >= 4 || wait_sec >= 20)",
 				AutoCollectSticker: "is_group && !from_bot && image_kb > 0 && image_kb < 2048",
 			},
@@ -529,6 +559,29 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Policy.RecallGossipCooldownSec <= 0 {
 		cfg.Policy.RecallGossipCooldownSec = 300
+	}
+	if strings.TrimSpace(cfg.Policy.Advisory.ReasoningEffort) == "" {
+		cfg.Policy.Advisory.ReasoningEffort = "medium"
+	}
+	if cfg.Policy.Advisory.Temperature == nil {
+		t := 0.55
+		cfg.Policy.Advisory.Temperature = &t
+	}
+	if cfg.Policy.Advisory.PresencePenalty == nil {
+		p := 0.0
+		cfg.Policy.Advisory.PresencePenalty = &p
+	}
+	if cfg.Policy.Advisory.MaxToolIterations <= 0 {
+		cfg.Policy.Advisory.MaxToolIterations = 8
+	}
+	if cfg.Policy.Advisory.ThreadContinuationSec <= 0 {
+		cfg.Policy.Advisory.ThreadContinuationSec = 150
+	}
+	if cfg.Policy.Advisory.ThreadMaxTurns <= 0 {
+		cfg.Policy.Advisory.ThreadMaxTurns = 5
+	}
+	if cfg.Policy.Advisory.ForwardMinChars < 0 {
+		cfg.Policy.Advisory.ForwardMinChars = 380
 	}
 	if cfg.LinkParser.CooldownSec < 0 {
 		cfg.LinkParser.CooldownSec = 15

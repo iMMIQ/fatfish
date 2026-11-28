@@ -163,3 +163,52 @@ print("call=", round(call["price"], 2), "delta=", round(call["delta"], 3), "pari
 		t.Fatal("expected finance.irr to reject all-positive cashflows")
 	}
 }
+
+func TestRenderTableAndGuideCardPNG(t *testing.T) {
+	fontPath := filepath.Join("..", "..", "assets", "fonts", "NotoSansSC-Regular.ttf")
+	ct := NewComputeTool(fontPath, 500000, 3)
+
+	res, err := ct.Execute(context.Background(), ToolContext{}, ComputeArgs{
+		Code: `
+chart.table(
+    title="3000元档 27寸4K显示器横评",
+    subtitle="写代码 + 偶尔FPS场景推荐对比",
+    headers=["维度", "方案A (Fast IPS)", "方案B (MiniLED)", "方案C (办公60Hz)"],
+    rows=[
+        ["参考价位", "2200~2600元", "2900~3300元", "1800~2100元"],
+        ["文字清晰度", "极佳，无光晕", "优秀，白底偶有光晕", "极佳"],
+        ["FPS游戏", "160Hz 丝滑够用", "160Hz 丝滑+HDR", "60Hz 拖影严重(避坑)"],
+    ],
+    highlight_col=1
+)
+chart.card(
+    title="关西4天不特种兵行程卡",
+    subtitle="大阪住到底 + 抽2天往返京都",
+    sections=[
+        {"heading": "Day1 大阪落地", "items": ["心斋桥/道顿堀吃晚饭", "梅田蓝天大厦看夜景"]},
+        {"heading": "Day2 京都东线", "items": ["早7:30前冲清水寺避开旅行团", "二年坂三年坂 -> 八坂神社 -> 鸭川"]},
+    ],
+    footer="避坑：岚山小火车旺季提前官网抢票，西瓜卡直接用手机钱包开。"
+)
+`,
+	})
+	if err != nil {
+		t.Fatalf("table/card render failed: %v", err)
+	}
+	if len(res.DirectMedia) != 2 {
+		t.Fatalf("expected 2 PNG media outputs (table + card), got %d", len(res.DirectMedia))
+	}
+	for i, dm := range res.DirectMedia {
+		if dm.MimeType != "image/png" {
+			t.Fatalf("media[%d] expected image/png, got %q", i, dm.MimeType)
+		}
+		img, err := png.Decode(bytes.NewReader(dm.Data))
+		if err != nil {
+			t.Fatalf("decode PNG[%d]: %v", i, err)
+		}
+		b := img.Bounds()
+		if b.Dx() < 600 || b.Dy() < 200 {
+			t.Fatalf("unexpected PNG[%d] dimensions: %v", i, b)
+		}
+	}
+}

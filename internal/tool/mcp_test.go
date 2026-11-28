@@ -58,3 +58,49 @@ func TestMCPToolCachePreservesKVDeclarations(t *testing.T) {
 		t.Fatalf("expected temporary unavailable notice, got %q", res.TextForLLM)
 	}
 }
+
+func TestMCPReadOnlyAndOutputTrim(t *testing.T) {
+	st, err := store.Open(t.TempDir(), 512, 5)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	cached := []CachedMCPTool{{
+		RemoteName:  "webSearchPrime",
+		FullName:    "mcp_web_search_prime_webSearchPrime",
+		Description: "Search tool",
+		ReadOnly:    false, // Server omitted ReadOnlyHint annotation
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}}}`),
+	}}
+	raw, _ := json.Marshal(cached)
+	_ = st.SaveMCPToolCache(ctx, "web_search_prime", string(raw))
+
+	reg := NewRegistry(5 * time.Second)
+	bridge := NewMCPBridge(st, nil)
+	bridge.InitAndRegister(ctx, []config.MCPServerConfig{{
+		Name:           "web_search_prime",
+		Transport:      "streamable_http",
+		URL:            "http://127.0.0.1:1/mcp",
+		TimeoutSec:     1,
+		ReadOnly:       true,
+		MaxOutputRunes: 500,
+	}}, reg)
+	reg.Freeze()
+
+	entry, ok := reg.Lookup("mcp_web_search_prime_webSearchPrime")
+	if !ok {
+		t.Fatal("expected tool registered")
+	}
+	if !entry.ReadOnly {
+		t.Fatal("expected ReadOnly=true for web_search_prime so agent runs parallel errgroup")
+	}
+
+	// Verify oversized MCP output is safely clipped when exceeding maxRunes.
+	huge := strings.Repeat("攻略实测避坑内容段落。", 400)
+	trimmed := trimMCPOutput(ctx, nil, huge, map[string]any{"query": "避坑"}, 200)
+	if len([]rune(trimmed)) > 230 || !strings.Contains(trimmed, "truncated") {
+		t.Fatalf("expected clipped MCP output around 200 runes, got len=%d", len([]rune(trimmed)))
+	}
+}

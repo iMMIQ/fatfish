@@ -133,8 +133,17 @@ policy:
     after_reply_prob: 0.15
     after_reply_max_chars: 35
     after_reply_delay_sec: 0.5
+  advisory:
+    enabled: true
+    reasoning_effort: "medium"
+    temperature: 0.55
+    presence_penalty: 0.0
+    max_tool_iterations: 8
+    thread_continuation_sec: 150
+    thread_max_turns: 5
+    forward_min_chars: 380
   rules:
-    reply_gate: "mentioned || replied_to_bot || poked || (in_thread && thread_turns < 3) || (!is_night && cooldown_ok && (hit_nickname ? rand < 0.70 : rand < 0.03))"
+    reply_gate: "mentioned || replied_to_bot || poked || in_thread || (!is_night && cooldown_ok && (hit_nickname ? rand < 0.70 : rand < 0.03))"
     drop_stale: "proactive && (new_msgs >= 4 || wait_sec >= 20)"
     auto_collect_sticker: "is_group && !from_bot && image_kb > 0 && image_kb < 2048"
   overrides:

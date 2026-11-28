@@ -69,6 +69,9 @@ func (s *stubTransport) SendText(context.Context, model.ChannelID, string, trans
 func (s *stubTransport) SendImage(context.Context, model.ChannelID, []byte, string, transport.SendOptions) (string, error) {
 	return "2", nil
 }
+func (s *stubTransport) SendForward(context.Context, model.ChannelID, []transport.ForwardNode, string) (string, error) {
+	return "3", nil
+}
 func (s *stubTransport) SendPoke(context.Context, model.ChannelID, string) error {
 	s.pokes++
 	return nil

@@ -431,6 +431,10 @@ func parsePageRange(spec string) (int, int) {
 // selectRelevantChunks splits long documents (e.g., 100-page financial filings) into overlapping chunks
 // and ranks them against query using local rerank -> embed cosine -> lexical overlap fallback.
 func (t *ReadSourceTool) selectRelevantChunks(ctx context.Context, content, query string, topK, maxRunes int) string {
+	return selectRelevantChunksWithHub(ctx, t.hub, content, query, topK, maxRunes)
+}
+
+func selectRelevantChunksWithHub(ctx context.Context, hub *infer.Hub, content, query string, topK, maxRunes int) string {
 	chunks := splitOverlappingChunks(content, 1000, 150, 64)
 	if len(chunks) <= topK {
 		return clipRunes(content, maxRunes)
@@ -445,15 +449,15 @@ func (t *ReadSourceTool) selectRelevantChunks(ctx context.Context, content, quer
 	}
 
 	ranked := false
-	if t.hub != nil {
-		if rres, err := t.hub.Rerank(ctx, query, chunks); err == nil && len(rres) > 0 {
+	if hub != nil {
+		if rres, err := hub.Rerank(ctx, query, chunks); err == nil && len(rres) > 0 {
 			for _, r := range rres {
 				if r.Index >= 0 && r.Index < len(scores) {
 					scores[r.Index].score = r.Score*0.85 + scores[r.Index].score*0.15
 				}
 			}
 			ranked = true
-		} else if embs, err := t.hub.Embed(ctx, append([]string{query}, chunks...)); err == nil && len(embs) == len(chunks)+1 {
+		} else if embs, err := hub.Embed(ctx, append([]string{query}, chunks...)); err == nil && len(embs) == len(chunks)+1 {
 			qv := embs[0]
 			vec.NormalizeInPlace(qv)
 			for i := range chunks {

@@ -15,9 +15,12 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/iMMIQ/fatfish/internal/config"
+	"github.com/iMMIQ/fatfish/internal/infer"
 	"github.com/iMMIQ/fatfish/internal/netutil"
 	"github.com/iMMIQ/fatfish/internal/store"
 )
+
+const defaultMCPMaxOutputRunes = 8000
 
 // CachedMCPTool is persisted in SQLite `mcp_tool_cache` so transient MCP outages
 // never cause declared OpenAI tool schemas to flap (preserving KV Prefix Cache).
@@ -39,6 +42,7 @@ type mcpServerConn struct {
 // tools (`mcp.<server>.<tool>`) with SQLite cached manifest fallback.
 type MCPBridge struct {
 	store   *store.Store
+	hub     *infer.Hub
 	log     *slog.Logger
 	mu      sync.Mutex
 	servers map[string]*mcpServerConn
@@ -53,6 +57,13 @@ func NewMCPBridge(st *store.Store, logger *slog.Logger) *MCPBridge {
 		log:     logger,
 		servers: make(map[string]*mcpServerConn),
 	}
+}
+
+// SetHub attaches an optional inference hub for semantic chunk reranking of oversized MCP outputs.
+func (b *MCPBridge) SetHub(hub *infer.Hub) {
+	b.mu.Lock()
+	b.hub = hub
+	b.mu.Unlock()
 }
 
 // InitAndRegister connects to every configured MCP server, refreshes `mcp_tool_cache`
@@ -86,13 +97,18 @@ func (b *MCPBridge) InitAndRegister(ctx context.Context, servers []config.MCPSer
 			if timeout <= 0 {
 				timeout = 30 * time.Second
 			}
+			maxRunes := scfg.MaxOutputRunes
+			if maxRunes <= 0 {
+				maxRunes = defaultMCPMaxOutputRunes
+			}
+			readOnly := ct.ReadOnly || scfg.ReadOnly || isKnownReadOnlyMCP(scfg.Name, ct.RemoteName)
 			_ = reg.RegisterRaw(Entry{
 				Name:        ct.FullName,
 				Description: ct.Description,
-				ReadOnly:    ct.ReadOnly,
+				ReadOnly:    readOnly,
 				Parameters:  ct.Parameters,
 				Invoke: func(callCtx context.Context, _ ToolContext, rawArgs json.RawMessage) (ToolResult, error) {
-					return b.invoke(callCtx, serverName, remoteName, rawArgs, timeout)
+					return b.invoke(callCtx, serverName, remoteName, rawArgs, timeout, maxRunes)
 				},
 			})
 		}
@@ -152,9 +168,10 @@ func (b *MCPBridge) loadCached(ctx context.Context, serverName string) []CachedM
 	return tools
 }
 
-func (b *MCPBridge) invoke(ctx context.Context, serverName, remoteName string, rawArgs json.RawMessage, timeout time.Duration) (ToolResult, error) {
+func (b *MCPBridge) invoke(ctx context.Context, serverName, remoteName string, rawArgs json.RawMessage, timeout time.Duration, maxRunes int) (ToolResult, error) {
 	b.mu.Lock()
 	conn := b.servers[serverName]
+	hub := b.hub
 	b.mu.Unlock()
 	if conn == nil {
 		return ToolResult{}, fmt.Errorf("mcp server %q temporarily unavailable", serverName)
@@ -218,11 +235,55 @@ func (b *MCPBridge) invoke(ctx context.Context, serverName, remoteName string, r
 	joined := strings.Join(texts, "\n")
 	if res.IsError {
 		return ToolResult{
-			TextForLLM: fmt.Sprintf("MCP tool error: %s", joined),
-			SoftError:  joined,
+			TextForLLM: fmt.Sprintf("MCP tool error: %s", clipRunes(joined, 2000)),
+			SoftError:  clipRunes(joined, 500),
 		}, nil
 	}
+	joined = trimMCPOutput(ctx, hub, joined, argMap, maxRunes)
 	return ToolResult{TextForLLM: netutil.WrapExternalData("mcp:"+serverName+":"+remoteName, joined)}, nil
+}
+
+func isKnownReadOnlyMCP(serverName, remoteName string) bool {
+	s := strings.ToLower(strings.TrimSpace(serverName))
+	r := strings.ToLower(strings.TrimSpace(remoteName))
+	switch s {
+	case "web_search_prime", "web_reader", "zread", "web_search":
+		return true
+	}
+	if strings.HasPrefix(s, "web_search") || strings.HasPrefix(s, "web_reader") {
+		return true
+	}
+	for _, prefix := range []string{"web_search", "web_reader", "search_", "read_", "get_", "fetch_"} {
+		if strings.HasPrefix(r, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func trimMCPOutput(ctx context.Context, hub *infer.Hub, content string, argMap map[string]any, maxRunes int) string {
+	if maxRunes <= 0 {
+		maxRunes = defaultMCPMaxOutputRunes
+	}
+	if len([]rune(content)) <= maxRunes {
+		return content
+	}
+	q := extractMCPQueryHint(argMap)
+	if q != "" && hub != nil {
+		return selectRelevantChunksWithHub(ctx, hub, content, q, 6, maxRunes)
+	}
+	return clipRunes(content, maxRunes)
+}
+
+func extractMCPQueryHint(argMap map[string]any) string {
+	for _, k := range []string{"query", "search_query", "q", "keyword", "keywords", "topic"} {
+		if v, ok := argMap[k]; ok {
+			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+				return strings.TrimSpace(s)
+			}
+		}
+	}
+	return ""
 }
 
 func (b *MCPBridge) connect(ctx context.Context, scfg config.MCPServerConfig) (*mcp.ClientSession, error) {

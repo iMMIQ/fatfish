@@ -57,7 +57,7 @@ func (t *ComputeTool) Renderer() *ChartRenderer { return t.renderer }
 func (t *ComputeTool) Name() string             { return "compute" }
 func (t *ComputeTool) ReadOnly() bool           { return true }
 func (t *ComputeTool) Description() string {
-	return "Execute pure-Go Starlark calculations with preloaded math, json, time, stats (mean/median/stdev/percentile/corr/linreg), finance (pmt/npv/irr/xirr/cagr/drawdown/dca/volatility/sharpe/sortino/sma/ema/rsi/macd/bollinger/bs_option), and chart (line/bar/pie/scatter/kline/compare PNG)."
+	return "Execute pure-Go Starlark calculations with preloaded math, json, time, stats (mean/median/stdev/percentile/corr/linreg), finance (pmt/npv/irr/xirr/cagr/drawdown/dca/volatility/sharpe/sortino/sma/ema/rsi/macd/bollinger/bs_option), and chart (line/bar/pie/scatter/kline/compare/table/card PNG)."
 }
 
 // ValidateStarlarkAST inspects the parsed AST before execution to block single-step & exponential OOM DoS
@@ -1331,6 +1331,61 @@ func (t *ComputeTool) chartModule(charts *[]model.DirectMedia) *starlarkstruct.M
 		return starlark.String(fmt.Sprintf("rendered compare chart (%d bytes)", len(pngBytes))), nil
 	}
 
+	tableFn := func(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+		if err := checkCap(); err != nil {
+			return nil, err
+		}
+		var title, subtitle string
+		var headersVal, rowsVal starlark.Value
+		highlightCol := -1
+		if err := starlark.UnpackArgs("chart.table", args, kwargs,
+			"title", &title,
+			"headers", &headersVal,
+			"rows", &rowsVal,
+			"subtitle?", &subtitle,
+			"highlight_col?", &highlightCol,
+		); err != nil {
+			return nil, err
+		}
+		headers, _ := toStringSlice(headersVal)
+		rows, err := toStringMatrix(rowsVal)
+		if err != nil {
+			return nil, err
+		}
+		pngBytes, err := t.renderer.RenderTable(title, subtitle, headers, rows, highlightCol)
+		if err != nil {
+			return nil, err
+		}
+		*charts = append(*charts, model.DirectMedia{Data: pngBytes, MimeType: "image/png", Filename: "table.png", Caption: title})
+		return starlark.String(fmt.Sprintf("rendered comparison table (%d bytes)", len(pngBytes))), nil
+	}
+
+	cardFn := func(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+		if err := checkCap(); err != nil {
+			return nil, err
+		}
+		var title, subtitle, footer string
+		var sectionsVal starlark.Value
+		if err := starlark.UnpackArgs("chart.card", args, kwargs,
+			"title", &title,
+			"sections", &sectionsVal,
+			"subtitle?", &subtitle,
+			"footer?", &footer,
+		); err != nil {
+			return nil, err
+		}
+		sections, err := toCardSections(sectionsVal)
+		if err != nil {
+			return nil, err
+		}
+		pngBytes, err := t.renderer.RenderCard(title, subtitle, sections, footer)
+		if err != nil {
+			return nil, err
+		}
+		*charts = append(*charts, model.DirectMedia{Data: pngBytes, MimeType: "image/png", Filename: "card.png", Caption: title})
+		return starlark.String(fmt.Sprintf("rendered guide card (%d bytes)", len(pngBytes))), nil
+	}
+
 	return &starlarkstruct.Module{
 		Name: "chart",
 		Members: starlark.StringDict{
@@ -1340,8 +1395,62 @@ func (t *ComputeTool) chartModule(charts *[]model.DirectMedia) *starlarkstruct.M
 			"pie":     starlark.NewBuiltin("chart.pie", pieFn),
 			"kline":   starlark.NewBuiltin("chart.kline", klineFn),
 			"compare": starlark.NewBuiltin("chart.compare", compareFn),
+			"table":   starlark.NewBuiltin("chart.table", tableFn),
+			"card":    starlark.NewBuiltin("chart.card", cardFn),
 		},
 	}
+}
+
+func toStringMatrix(v starlark.Value) ([][]string, error) {
+	iter, ok := v.(starlark.Iterable)
+	if !ok {
+		return nil, fmt.Errorf("chart.table: rows must be a list of lists, got %s", v.Type())
+	}
+	it := iter.Iterate()
+	defer it.Done()
+	var item starlark.Value
+	var out [][]string
+	for it.Next(&item) {
+		row, _ := toStringSlice(item)
+		out = append(out, row)
+	}
+	return out, nil
+}
+
+func toCardSections(v starlark.Value) ([]CardSection, error) {
+	iter, ok := v.(starlark.Iterable)
+	if !ok {
+		return nil, fmt.Errorf("chart.card: sections must be a list of {heading, items} dicts, got %s", v.Type())
+	}
+	it := iter.Iterate()
+	defer it.Done()
+	var item starlark.Value
+	var out []CardSection
+	for it.Next(&item) {
+		d, ok := item.(*starlark.Dict)
+		if !ok {
+			continue
+		}
+		var sec CardSection
+		if hv, found, _ := d.Get(starlark.String("heading")); found {
+			if hs, ok := hv.(starlark.String); ok {
+				sec.Heading = string(hs)
+			} else {
+				sec.Heading = hv.String()
+			}
+		} else if hv, found, _ := d.Get(starlark.String("title")); found {
+			if hs, ok := hv.(starlark.String); ok {
+				sec.Heading = string(hs)
+			} else {
+				sec.Heading = hv.String()
+			}
+		}
+		if iv, found, _ := d.Get(starlark.String("items")); found {
+			sec.Items, _ = toStringSlice(iv)
+		}
+		out = append(out, sec)
+	}
+	return out, nil
 }
 
 func toFloat(v starlark.Value) (float64, error) {

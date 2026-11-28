@@ -54,16 +54,21 @@ func NewRunner(hub *infer.Hub, st *store.Store, fb *frame.Builder, reg *tool.Reg
 
 // TurnInput describes the inputs for one agent turn inside a Room segment.
 type TurnInput struct {
-	ChannelID    model.ChannelID
-	Epoch        int64
-	Segment      *store.SegmentRecord
-	PersonaText  string
-	UserPayload  frame.StoredFramePayload
-	SenderID     string
-	SenderName   string
-	IsAdmin      bool
-	TriggerMsgID string
-	TriggerKind  string
+	ChannelID         model.ChannelID
+	Epoch             int64
+	Segment           *store.SegmentRecord
+	PersonaText       string
+	UserPayload       frame.StoredFramePayload
+	SenderID          string
+	SenderName        string
+	IsAdmin           bool
+	TriggerMsgID      string
+	TriggerKind       string
+	AdvisoryMode      bool
+	ReasoningEffort   string
+	Temperature       *float64
+	PresencePenalty   *float64
+	MaxToolIterations int
 }
 
 // TurnStats summarizes inference telemetry across all iterations of a turn.
@@ -130,11 +135,28 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 	var stats TurnStats
 	exhaustedTools := false
 	contentFilterRecovered := false
-	for iter := 1; iter <= maxToolIterations; iter++ {
+	maxIter := maxToolIterations
+	if in.MaxToolIterations > 0 {
+		maxIter = in.MaxToolIterations
+	}
+	buildReq := func(m []infer.ChatMessage, tools []infer.ToolDefinition) infer.ChatRequest {
 		req := infer.ChatRequest{
-			Messages: msgs,
-			Tools:    defs,
+			Messages: m,
+			Tools:    tools,
 		}
+		if strings.TrimSpace(in.ReasoningEffort) != "" {
+			req.ReasoningEffort = strings.TrimSpace(in.ReasoningEffort)
+		}
+		if in.Temperature != nil {
+			req.Temperature = in.Temperature
+		}
+		if in.PresencePenalty != nil {
+			req.PresencePenalty = in.PresencePenalty
+		}
+		return req
+	}
+	for iter := 1; iter <= maxIter; iter++ {
+		req := buildReq(msgs, defs)
 		iterPrefixHash := assembled.PrefixHash
 		if iter > 1 && len(msgs) > 1 {
 			pb, _ := json.Marshal(msgs[:len(msgs)-1])
@@ -148,10 +170,7 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 			if iter == 1 && infer.IsContentFiltered(err) && len(msgs) > 2 {
 				r.log.Warn("content filter triggered on segment context, retrying without pinned history", "channel", in.ChannelID, "segment", in.Segment.ID)
 				safeMsgs := []infer.ChatMessage{msgs[0], msgs[len(msgs)-1]}
-				safeResp, safeErr := r.hub.Chat(ctx, "primary", infer.ChatRequest{
-					Messages: safeMsgs,
-					Tools:    defs,
-				})
+				safeResp, safeErr := r.hub.Chat(ctx, "primary", buildReq(safeMsgs, defs))
 				if safeErr == nil {
 					msgs = safeMsgs
 					resp = safeResp
@@ -282,15 +301,15 @@ func (r *Runner) Run(ctx context.Context, in TurnInput) (*TurnOutput, error) {
 				Text:       outText,
 			})
 		}
-		if iter == maxToolIterations {
+		if iter == maxIter {
 			exhaustedTools = true
 		}
 	}
 
-	// If all maxToolIterations returned tool_calls, run one final synthesis pass without tools
+	// If all maxIter iterations returned tool_calls, run one final synthesis pass without tools
 	// so the user receives an answer instead of silence.
 	if exhaustedTools && finalText == "" && ctx.Err() == nil {
-		if resp, err := r.hub.Chat(ctx, "primary", infer.ChatRequest{Messages: msgs}); err == nil {
+		if resp, err := r.hub.Chat(ctx, "primary", buildReq(msgs, nil)); err == nil {
 			stats.Iterations++
 			stats.PromptTokens += resp.Usage.PromptTokens
 			stats.CachedTokens += resp.Usage.CachedTokens

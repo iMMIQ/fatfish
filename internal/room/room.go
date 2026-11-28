@@ -293,9 +293,10 @@ type Room struct {
 	turnCancel context.CancelFunc
 
 	// Thread continuation state
-	threadUserID string
-	threadTurns  int
-	threadLastAt time.Time
+	threadUserID   string
+	threadTurns    int
+	threadLastAt   time.Time
+	threadAdvisory bool
 
 	// +1 repeater state
 	plusOnePhrase string
@@ -316,6 +317,7 @@ type turnOutcome struct {
 	committed        bool
 	proactiveActed   bool
 	skippedThread    bool
+	advisory         bool
 	uncommittedBatch []model.Message
 	segID            int64
 	seenMembers      []string
@@ -347,11 +349,12 @@ const (
 )
 
 type triggerState struct {
-	msg        model.Message
-	kind       string // "mention" | "reply" | "poke" | "thread" | "proactive" | "dm" | "cron"
-	proactive  bool
-	enqueuedAt time.Time
-	enqMsgCnt  uint64
+	msg              model.Message
+	kind             string // "mention" | "reply" | "poke" | "thread" | "proactive" | "dm" | "cron"
+	proactive        bool
+	inAdvisoryThread bool
+	enqueuedAt       time.Time
+	enqMsgCnt        uint64
 }
 
 func newRoom(mgr *Manager, ch model.ChannelID) *Room {
@@ -607,6 +610,7 @@ func (r *Room) onAdminCommand(cmd model.AdminCommand) {
 		r.seenInSegment = make(map[string]bool)
 		r.threadUserID = ""
 		r.threadTurns = 0
+		r.threadAdvisory = false
 		if cmd.Reply != nil {
 			cmd.Reply <- fmt.Sprintf("已重置当前频道上下文 (epoch=%d)", r.epoch.Load())
 		}
@@ -883,11 +887,20 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 	repliedToOther := msg.RepliedToOther()
 	mentionedIgnoredBot := r.mentionsIgnoredBot(msg)
 	threadMax := r.mgr.policy.ThreadMaxTurns(r.ch)
+	threadWindowSec := cfg.Policy.ThreadContinuationSec
+	if r.threadAdvisory && cfg.Policy.Advisory.IsEnabled() {
+		if cfg.Policy.Advisory.ThreadMaxTurns > threadMax {
+			threadMax = cfg.Policy.Advisory.ThreadMaxTurns
+		}
+		if cfg.Policy.Advisory.ThreadContinuationSec > threadWindowSec {
+			threadWindowSec = cfg.Policy.Advisory.ThreadContinuationSec
+		}
+	}
 	inThread := r.threadUserID == msg.SenderID &&
 		!mentionedOther &&
 		!repliedToOther &&
 		r.threadTurns < threadMax &&
-		time.Since(r.threadLastAt) <= time.Duration(cfg.Policy.ThreadContinuationSec)*time.Second &&
+		time.Since(r.threadLastAt) <= time.Duration(threadWindowSec)*time.Second &&
 		time.Since(r.threadLastAt) >= time.Duration(cfg.Policy.ThreadMinIntervalSec*float64(time.Second))
 	cooldownSec := r.mgr.policy.ProactiveCooldownSec(r.ch)
 	cooldownOK := time.Since(r.lastProactive) >= time.Duration(cooldownSec)*time.Second
@@ -1083,11 +1096,12 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 	}
 
 	r.pendingTrigger = &triggerState{
-		msg:        cloneMessage(*msg),
-		kind:       trigKind,
-		proactive:  proactive,
-		enqueuedAt: time.Now(),
-		enqMsgCnt:  r.msgCount.Load(),
+		msg:              cloneMessage(*msg),
+		kind:             trigKind,
+		proactive:        proactive,
+		inAdvisoryThread: inThread && r.threadAdvisory,
+		enqueuedAt:       time.Now(),
+		enqMsgCnt:        r.msgCount.Load(),
 	}
 
 	// Pure @mention with no text waits mention_wait_sec for follow-up message from same sender.
@@ -1561,6 +1575,7 @@ func (r *Room) applyTurnOutcome(out turnOutcome) {
 	if out.skippedThread {
 		r.threadUserID = ""
 		r.threadTurns = 0
+		r.threadAdvisory = false
 	}
 	if out.segID > 0 {
 		if out.segID != r.lastSegID {
@@ -1587,6 +1602,7 @@ func (r *Room) applyTurnOutcome(out turnOutcome) {
 				r.threadUserID = out.trig.msg.SenderID
 				r.threadTurns = 1
 			}
+			r.threadAdvisory = out.advisory
 			r.threadLastAt = time.Now()
 		}
 		return
@@ -1716,6 +1732,10 @@ func (r *Room) runTurnWorker(
 		batch, cfg.Location(), newMemberDelta, trig.msg.PlatformMsgID,
 		cfg.Frame.MaxBackgroundImages, cfg.Frame.MaxImagesPerRequest,
 	)
+	advisoryMode := cfg.Policy.Advisory.IsEnabled() &&
+		DetectAdvisoryIntent(trig.msg.TextOnly(), trig.kind, trig.inAdvisoryThread)
+	outcome.advisory = advisoryMode
+
 	if trig.kind == "plus_one_break" {
 		userPayload.Text += "\n[提示: 多名群友正在刷屏复读同一句话，用一句简短俏皮的话自然打断复读。]"
 	} else if trig.kind == "poke_bystander" {
@@ -1724,10 +1744,12 @@ func (r *Room) runTurnWorker(
 		userPayload.Text += "\n[提示: 群友刚秒撤回了一条消息，顺口吃瓜调侃一句（1~12字，别原封不动复述敏感或隐私内容），没意思就直接输出 [[skip]]。]"
 	} else if trig.kind == "link" {
 		userPayload.Text += "\n[提示: 系统已将这条链接的纯文本基础解析发到群里了，不要重复复读标题和播放量等基础信息；只按你的性格顺口吐槽、接梗或补一句有意思的点评，觉得解析本身已经够清楚、没必要再补话就直接输出 [[skip]]。]"
+	} else if advisoryMode {
+		userPayload.Text += "\n[提示: 群友在认真问攻略/建议，切入“嘴硬但真懂行的群友”模式：先给结论、给带取舍条件的方案、补1~2条实战避坑（涉及时效价格/版本/新规先并发查证再答）；做多款参数横评或多日行程表可直接用 compute 的 chart.table/chart.card 出图，正文保持高密度纯文本分段，不要写 Markdown #/** 符号和 AI 客服腔。]"
 	} else if trig.kind == "thread" && !hasRichMediaPart(trig.msg) && len([]rune(strings.TrimSpace(trig.msg.TextOnly()))) <= 6 {
 		userPayload.Text += "\n[提示: 这是续聊且对方回复很简短，若已自然收尾可直接输出 [[skip]] 闭嘴，或只输出 [[sticker: 情绪]] 纯发表情包，不必硬接文字。]"
 	}
-	out, err := r.mgr.runner.Run(ctx, agent.TurnInput{
+	turnIn := agent.TurnInput{
 		ChannelID:    r.ch,
 		Epoch:        startEpoch,
 		Segment:      seg,
@@ -1738,7 +1760,15 @@ func (r *Room) runTurnWorker(
 		IsAdmin:      cfg.IsAdmin(trig.msg.SenderID),
 		TriggerMsgID: trig.msg.PlatformMsgID,
 		TriggerKind:  trig.kind,
-	})
+		AdvisoryMode: advisoryMode,
+	}
+	if advisoryMode {
+		turnIn.ReasoningEffort = cfg.Policy.Advisory.ReasoningEffort
+		turnIn.Temperature = cfg.Policy.Advisory.Temperature
+		turnIn.PresencePenalty = cfg.Policy.Advisory.PresencePenalty
+		turnIn.MaxToolIterations = cfg.Policy.Advisory.MaxToolIterations
+	}
+	out, err := r.mgr.runner.Run(ctx, turnIn)
 	if err != nil {
 		if infer.IsContentFiltered(err) && r.mgr.store != nil {
 			_ = r.mgr.store.CloseSegment(ctx, seg.ID, "")
@@ -1773,6 +1803,20 @@ func (r *Room) runTurnWorker(
 
 	// Build TurnPlan with natural output formatting using LIVE message displacement count.
 	bubbles := FormatBubbles(out.Text, cfg.Policy)
+	var forwardLead string
+	var forwardNodeTexts []string
+	if r.ch.IsGroup() && advisoryMode && cfg.Policy.Advisory.ForwardMinChars > 0 && len([]rune(strings.TrimSpace(out.Text))) >= cfg.Policy.Advisory.ForwardMinChars {
+		selfID := ""
+		if r.mgr.tr != nil {
+			selfID = r.mgr.tr.SelfID()
+		}
+		if lead, fnodes := BuildForwardGuide(out.Text, r.botDisplayName(cfg), selfID); len(fnodes) >= 2 {
+			forwardLead = lead
+			for _, fn := range fnodes {
+				forwardNodeTexts = append(forwardNodeTexts, fn.Text)
+			}
+		}
+	}
 	replyTo, mentionUser := SmartReplyDecoration(trig, int(r.msgCount.Load()-trig.enqMsgCnt), cfg.Policy)
 	pokeAfter := false
 	if cfg.Policy.Poke.Mode != "ignore" &&
@@ -1790,8 +1834,11 @@ func (r *Room) runTurnWorker(
 		TriggerMsgID:   trig.msg.PlatformMsgID,
 		TriggerUserID:  trig.msg.SenderID,
 		TriggerKind:    trig.kind,
+		Advisory:       advisoryMode,
 		RawText:        out.Text,
 		Bubbles:        bubbles,
+		ForwardLead:    forwardLead,
+		ForwardNodes:   forwardNodeTexts,
 		DirectMedia:    out.DirectMedia,
 		StickerIntent:  out.StickerIntent,
 		ReplyToMsgID:   replyTo,
@@ -1832,67 +1879,130 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 			}
 		}
 
-		// 1. Send text bubbles with natural pacing and live epoch/risk guards.
-	bubbleLoop:
-		for i, b := range plan.Bubbles {
-			if r.epoch.Load() != plan.Epoch {
-				status = model.DeliveryAbortedEpoch
-				break bubbleLoop
+		// 1. Send text bubbles (or concise lead-in + merged-forward card for long group guides).
+		forwardDelivered := false
+		if len(plan.ForwardNodes) >= 2 && r.epoch.Load() == plan.Epoch {
+			if r.ch.IsGroup() && maxPerMin > 0 && r.outboundRemaining(time.Now(), maxPerMin) <= 0 {
+				_ = r.waitForOutboundSlot(ctx, maxPerMin, 15*time.Second)
 			}
-			if i > 0 {
-				delay := bubbleDelay(b, cfg.Policy.BubbleTypingDelayMax)
-				select {
-				case <-time.After(delay):
-				case <-ctx.Done():
-					if r.epoch.Load() != plan.Epoch {
-						status = model.DeliveryAbortedEpoch
-					} else {
-						status = model.DeliveryPartial
+			botName := r.botDisplayName(cfg)
+			selfID := r.mgr.tr.SelfID()
+			fnodes := make([]transport.ForwardNode, 0, len(plan.ForwardNodes))
+			for _, txt := range plan.ForwardNodes {
+				fnodes = append(fnodes, transport.ForwardNode{
+					SenderID:   selfID,
+					SenderName: botName,
+					Text:       txt,
+				})
+			}
+			fpid, ferr := r.mgr.tr.SendForward(ctx, r.ch, fnodes, botName+" 攻略卡片")
+			if ferr == nil {
+				forwardDelivered = true
+				r.recordOutbound(time.Now())
+				sent = append(sent, model.SentItem{
+					Kind:          "forward",
+					PlatformMsgID: fpid,
+					Text:          plan.RawText,
+					SentAt:        time.Now().UnixMilli(),
+				})
+				if strings.TrimSpace(plan.ForwardLead) != "" && r.epoch.Load() == plan.Epoch {
+					opts := transport.SendOptions{
+						ReplyToMsgID:  plan.ReplyToMsgID,
+						MentionUserID: plan.MentionUserID,
 					}
-					break bubbleLoop
+					if lpid, lerr := r.mgr.tr.SendText(ctx, r.ch, plan.ForwardLead, opts); lerr == nil {
+						r.recordOutbound(time.Now())
+						sent = append(sent, model.SentItem{
+							Kind:          "text",
+							PlatformMsgID: lpid,
+							Text:          plan.ForwardLead,
+							SentAt:        time.Now().UnixMilli(),
+						})
+					} else if errors.Is(lerr, transport.ErrRiskMuted) {
+						status = model.DeliveryAbortedRisk
+						r.engageMute(ctx, cfg)
+					}
 				}
+				_ = r.mgr.store.AppendMessage(ctx, &model.Message{
+					ChannelID:     r.ch,
+					PlatformMsgID: fpid,
+					SenderID:      selfID,
+					SenderName:    botName,
+					FromBot:       true,
+					Parts:         []model.Part{{Kind: model.PartText, Text: plan.RawText}},
+					CreatedAt:     time.Now(),
+				})
+			} else if errors.Is(ferr, transport.ErrRiskMuted) {
+				status = model.DeliveryAbortedRisk
+				r.engageMute(ctx, cfg)
+				forwardDelivered = true // Stop without falling back when risk-muted
+			} else {
+				r.mgr.log.Warn("forward guide delivery failed, falling back to plain bubbles", "channel", r.ch, "err", ferr)
+			}
+		}
+
+		if !forwardDelivered {
+		bubbleLoop:
+			for i, b := range plan.Bubbles {
 				if r.epoch.Load() != plan.Epoch {
 					status = model.DeliveryAbortedEpoch
 					break bubbleLoop
 				}
-			}
-			if r.ch.IsGroup() && maxPerMin > 0 && r.outboundRemaining(time.Now(), maxPerMin) <= 0 {
-				_ = r.waitForOutboundSlot(ctx, maxPerMin, 15*time.Second)
-			}
-			opts := transport.SendOptions{}
-			if i == 0 {
-				opts.ReplyToMsgID = plan.ReplyToMsgID
-				opts.MentionUserID = plan.MentionUserID
-			}
-			pid, err := r.mgr.tr.SendText(ctx, r.ch, b, opts)
-			if err != nil {
-				if errors.Is(err, transport.ErrRiskMuted) {
-					status = model.DeliveryAbortedRisk
-					r.engageMute(ctx, cfg)
-				} else if len(sent) > 0 {
-					status = model.DeliveryPartial
-				} else {
-					status = model.DeliveryFailed
+				if i > 0 {
+					delay := bubbleDelay(b, cfg.Policy.BubbleTypingDelayMax)
+					select {
+					case <-time.After(delay):
+					case <-ctx.Done():
+						if r.epoch.Load() != plan.Epoch {
+							status = model.DeliveryAbortedEpoch
+						} else {
+							status = model.DeliveryPartial
+						}
+						break bubbleLoop
+					}
+					if r.epoch.Load() != plan.Epoch {
+						status = model.DeliveryAbortedEpoch
+						break bubbleLoop
+					}
 				}
-				break bubbleLoop
+				if r.ch.IsGroup() && maxPerMin > 0 && r.outboundRemaining(time.Now(), maxPerMin) <= 0 {
+					_ = r.waitForOutboundSlot(ctx, maxPerMin, 15*time.Second)
+				}
+				opts := transport.SendOptions{}
+				if i == 0 {
+					opts.ReplyToMsgID = plan.ReplyToMsgID
+					opts.MentionUserID = plan.MentionUserID
+				}
+				pid, err := r.mgr.tr.SendText(ctx, r.ch, b, opts)
+				if err != nil {
+					if errors.Is(err, transport.ErrRiskMuted) {
+						status = model.DeliveryAbortedRisk
+						r.engageMute(ctx, cfg)
+					} else if len(sent) > 0 {
+						status = model.DeliveryPartial
+					} else {
+						status = model.DeliveryFailed
+					}
+					break bubbleLoop
+				}
+				r.recordOutbound(time.Now())
+				sent = append(sent, model.SentItem{
+					Kind:          "text",
+					PlatformMsgID: pid,
+					Text:          b,
+					SentAt:        time.Now().UnixMilli(),
+				})
+				// Record bot reply in L0 timeline.
+				_ = r.mgr.store.AppendMessage(ctx, &model.Message{
+					ChannelID:     r.ch,
+					PlatformMsgID: pid,
+					SenderID:      r.mgr.tr.SelfID(),
+					SenderName:    r.botDisplayName(cfg),
+					FromBot:       true,
+					Parts:         []model.Part{{Kind: model.PartText, Text: b}},
+					CreatedAt:     time.Now(),
+				})
 			}
-			r.recordOutbound(time.Now())
-			sent = append(sent, model.SentItem{
-				Kind:          "text",
-				PlatformMsgID: pid,
-				Text:          b,
-				SentAt:        time.Now().UnixMilli(),
-			})
-			// Record bot reply in L0 timeline.
-			_ = r.mgr.store.AppendMessage(ctx, &model.Message{
-				ChannelID:     r.ch,
-				PlatformMsgID: pid,
-				SenderID:      r.mgr.tr.SelfID(),
-				SenderName:    r.botDisplayName(cfg),
-				FromBot:       true,
-				Parts:         []model.Part{{Kind: model.PartText, Text: b}},
-				CreatedAt:     time.Now(),
-			})
 		}
 
 		// 2. Send DirectMedia (e.g. PNG charts from compute/quote) if text succeeded.
@@ -2061,6 +2171,7 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 	r.mgr.log.Info("turn delivered",
 		"channel", r.ch,
 		"trigger", trig.kind,
+		"advisory", plan.Advisory,
 		"status", status,
 		"model", stats.ModelUsed,
 		"fallback", stats.FallbackUsed,
@@ -2072,6 +2183,7 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 		"comp_tok", stats.CompletionTokens,
 		"latency_ms", stats.TotalLatencyMs,
 		"bubbles", len(sent),
+		"forward", len(plan.ForwardNodes) >= 2,
 		"sticker", plan.StickerIntent != "",
 	)
 
@@ -2399,6 +2511,21 @@ func FormatBubbles(text string, pol config.PolicyConfig) []string {
 	}
 
 	if !pol.SplitNewlineBubbles || strings.Contains(text, "```") || containsMarkdownTable(text) {
+		return []string{stripPeriod(text)}
+	}
+	// Preserve structured guides / multi-point advice as cohesive blocks instead of shattering
+	// lines 1..2 into tiny bubbles while dumping lines 3..N together.
+	if IsStructuredReply(text) {
+		paras := strings.Split(text, "\n\n")
+		var cleanParas []string
+		for _, p := range paras {
+			if t := strings.TrimSpace(p); t != "" {
+				cleanParas = append(cleanParas, t)
+			}
+		}
+		if len(cleanParas) == 2 && len([]rune(cleanParas[0])) >= 20 && len([]rune(cleanParas[1])) >= 12 {
+			return []string{stripPeriod(cleanParas[0]), stripPeriod(cleanParas[1])}
+		}
 		return []string{stripPeriod(text)}
 	}
 	rawLines := strings.Split(text, "\n")

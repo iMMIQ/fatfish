@@ -227,3 +227,71 @@ func TestExtractSkipMarker(t *testing.T) {
 		t.Fatalf("expected text+skip to strip marker without skipping, got clean=%q skip=%v", clean3, skip3)
 	}
 }
+
+func TestRunnerAdvisoryOverridesAndMaxToolIterations(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		var req infer.ChatRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.ReasoningEffort != "medium" || req.Temperature == nil || *req.Temperature != 0.55 {
+			t.Errorf("iter %d expected advisory overrides effort=medium temp=0.55, got effort=%q temp=%v", n, req.ReasoningEffort, req.Temperature)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if n <= 7 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"finish_reason": "tool_calls",
+					"message": map[string]any{
+						"tool_calls": []map[string]any{
+							{"id": "c", "type": "function", "function": map[string]any{"name": "read_a", "arguments": `{"x":"step"}`}},
+						},
+					},
+				}},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"finish_reason": "stop",
+				"message":       map[string]any{"content": "deep advisory answer"},
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	st, _ := store.Open(t.TempDir(), 512, 5)
+	defer st.Close()
+	hub := infer.NewHub(config.ModelsConfig{
+		Primary: config.ModelEndpointConfig{BaseURL: srv.URL, Model: "test-model", ReasoningEffort: "low", TimeoutSec: 5},
+	})
+	fb := frame.NewBuilder(st, config.FrameConfig{InputTokenBudget: 32768, TrimHighWater: 0.8, TrimLowWater: 0.5, SegmentIdleMinutes: 30, MaxImagesPerRequest: 6, ImageTokenReserve: 1600})
+	reg := tool.NewRegistry(5 * time.Second)
+	var running, maxConc atomic.Int32
+	_ = tool.Register[stubArgs](reg, &stubReadTool{name: "read_a", running: &running, maxConc: &maxConc})
+	reg.Freeze()
+
+	ch := model.MakeChannelID("onebot", "1", model.ChannelGroup, "4")
+	seg, _, _ := fb.EnsureActiveSegment(context.Background(), ch, 1, frame.ScopeHash("p", reg.Hash(), "test-model"), nil)
+
+	temp := 0.55
+	pp := 0.0
+	out, err := NewRunner(hub, st, fb, reg, nil).Run(context.Background(), TurnInput{
+		ChannelID:         ch,
+		Epoch:             1,
+		Segment:           seg,
+		PersonaText:       "persona",
+		UserPayload:       frame.StoredFramePayload{Role: "user", Text: "guide"},
+		AdvisoryMode:      true,
+		ReasoningEffort:   "medium",
+		Temperature:       &temp,
+		PresencePenalty:   &pp,
+		MaxToolIterations: 8,
+	})
+	if err != nil {
+		t.Fatalf("Runner.Run: %v", err)
+	}
+	if out.Text != "deep advisory answer" || out.Stats.Iterations != 8 {
+		t.Fatalf("expected 8-iter advisory answer, got text=%q iters=%d", out.Text, out.Stats.Iterations)
+	}
+}

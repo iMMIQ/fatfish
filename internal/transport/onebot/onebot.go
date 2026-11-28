@@ -688,6 +688,76 @@ func (c *Client) SendImage(ctx context.Context, ch model.ChannelID, imgBytes []b
 	return c.sendSegments(ctx, ch, segs)
 }
 
+// SendForward sends a merged-forward message card via OneBot `send_group_forward_msg` / `send_private_forward_msg`.
+func (c *Client) SendForward(ctx context.Context, ch model.ChannelID, nodes []transport.ForwardNode, summary string) (string, error) {
+	if len(nodes) == 0 {
+		return "", errors.New("onebot: empty forward nodes")
+	}
+	_, _, kind, nativeID, ok := model.ParseChannelID(ch)
+	if !ok {
+		return "", fmt.Errorf("onebot: invalid channel id %q", ch)
+	}
+	selfID := c.SelfID()
+	msgNodes := make([]map[string]any, 0, len(nodes))
+	for _, n := range nodes {
+		txt := strings.TrimSpace(n.Text)
+		if txt == "" {
+			continue
+		}
+		uin := strings.TrimSpace(n.SenderID)
+		if uin == "" {
+			uin = selfID
+		}
+		name := strings.TrimSpace(n.SenderName)
+		if name == "" {
+			name = "fatfish"
+		}
+		msgNodes = append(msgNodes, map[string]any{
+			"type": "node",
+			"data": map[string]any{
+				"uin":  uin,
+				"name": name,
+				"content": []map[string]any{
+					{"type": "text", "data": map[string]any{"text": txt}},
+				},
+			},
+		})
+	}
+	if len(msgNodes) == 0 {
+		return "", errors.New("onebot: no non-empty forward nodes")
+	}
+
+	params := map[string]any{"messages": msgNodes}
+	if s := strings.TrimSpace(summary); s != "" {
+		params["summary"] = s
+	}
+	var action string
+	if kind == model.ChannelGroup {
+		action = "send_group_forward_msg"
+		if idNum, err := strconv.ParseInt(nativeID, 10, 64); err == nil {
+			params["group_id"] = idNum
+		} else {
+			params["group_id"] = nativeID
+		}
+	} else {
+		action = "send_private_forward_msg"
+		if idNum, err := strconv.ParseInt(nativeID, 10, 64); err == nil {
+			params["user_id"] = idNum
+		} else {
+			params["user_id"] = nativeID
+		}
+	}
+	resp, err := c.callAPI(ctx, action, params)
+	if err != nil {
+		return "", err
+	}
+	var data struct {
+		MessageID any `json:"message_id"`
+	}
+	_ = json.Unmarshal(resp.Data, &data)
+	return anyToString(data.MessageID), nil
+}
+
 func (c *Client) sendSegments(ctx context.Context, ch model.ChannelID, segs []map[string]any) (string, error) {
 	_, _, kind, nativeID, ok := model.ParseChannelID(ch)
 	if !ok {
