@@ -27,6 +27,7 @@ import (
 	"github.com/iMMIQ/fatfish/internal/tool"
 	"github.com/iMMIQ/fatfish/internal/transport"
 	"github.com/iMMIQ/fatfish/internal/transport/onebot"
+	"github.com/iMMIQ/fatfish/internal/travel"
 )
 
 // App wires all fatfish subsystems together and manages lifecycle, hot-reload, and graceful drain.
@@ -38,6 +39,7 @@ type App struct {
 	Frames   *frame.Builder
 	Memory   *memory.Service
 	Stickers *sticker.Engine
+	Travel   *travel.Service
 	Registry *tool.Registry
 	MCP      *tool.MCPBridge
 	Runner   *agent.Runner
@@ -85,6 +87,7 @@ func New(configPath string, enableTransport bool) (*App, error) {
 	memSvc := memory.NewService(st, hub, cfg.Models.Embed.Dim, logger)
 	memSvc.SetIgnoredBots(cfg.Policy.IgnoredBots)
 	stkEng := sticker.NewEngine(st, hub, cfg.Sticker, cfg.Models.Embed.Dim, logger)
+	travelSvc := travel.NewService(st, hub, cfg.Travel, cfg.Location(), cfg.PersonaText, cfg.Tools.ChartFontPath, cfg.Tools.SSRFAllowHosts, logger)
 
 	var tr transport.Transport
 	if enableTransport && (cfg.Transport.OneBot.WSListen != "" || cfg.Transport.OneBot.WSURL != "") {
@@ -120,7 +123,7 @@ func New(configPath string, enableTransport bool) (*App, error) {
 	quoteTool := tool.NewQuoteTool(cfg.Tools.SSRFAllowHosts, computeTool.Renderer())
 	sched.SetPriceFetcher(quoteTool)
 	interactTool := tool.NewInteractTool(tr, cfg.Tools.AllowRelayChannels)
-	if err := registerBuiltins(reg, st, memSvc, stkEng, sched, computeTool, webSearchTool, readSourceTool, quoteTool, interactTool); err != nil {
+	if err := registerBuiltins(reg, st, memSvc, stkEng, sched, computeTool, webSearchTool, readSourceTool, quoteTool, interactTool, travelSvc, cfg.Travel.Enabled); err != nil {
 		_ = st.Close()
 		return nil, err
 	}
@@ -146,12 +149,15 @@ func New(configPath string, enableTransport bool) (*App, error) {
 		Runner:    runner,
 		Memory:    memSvc,
 		Stickers:  stkEng,
+		Travel:    travelSvc,
 		Registry:  reg,
 		Parser:    linkParser,
 		Transport: tr,
 		Logger:    logger,
 	})
 	sched.SetMemoryHooks(memSvc, pol)
+	travelSvc.SetHooks(roomDisp, pol)
+	sched.SetTravelHooks(travelSvc)
 
 	var conSrv *console.Server
 	if cfg.Console.Enabled {
@@ -164,6 +170,7 @@ func New(configPath string, enableTransport bool) (*App, error) {
 			Rooms:    roomDisp,
 			Registry: reg,
 			Stickers: stkEng,
+			Travel:   travelSvc,
 			Logs:     logBuf,
 		})
 		if err != nil {
@@ -182,6 +189,7 @@ func New(configPath string, enableTransport bool) (*App, error) {
 		fb.UpdateConfig(newCfg.Frame)
 		memSvc.SetIgnoredBots(newCfg.Policy.IgnoredBots)
 		stkEng.UpdateConfig(newCfg.Sticker)
+		travelSvc.UpdateConfig(newCfg.Travel, newCfg.Location(), newCfg.PersonaText, newCfg.Tools.ChartFontPath, newCfg.Tools.SSRFAllowHosts)
 		sched.SetMediaQuotas(newCfg.Frame.RoomMediaMiB, newCfg.Frame.TotalMediaMiB)
 		sched.UpdateConfig(newCfg.Location(), newCfg.Tools.MaxSchedulesPerChannel, newCfg.Tools.MinCronIntervalMinutes)
 		reg.UpdateDefaultTimeout(time.Duration(newCfg.Tools.DefaultTimeoutSec) * time.Second)
@@ -202,6 +210,7 @@ func New(configPath string, enableTransport bool) (*App, error) {
 		Frames:   fb,
 		Memory:   memSvc,
 		Stickers: stkEng,
+		Travel:   travelSvc,
 		Registry: reg,
 		MCP:      mcpBridge,
 		Runner:   runner,
@@ -238,6 +247,8 @@ func registerBuiltins(
 	readSource *tool.ReadSourceTool,
 	quote *tool.QuoteTool,
 	interact *tool.InteractTool,
+	travelSvc *travel.Service,
+	travelEnabled bool,
 ) error {
 	if err := tool.Register[tool.RecallArgs](reg, tool.NewRecallTool(mem)); err != nil {
 		return err
@@ -268,6 +279,11 @@ func registerBuiltins(
 	}
 	if err := tool.Register[tool.InteractArgs](reg, interact); err != nil {
 		return err
+	}
+	if travelEnabled && travelSvc != nil {
+		if err := tool.Register[tool.TravelArgs](reg, tool.NewTravelTool(travelSvc)); err != nil {
+			return err
+		}
 	}
 	return nil
 }

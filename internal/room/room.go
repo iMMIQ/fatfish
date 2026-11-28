@@ -30,6 +30,7 @@ import (
 	"github.com/iMMIQ/fatfish/internal/store"
 	"github.com/iMMIQ/fatfish/internal/tool"
 	"github.com/iMMIQ/fatfish/internal/transport"
+	"github.com/iMMIQ/fatfish/internal/travel"
 )
 
 // Manager owns all Per-Channel Room Actors and routes events non-blockingly.
@@ -42,6 +43,7 @@ type Manager struct {
 	runner   *agent.Runner
 	memory   *memory.Service
 	stickers *sticker.Engine
+	travel   *travel.Service
 	registry *tool.Registry
 	parser   *parser.Service
 	tr       transport.Transport
@@ -68,6 +70,7 @@ type Dependencies struct {
 	Runner    *agent.Runner
 	Memory    *memory.Service
 	Stickers  *sticker.Engine
+	Travel    *travel.Service
 	Registry  *tool.Registry
 	Parser    *parser.Service
 	Transport transport.Transport
@@ -97,6 +100,7 @@ func NewManager(deps Dependencies) *Manager {
 		runner:         deps.Runner,
 		memory:         deps.Memory,
 		stickers:       deps.Stickers,
+		travel:         deps.Travel,
 		registry:       deps.Registry,
 		parser:         linkParser,
 		tr:             deps.Transport,
@@ -869,6 +873,12 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 	nowLocal := now.In(cfg.Location())
 	hour := nowLocal.Hour()
 	isNight := hour < 7 || hour >= 23
+	botLocalHour, botSleeping, botInTransit := hour, false, false
+	if r.mgr.travel != nil {
+		if bh, bs, bt, ok := r.mgr.travel.BotClock(now); ok {
+			botLocalHour, botSleeping, botInTransit = bh, bs, bt
+		}
+	}
 	mentionedOther := msg.MentionedOther()
 	repliedToOther := msg.RepliedToOther()
 	mentionedIgnoredBot := r.mentionsIgnoredBot(msg)
@@ -897,6 +907,9 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		CooldownOK:     cooldownOK,
 		IsNight:        isNight,
 		Hour:           hour,
+		BotLocalHour:   botLocalHour,
+		BotSleeping:    botSleeping,
+		BotInTransit:   botInTransit,
 		BurstUsers:     burstUsers,
 		HasLink:        hasLinkCandidate,
 		TextLen:        len([]rune(plain)),
@@ -1476,8 +1489,12 @@ func (r *Room) onSystemTrigger(ev model.SystemTriggerEvent) bool {
 		return false
 	}
 	prefix := "[Scheduled Trigger] "
+	trigKind := "cron"
 	if ev.Kind == "price_alert" {
 		prefix = "[Price Alert Trigger] "
+	} else if ev.Kind == "travel" {
+		prefix = "[Travel Event] "
+		trigKind = "travel"
 	}
 	trigMsg := model.Message{
 		ChannelID:  r.ch,
@@ -1489,7 +1506,7 @@ func (r *Room) onSystemTrigger(ev model.SystemTriggerEvent) bool {
 	r.pendingMsgs = append(r.pendingMsgs, trigMsg)
 	r.pendingTrigger = &triggerState{
 		msg:        trigMsg,
-		kind:       "cron",
+		kind:       trigKind,
 		proactive:  false,
 		enqueuedAt: time.Now(),
 		enqMsgCnt:  r.msgCount.Load(),
@@ -1638,10 +1655,19 @@ func (r *Room) runTurnWorker(
 	seg, closedSeg, err := r.mgr.frames.EnsureActiveSegmentWithClose(
 		ctx, r.ch, startEpoch, scopeHash,
 		func(sctx context.Context) (frame.SnapshotInput, error) {
-			if r.mgr.memory == nil {
-				return frame.SnapshotInput{}, nil
+			now := time.Now()
+			var snap frame.SnapshotInput
+			if r.mgr.memory != nil {
+				var serr error
+				snap, serr = r.mgr.memory.BuildSnapshotWithTime(sctx, r.ch, activeMembers, now, cfg.Location())
+				if serr != nil {
+					return snap, serr
+				}
 			}
-			return r.mgr.memory.BuildSnapshotWithTime(sctx, r.ch, activeMembers, time.Now(), cfg.Location())
+			if r.mgr.travel != nil && r.mgr.travel.Enabled() {
+				snap.TravelStatus = r.mgr.travel.SnapshotForChannel(sctx, r.ch, now, cfg.Location())
+			}
+			return snap, nil
 		},
 		func(sctx context.Context, closed *store.SegmentRecord) string {
 			// Summarize closed segment inline within a short 6s budget so Segment N+1 gets Segment N's summary immediately.

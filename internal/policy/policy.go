@@ -28,6 +28,9 @@ type PolicyEnv struct {
 	CooldownOK   bool    `expr:"cooldown_ok"`
 	IsNight      bool    `expr:"is_night"`
 	Hour         int     `expr:"hour"`
+	BotLocalHour int     `expr:"bot_local_hour"`
+	BotSleeping  bool    `expr:"bot_sleeping"`
+	BotInTransit bool    `expr:"bot_in_transit"`
 	BurstUsers   int     `expr:"burst_users"`
 	NewMsgs      int     `expr:"new_msgs"`
 	WaitSec      float64 `expr:"wait_sec"`

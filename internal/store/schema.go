@@ -261,4 +261,69 @@ CREATE TABLE IF NOT EXISTS kv_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS travel_state (
+    id                 INTEGER PRIMARY KEY CHECK (id = 1),
+    status             TEXT NOT NULL DEFAULT 'staying',
+    current_city_id    TEXT NOT NULL,
+    next_city_id       TEXT NOT NULL DEFAULT '',
+    transport_mode     TEXT NOT NULL DEFAULT '',
+    arrived_at         INTEGER NOT NULL,
+    depart_at          INTEGER NOT NULL,
+    transit_eta        INTEGER NOT NULL DEFAULT 0,
+    weather_summary    TEXT NOT NULL DEFAULT '',
+    weather_code       INTEGER NOT NULL DEFAULT -1,
+    weather_temp_c     REAL NOT NULL DEFAULT 0,
+    weather_updated_at INTEGER NOT NULL DEFAULT 0,
+    last_journal_at    INTEGER NOT NULL DEFAULT 0,
+    last_proactive_at  INTEGER NOT NULL DEFAULT 0,
+    leg_count          INTEGER NOT NULL DEFAULT 1,
+    total_distance_km  REAL NOT NULL DEFAULT 0,
+    started_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS travel_journal (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    city_id    TEXT NOT NULL,
+    city_name  TEXT NOT NULL,
+    country    TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'staying',
+    weather    TEXT NOT NULL DEFAULT '',
+    local_time TEXT NOT NULL DEFAULT '',
+    kind       TEXT NOT NULL DEFAULT 'diary',
+    content    TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_travel_journal_ts ON travel_journal(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_travel_journal_city ON travel_journal(city_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS travel_visits (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    city_id        TEXT NOT NULL,
+    city_name      TEXT NOT NULL,
+    country        TEXT NOT NULL,
+    lat            REAL NOT NULL,
+    lon            REAL NOT NULL,
+    transport_mode TEXT NOT NULL DEFAULT '',
+    distance_km    REAL NOT NULL DEFAULT 0,
+    arrived_at     INTEGER NOT NULL,
+    departed_at    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_travel_visits_ts ON travel_visits(arrived_at DESC);
+
+CREATE TABLE IF NOT EXISTS travel_suggestions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id  TEXT NOT NULL,
+    member_id   TEXT NOT NULL,
+    member_name TEXT NOT NULL,
+    city_id     TEXT NOT NULL,
+    city_name   TEXT NOT NULL,
+    note        TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'pending',
+    created_at  INTEGER NOT NULL,
+    visited_at  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_travel_suggestions_status ON travel_suggestions(status, created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_travel_suggestions_chan_city ON travel_suggestions(channel_id, city_id, status);
 `

@@ -111,6 +111,13 @@ func (b *Builder) BuildPinnedSnapshot(in SnapshotInput) string {
 		sections = append(sections, "[Session Time]\n"+ts)
 	}
 
+	if tr := strings.TrimSpace(in.TravelStatus); tr != "" {
+		trBudget := defaultIfNonPos(cfg.PinnedSnapshotBudgets.Travel, 140)
+		if sec := truncateToTokens(tr, trBudget); sec != "" {
+			sections = append(sections, "[Current Journey]\n"+sec)
+		}
+	}
+
 	if len(in.Lore) > 0 {
 		lines := make([]string, 0, len(in.Lore))
 		for _, l := range in.Lore {

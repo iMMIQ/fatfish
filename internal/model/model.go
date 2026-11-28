@@ -456,10 +456,92 @@ type KVMetric struct {
 // SnapshotInput provides the channel-scoped memory components used ONCE when opening a new Frame segment.
 // Lives in internal/model so internal/memory does not need to import internal/frame (SPEC §2 DAG).
 type SnapshotInput struct {
-	SessionTime      string   // Local date/weekday/period anchor frozen at segment start
+	SessionTime      string // Local date/weekday/period anchor frozen at segment start
+	TravelStatus     string // Optional global bot travel state + local clock + weather + recent micro-diary
 	Lore             []LoreEntry
 	PinnedNotes      []Note
 	PreviousSummary  string
 	RecentHighlights []string // Recent 48h high-signal episodes / digest snippets
 	MemberCards      []string // Pre-formatted active member summaries
+}
+
+// TravelCity defines a real-world destination in the built-in global atlas.
+type TravelCity struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	NameZH      string   `json:"name_zh"`
+	Country     string   `json:"country"`
+	CountryZH   string   `json:"country_zh"`
+	Region      string   `json:"region"` // "east_asia" | "se_asia" | "south_asia" | "middle_east" | "europe" | "north_america" | "south_america" | "africa" | "oceania" | "polar"
+	Lat         float64  `json:"lat"`
+	Lon         float64  `json:"lon"`
+	Timezone    string   `json:"timezone"` // IANA timezone e.g. "Asia/Tokyo"
+	Currency    string   `json:"currency"` // ISO 4217 e.g. "JPY"
+	AirportCode string   `json:"airport_code"`
+	Tags        []string `json:"tags"`
+	Vibe        string   `json:"vibe"`
+}
+
+// TravelState persists the bot's global, cross-channel consistent world-travel state machine.
+type TravelState struct {
+	Status           string    `json:"status"` // "staying" | "in_transit"
+	CurrentCityID    string    `json:"current_city_id"`
+	NextCityID       string    `json:"next_city_id,omitempty"`
+	TransportMode    string    `json:"transport_mode,omitempty"` // "flight" | "train" | "ferry"
+	ArrivedAt        time.Time `json:"arrived_at"`
+	DepartAt         time.Time `json:"depart_at"`
+	TransitETA       time.Time `json:"transit_eta,omitempty"`
+	WeatherSummary   string    `json:"weather_summary,omitempty"`
+	WeatherCode      int       `json:"weather_code"`
+	WeatherTempC     float64   `json:"weather_temp_c"`
+	WeatherUpdatedAt time.Time `json:"weather_updated_at,omitempty"`
+	LastJournalAt    time.Time `json:"last_journal_at,omitempty"`
+	LastProactiveAt  time.Time `json:"last_proactive_at,omitempty"`
+	LegCount         int       `json:"leg_count"`
+	TotalDistanceKm  float64   `json:"total_distance_km"`
+	StartedAt        time.Time `json:"started_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+// TravelJournalEntry records a short, persona-voiced micro-diary entry along the journey.
+type TravelJournalEntry struct {
+	ID        int64     `json:"id"`
+	CityID    string    `json:"city_id"`
+	CityName  string    `json:"city_name"`
+	Country   string    `json:"country"`
+	Status    string    `json:"status"` // "staying" | "in_transit"
+	Weather   string    `json:"weather,omitempty"`
+	LocalTime string    `json:"local_time,omitempty"`
+	Kind      string    `json:"kind"` // "diary" | "arrival" | "departure" | "extreme_weather"
+	Content   string    `json:"content"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// TravelVisit records a visited city leg in chronological order for footprint maps & history.
+type TravelVisit struct {
+	ID            int64     `json:"id"`
+	CityID        string    `json:"city_id"`
+	CityName      string    `json:"city_name"`
+	Country       string    `json:"country"`
+	Lat           float64   `json:"lat"`
+	Lon           float64   `json:"lon"`
+	TransportMode string    `json:"transport_mode,omitempty"`
+	DistanceKm    float64   `json:"distance_km"`
+	ArrivedAt     time.Time `json:"arrived_at"`
+	DepartedAt    time.Time `json:"departed_at,omitempty"`
+}
+
+// TravelSuggestion records a channel-scoped member suggestion for the next travel destination.
+// Attribution (MemberID/MemberName) is strictly scoped to ChannelID (never leaked across channels).
+type TravelSuggestion struct {
+	ID         int64     `json:"id"`
+	ChannelID  ChannelID `json:"channel_id"`
+	MemberID   string    `json:"member_id"`
+	MemberName string    `json:"member_name"`
+	CityID     string    `json:"city_id"`
+	CityName   string    `json:"city_name"`
+	Note       string    `json:"note,omitempty"`
+	Status     string    `json:"status"` // "pending" | "selected" | "visited" | "expired"
+	CreatedAt  time.Time `json:"created_at"`
+	VisitedAt  time.Time `json:"visited_at,omitempty"`
 }

@@ -23,6 +23,7 @@ import (
 	"github.com/iMMIQ/fatfish/internal/sticker"
 	"github.com/iMMIQ/fatfish/internal/store"
 	"github.com/iMMIQ/fatfish/internal/tool"
+	"github.com/iMMIQ/fatfish/internal/travel"
 	"github.com/iMMIQ/fatfish/web"
 )
 
@@ -37,6 +38,7 @@ type Dependencies struct {
 	Rooms    *room.Manager
 	Registry *tool.Registry
 	Stickers *sticker.Engine
+	Travel   *travel.Service
 	Logs     *LogBroadcaster
 }
 
@@ -111,6 +113,12 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("GET /api/stickers/image", s.auth(http.HandlerFunc(s.handleStickerImage)))
 	mux.Handle("POST /api/stickers/approve", s.auth(http.HandlerFunc(s.handleStickerApprove)))
 	mux.Handle("POST /api/stickers/reject", s.auth(http.HandlerFunc(s.handleStickerReject)))
+	mux.Handle("GET /travel", s.auth(http.HandlerFunc(s.handleTravelPage)))
+	mux.Handle("GET /api/travel/map.png", s.auth(http.HandlerFunc(s.handleTravelMapPNG)))
+	mux.Handle("GET /api/travel/ticket.png", s.auth(http.HandlerFunc(s.handleTravelTicketPNG)))
+	mux.Handle("POST /api/travel/go", s.auth(http.HandlerFunc(s.handleTravelForceGo)))
+	mux.Handle("POST /api/travel/diary", s.auth(http.HandlerFunc(s.handleTravelDiaryNow)))
+	mux.Handle("POST /api/travel/weather", s.auth(http.HandlerFunc(s.handleTravelWeatherNow)))
 	mux.Handle("GET /logs", s.auth(http.HandlerFunc(s.handleLogsPage)))
 	mux.Handle("GET /api/logs/stream", s.auth(http.HandlerFunc(s.handleLogsStream)))
 
@@ -476,6 +484,101 @@ func (s *Server) handleStickerReject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = w.Write([]byte(`<span class="muted">Rejected</span>`))
+}
+
+func (s *Server) handleTravelPage(w http.ResponseWriter, r *http.Request) {
+	data := map[string]any{
+		"Page":        "travel",
+		"TravelReady": s.deps.Travel != nil,
+		"Cities":      travel.AllCities(),
+		"CacheBust":   time.Now().Unix(),
+	}
+	if s.deps.Travel != nil {
+		if ov, err := s.deps.Travel.Overview(r.Context()); err == nil {
+			data["Overview"] = ov
+		} else {
+			data["Error"] = err.Error()
+		}
+	}
+	_ = s.tmpl.Execute(w, data)
+}
+
+func (s *Server) handleTravelMapPNG(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Travel == nil {
+		http.NotFound(w, r)
+		return
+	}
+	raw, err := s.deps.Travel.RenderMapPNG(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(raw)
+}
+
+func (s *Server) handleTravelTicketPNG(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Travel == nil {
+		http.NotFound(w, r)
+		return
+	}
+	raw, err := s.deps.Travel.RenderBoardingPassPNG(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(raw)
+}
+
+func (s *Server) handleTravelForceGo(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Travel == nil {
+		http.Error(w, "travel unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	city := strings.TrimSpace(r.FormValue("city"))
+	instant := r.FormValue("instant") == "1"
+	_, target, err := s.deps.Travel.ForceTravel(r.Context(), city, instant)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`<span class="badge err">` + html.EscapeString(err.Error()) + `</span>`))
+		return
+	}
+	mode := "departed toward"
+	if instant {
+		mode = "arrived at"
+	}
+	_, _ = w.Write([]byte(`<span class="badge ok">` + html.EscapeString(fmt.Sprintf("%s %s·%s (%s)", mode, target.CountryZH, target.NameZH, target.AirportCode)) + ` — refresh page to view</span>`))
+}
+
+func (s *Server) handleTravelDiaryNow(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Travel == nil {
+		http.Error(w, "travel unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	entry, err := s.deps.Travel.TriggerDiaryNow(r.Context())
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`<span class="badge err">` + html.EscapeString(err.Error()) + `</span>`))
+		return
+	}
+	_, _ = w.Write([]byte(`<span class="badge ok">New entry: ` + html.EscapeString(entry.Content) + `</span>`))
+}
+
+func (s *Server) handleTravelWeatherNow(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Travel == nil {
+		http.Error(w, "travel unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	info, err := s.deps.Travel.RefreshWeatherNow(r.Context())
+	if err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`<span class="badge err">` + html.EscapeString(err.Error()) + `</span>`))
+		return
+	}
+	_, _ = w.Write([]byte(`<span class="badge ok">Weather updated: ` + html.EscapeString(info.Summary) + `</span>`))
 }
 
 func (s *Server) handleLogsPage(w http.ResponseWriter, _ *http.Request) {

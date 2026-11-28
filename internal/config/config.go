@@ -31,7 +31,8 @@ type Config struct {
 	Policy     PolicyConfig     `yaml:"policy"`
 	LinkParser LinkParserConfig `yaml:"link_parser"`
 	Sticker    StickerConfig    `yaml:"sticker"`
-	Tools     ToolsConfig     `yaml:"tools"`
+	Travel     TravelConfig     `yaml:"travel"`
+	Tools      ToolsConfig      `yaml:"tools"`
 	MCP       MCPConfig       `yaml:"mcp"`
 	Console   ConsoleConfig   `yaml:"console"`
 
@@ -119,6 +120,7 @@ type PinnedSnapshotBudgets struct {
 	Notes      int `yaml:"notes"`
 	Profiles   int `yaml:"profiles"`
 	Highlights int `yaml:"highlights"`
+	Travel     int `yaml:"travel"`
 }
 
 type PolicyConfig struct {
@@ -213,6 +215,24 @@ type StickerConfig struct {
 	AsyncSendTimeoutSec  int     `yaml:"async_send_timeout_sec"`
 	MaxSendMiB           int     `yaml:"max_send_mib"`
 	AutoCollect          bool    `yaml:"auto_collect"`
+}
+
+// TravelConfig configures the optional global continuous world-travel life-simulation subsystem.
+type TravelConfig struct {
+	Enabled                 bool     `yaml:"enabled"`
+	HomeCity                string   `yaml:"home_city"`                  // Starting city ID or name (default "hangzhou")
+	RouteStyle              string   `yaml:"route_style"`                // "realistic" | "wander"
+	StayMinDays             int      `yaml:"stay_min_days"`              // Minimum stay per city (default 3)
+	StayMaxDays             int      `yaml:"stay_max_days"`              // Maximum stay per city (default 6)
+	JournalIntervalHours    float64  `yaml:"journal_interval_hours"`     // Hours between micro-diary entries (default 5.0)
+	WeatherIntervalHours    float64  `yaml:"weather_interval_hours"`     // Hours between Open-Meteo weather refreshes (default 3.0)
+	JournalModel            string   `yaml:"journal_model"`              // Inference hub role: "primary" | "fast" | "distill" (default "primary")
+	AllowSuggestions        bool     `yaml:"allow_suggestions"`          // Allow group members to suggest next stop via travel tool
+	ProactiveEnabled        bool     `yaml:"proactive_enabled"`          // Emit low-frequency arrival/extreme-weather check-ins
+	ProactiveChannels       []string `yaml:"proactive_channels"`         // Allowed channel IDs / native IDs, or ["*"] for all allowed channels
+	ProactiveQuietStartHour int      `yaml:"proactive_quiet_start_hour"` // Config TZ hour to begin quiet window (default 23)
+	ProactiveQuietEndHour   int      `yaml:"proactive_quiet_end_hour"`   // Config TZ hour to end quiet window (default 9)
+	ProactiveMinGapHours    float64  `yaml:"proactive_min_gap_hours"`    // Minimum hours between proactive travel posts (default 36)
 }
 
 type ToolsConfig struct {
@@ -322,6 +342,7 @@ func defaultConfig() *Config {
 				Notes:      140,
 				Profiles:   220,
 				Highlights: 220,
+				Travel:     140,
 			},
 			MaxImagesPerRequest: 6,
 			MaxBackgroundImages: 2,
@@ -396,6 +417,21 @@ func defaultConfig() *Config {
 			MMRLambda:            0.7,
 			AsyncSendTimeoutSec:  15,
 			MaxSendMiB:           5,
+		},
+		Travel: TravelConfig{
+			Enabled:                 false,
+			HomeCity:                "hangzhou",
+			RouteStyle:              "realistic",
+			StayMinDays:             3,
+			StayMaxDays:             6,
+			JournalIntervalHours:    5.0,
+			WeatherIntervalHours:    3.0,
+			JournalModel:            "primary",
+			AllowSuggestions:        true,
+			ProactiveEnabled:        false,
+			ProactiveQuietStartHour: 23,
+			ProactiveQuietEndHour:   9,
+			ProactiveMinGapHours:    36,
 		},
 		Tools: ToolsConfig{
 			DefaultTimeoutSec:      30,
@@ -524,6 +560,39 @@ func applyDefaults(cfg *Config) {
 	if cfg.Sticker.MaxSendMiB <= 0 {
 		cfg.Sticker.MaxSendMiB = 5
 	}
+	if cfg.Frame.PinnedSnapshotBudgets.Travel <= 0 {
+		cfg.Frame.PinnedSnapshotBudgets.Travel = 140
+	}
+	if strings.TrimSpace(cfg.Travel.HomeCity) == "" {
+		cfg.Travel.HomeCity = "hangzhou"
+	}
+	if strings.TrimSpace(cfg.Travel.RouteStyle) == "" {
+		cfg.Travel.RouteStyle = "realistic"
+	}
+	if cfg.Travel.StayMinDays <= 0 {
+		cfg.Travel.StayMinDays = 3
+	}
+	if cfg.Travel.StayMaxDays < cfg.Travel.StayMinDays {
+		cfg.Travel.StayMaxDays = cfg.Travel.StayMinDays + 2
+	}
+	if cfg.Travel.JournalIntervalHours <= 0 {
+		cfg.Travel.JournalIntervalHours = 5.0
+	}
+	if cfg.Travel.WeatherIntervalHours <= 0 {
+		cfg.Travel.WeatherIntervalHours = 3.0
+	}
+	if strings.TrimSpace(cfg.Travel.JournalModel) == "" {
+		cfg.Travel.JournalModel = "primary"
+	}
+	if cfg.Travel.ProactiveMinGapHours <= 0 {
+		cfg.Travel.ProactiveMinGapHours = 36
+	}
+	if cfg.Travel.ProactiveQuietStartHour < 0 || cfg.Travel.ProactiveQuietStartHour > 23 {
+		cfg.Travel.ProactiveQuietStartHour = 23
+	}
+	if cfg.Travel.ProactiveQuietEndHour < 0 || cfg.Travel.ProactiveQuietEndHour > 23 {
+		cfg.Travel.ProactiveQuietEndHour = 9
+	}
 	if cfg.Tools.DefaultTimeoutSec <= 0 {
 		cfg.Tools.DefaultTimeoutSec = 30
 	}
@@ -586,6 +655,16 @@ func validateBasic(cfg *Config) error {
 	}
 	if cfg.Sticker.DocCenteringAlpha < 0 || cfg.Sticker.DocCenteringAlpha > 1 {
 		return errors.New("config: sticker.doc_centering_alpha must be in [0, 1]")
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.Travel.RouteStyle)) {
+	case "", "realistic", "wander":
+	default:
+		return fmt.Errorf("config: invalid travel.route_style %q (use realistic|wander)", cfg.Travel.RouteStyle)
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.Travel.JournalModel)) {
+	case "", "primary", "fast", "distill":
+	default:
+		return fmt.Errorf("config: invalid travel.journal_model %q (use primary|fast|distill)", cfg.Travel.JournalModel)
 	}
 	return nil
 }

@@ -44,6 +44,7 @@
     <a href="/config" class="{{if eq .Page "config"}}active{{end}}">Config & Policy</a>
     <a href="/memory" class="{{if eq .Page "memory"}}active{{end}}">Memory</a>
     <a href="/stickers" class="{{if eq .Page "stickers"}}active{{end}}">Stickers</a>
+    <a href="/travel" class="{{if eq .Page "travel"}}active{{end}}">Travel</a>
     <a href="/logs" class="{{if eq .Page "logs"}}active{{end}}">Live Logs</a>
   </nav>
   {{end}}
@@ -273,6 +274,123 @@
       </tbody>
     </table>
   </div>
+
+{{else if eq .Page "travel"}}
+  {{if .Error}}<div class="card"><span class="badge err">{{.Error}}</span></div>{{end}}
+  {{if .Overview}}
+  {{$ov := .Overview}}
+  <div class="grid">
+    <div class="card">
+      <div class="muted">Current Location</div>
+      <div class="kpi">{{$ov.CurrentCity.CountryZH}}·{{$ov.CurrentCity.NameZH}}</div>
+      <div class="muted">{{$ov.CurrentCity.Name}} ({{$ov.CurrentCity.AirportCode}}) · {{if $ov.Enabled}}<span class="badge ok">enabled</span>{{else}}<span class="badge warn">disabled</span>{{end}}</div>
+    </div>
+    <div class="card">
+      <div class="muted">Local Clock &amp; Jet Lag</div>
+      <div class="kpi" style="font-size:18px;">{{$ov.LocalTimeStr}}</div>
+      <div class="muted">{{$ov.TimezoneDelta}}</div>
+    </div>
+    <div class="card">
+      <div class="muted">Status &amp; Weather</div>
+      <div class="kpi" style="font-size:18px;">{{if eq $ov.State.Status "in_transit"}}In Transit{{if $ov.NextCity}} → {{$ov.NextCity.NameZH}}{{end}}{{else}}Staying (Day {{$ov.DaysOnRoad}}){{end}}</div>
+      <div class="muted">{{if $ov.State.WeatherSummary}}{{$ov.State.WeatherSummary}}{{else}}Weather pending{{end}}</div>
+    </div>
+    <div class="card">
+      <div class="muted">Footprints &amp; Distance</div>
+      <div class="kpi">{{$ov.CitiesVisited}} <span class="muted">cities / {{$ov.CountriesCount}} countries</span></div>
+      <div class="muted">{{printf "%.0f" $ov.State.TotalDistanceKm}} km · Leg #{{$ov.State.LegCount}}</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Live Controls</h2>
+    <form hx-post="/api/travel/go" hx-target="#travel-action-status" class="row">
+      <input name="city" list="travel-cities" placeholder="Target city e.g. 里斯本 / Reykjavik / Tokyo" required />
+      <datalist id="travel-cities">
+        {{range .Cities}}<option value="{{.NameZH}}">{{.CountryZH}}·{{.NameZH}} ({{.Name}} / {{.AirportCode}})</option>{{end}}
+      </datalist>
+      <label style="flex:0 0 auto;display:flex;align-items:center;gap:4px;font-size:12px;">
+        <input type="checkbox" name="instant" value="1" checked style="width:auto;" /> Instant arrive
+      </label>
+      <button type="submit" style="flex:0 0 auto;">Go Now</button>
+    </form>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+      <button type="button" class="secondary" hx-post="/api/travel/diary" hx-target="#travel-action-status">Write Diary Now</button>
+      <button type="button" class="secondary" hx-post="/api/travel/weather" hx-target="#travel-action-status">Refresh Weather</button>
+      <div id="travel-action-status"></div>
+    </div>
+  </div>
+
+  <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(420px,1fr));">
+    <div class="card">
+      <h3>World Footprint Map</h3>
+      <img src="/api/travel/map.png?t={{.CacheBust}}" alt="World Footprint Map" style="width:100%;border-radius:6px;border:1px solid var(--border);" />
+    </div>
+    <div class="card">
+      <h3>Current Boarding Pass / Postcard</h3>
+      <img src="/api/travel/ticket.png?t={{.CacheBust}}" alt="Boarding Pass" style="width:100%;border-radius:6px;border:1px solid var(--border);" />
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Segment-Pinned Snapshot Preview ([msg 1])</h3>
+    <pre style="margin:0;white-space:pre-wrap;background:#0b1220;border:1px solid var(--border);border-radius:6px;padding:10px;font-size:12px;">{{if $ov.SnapshotPreview}}{{$ov.SnapshotPreview}}{{else}}(disabled or empty){{end}}</pre>
+  </div>
+
+  <div class="card">
+    <h3>Travel Micro-Journal</h3>
+    <table>
+      <thead><tr><th>Local Time</th><th>City</th><th>Kind</th><th>Weather</th><th>Entry</th></tr></thead>
+      <tbody>
+        {{range $ov.Journal}}
+        <tr>
+          <td class="muted">{{.LocalTime}}</td>
+          <td>{{.Country}}·{{.CityName}}</td>
+          <td><span class="badge ok">{{.Kind}}</span></td>
+          <td class="muted">{{.Weather}}</td>
+          <td>{{.Content}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(380px,1fr));">
+    <div class="card">
+      <h3>Visited Cities</h3>
+      <table>
+        <thead><tr><th>Arrived</th><th>City</th><th>Leg</th></tr></thead>
+        <tbody>
+          {{range $ov.Visits}}
+          <tr>
+            <td class="muted">{{.ArrivedAt.Format "2006-01-02 15:04"}}</td>
+            <td>{{.Country}}·{{.CityName}}</td>
+            <td class="muted">{{if gt .DistanceKm 0.0}}{{.TransportMode}} {{printf "%.0f" .DistanceKm}}km{{else}}start{{end}}</td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h3>Member Suggestions (Channel-Scoped)</h3>
+      <table>
+        <thead><tr><th>City</th><th>Member</th><th>Note</th><th>Status</th></tr></thead>
+        <tbody>
+          {{range $ov.Suggestions}}
+          <tr>
+            <td>{{.CityName}}</td>
+            <td class="muted">{{.MemberName}}</td>
+            <td class="muted">{{.Note}}</td>
+            <td><span class="badge {{if eq .Status "visited"}}ok{{else if eq .Status "selected"}}warn{{else}}ok{{end}}">{{.Status}}</span></td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {{else}}
+  <div class="card"><p class="muted">Travel service not initialized.</p></div>
+  {{end}}
 
 {{else if eq .Page "logs"}}
   <div class="card">

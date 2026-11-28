@@ -85,6 +85,7 @@ frame:
     notes: 140
     profiles: 220
     highlights: 220
+    travel: 140
   max_images_per_request: 6
   max_background_images: 2
   image_token_reserve: 1600
@@ -169,6 +170,22 @@ sticker:
   async_send_timeout_sec: 15
   max_send_mib: 5
   auto_collect: false
+
+travel:
+  enabled: false
+  home_city: "hangzhou"
+  route_style: "realistic"       # realistic | wander
+  stay_min_days: 3
+  stay_max_days: 6
+  journal_interval_hours: 5.0
+  weather_interval_hours: 3.0
+  journal_model: "primary"       # primary | fast | distill
+  allow_suggestions: true
+  proactive_enabled: false
+  proactive_channels: []         # explicit channel/group IDs, or ["*"] for all allowed channels
+  proactive_quiet_start_hour: 23
+  proactive_quiet_end_hour: 9
+  proactive_min_gap_hours: 36
 
 tools:
   default_timeout_sec: 30

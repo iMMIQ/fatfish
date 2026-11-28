@@ -83,3 +83,31 @@ func TestPolicyInvalidExprRejected(t *testing.T) {
 		t.Fatalf("expected compile error for unknown PolicyEnv field")
 	}
 }
+
+func TestBotTravelClockPolicyEnv(t *testing.T) {
+	cfg := config.PolicyConfig{
+		Rules: config.PolicyRulesConfig{
+			ReplyGate: "mentioned || replied_to_bot || poked || (in_thread && thread_turns < 3) || (cooldown_ok && !mentioned_other && !replied_to_other && (hit_nickname ? ((is_night || bot_sleeping || bot_in_transit) ? rand < 0.40 : rand < 0.72) : ((is_night || bot_sleeping || bot_in_transit) ? rand < 0.01 : (burst_users >= 3 ? rand < 0.12 : rand < 0.06))))",
+		},
+	}
+	eng, err := NewEngine(cfg)
+	if err != nil {
+		t.Fatalf("compile travel-aware reply_gate: %v", err)
+	}
+	ch := model.MakeChannelID("onebot", "100001", model.ChannelGroup, "999")
+	// Explicit mention still replies while sleeping/in_transit
+	ok, err := eng.EvalReplyGate(ch, PolicyEnv{Mentioned: true, BotSleeping: true, BotInTransit: true, BotLocalHour: 3, Rand: 0.99})
+	if err != nil || !ok {
+		t.Fatalf("expected mentioned reply while sleeping, ok=%v err=%v", ok, err)
+	}
+	// Random proactive suppressed when bot_sleeping with rand=0.05
+	ok, err = eng.EvalReplyGate(ch, PolicyEnv{CooldownOK: true, BotSleeping: true, BotLocalHour: 3, Rand: 0.05})
+	if err != nil || ok {
+		t.Fatalf("expected suppressed proactive while bot_sleeping, ok=%v err=%v", ok, err)
+	}
+	// Random proactive allowed when awake with rand=0.05
+	ok, err = eng.EvalReplyGate(ch, PolicyEnv{CooldownOK: true, BotSleeping: false, BotLocalHour: 15, Rand: 0.05})
+	if err != nil || !ok {
+		t.Fatalf("expected allowed proactive while awake, ok=%v err=%v", ok, err)
+	}
+}

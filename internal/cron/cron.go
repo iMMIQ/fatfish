@@ -38,6 +38,12 @@ type ChannelFilter interface {
 	ChannelAllowed(ch model.ChannelID) bool
 }
 
+// TravelHooks lets the scheduler advance the global continuous world-travel state machine
+// without introducing package cycles.
+type TravelHooks interface {
+	Tick(ctx context.Context, now time.Time) error
+}
+
 // Scheduler polls persistent SQLite schedules and posts SystemTriggerEvents into Rooms,
 // and runs periodic maintenance (hourly incremental memory distill, daily digests, WAL/media quota cleanup).
 type Scheduler struct {
@@ -45,6 +51,7 @@ type Scheduler struct {
 	hub            *infer.Hub
 	dispatcher     Dispatcher
 	memHooks       MemoryHooks
+	travelHooks    TravelHooks
 	chanFilter     ChannelFilter
 	loc            *time.Location
 	maxPerChannel  int
@@ -61,12 +68,27 @@ type Scheduler struct {
 	digestBusy  atomic.Bool
 	maintBusy   atomic.Bool
 	alertBusy   atomic.Bool
+	travelBusy  atomic.Bool
 }
 
 // SetMemoryHooks attaches optional in-process incremental memory distillation and channel filtering.
 func (s *Scheduler) SetMemoryHooks(hooks MemoryHooks, filter ChannelFilter) {
 	s.memHooks = hooks
 	s.chanFilter = filter
+}
+
+// SetTravelHooks attaches the optional continuous world-travel background ticker.
+func (s *Scheduler) SetTravelHooks(hooks TravelHooks) {
+	s.mu.Lock()
+	s.travelHooks = hooks
+	s.mu.Unlock()
+}
+
+func (s *Scheduler) getTravelHooks() TravelHooks {
+	s.mu.RLock()
+	h := s.travelHooks
+	s.mu.RUnlock()
+	return h
 }
 
 func NewScheduler(st *store.Store, hub *infer.Hub, disp Dispatcher, loc *time.Location, maxPerChannel, minIntervalMin, embedDim int, logger *slog.Logger) *Scheduler {
@@ -240,20 +262,45 @@ func (s *Scheduler) CreateScheduleWithMarket(ctx context.Context, ch model.Chann
 func (s *Scheduler) Start(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
 	alertTicker := time.NewTicker(60 * time.Second)
+	travelTicker := time.NewTicker(5 * time.Minute)
+	travelBoot := time.NewTimer(15 * time.Second)
 	distillTicker := time.NewTicker(1 * time.Hour)
 	maintTicker := time.NewTicker(6 * time.Hour)
 	defer ticker.Stop()
 	defer alertTicker.Stop()
+	defer travelTicker.Stop()
+	defer travelBoot.Stop()
 	defer distillTicker.Stop()
 	defer maintTicker.Stop()
 
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
+	runTravel := func(ts time.Time) {
+		th := s.getTravelHooks()
+		if th == nil {
+			return
+		}
+		if s.travelBusy.CompareAndSwap(false, true) {
+			wg.Add(1)
+			go func(t time.Time) {
+				defer wg.Done()
+				defer s.travelBusy.Store(false)
+				if err := th.Tick(ctx, t); err != nil && ctx.Err() == nil {
+					s.log.Warn("travel tick failed", "err", err)
+				}
+			}(ts)
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case now := <-travelBoot.C:
+			runTravel(now)
+		case now := <-travelTicker.C:
+			runTravel(now)
 		case now := <-ticker.C:
 			s.tick(ctx, now)
 			if s.digestBusy.CompareAndSwap(false, true) {
