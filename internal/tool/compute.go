@@ -30,7 +30,7 @@ const (
 var ErrStarlarkOOMBlocked = errors.New("compute: blocked unsafe allocation pattern in Starlark AST")
 
 type ComputeArgs struct {
-	Code string `json:"code" jsonschema:"required,description=Starlark script to execute. Preloaded modules: math, json, time, stats, finance, chart. Use print() for output."`
+	Code string `json:"code" jsonschema:"required,description=Starlark script to execute. Preloaded: math, json, time, stats, finance, chart. Guide visuals: chart.card(title, sections=[{'heading':'Day1 ...','items':['...']}], subtitle='...', footer='避坑: ...'); chart.table(title, headers=['维度','方案A','方案B'], rows=[['预算','...','...']], subtitle='...', highlight_col=1). Use print() for text output."`
 }
 
 type ComputeTool struct {
@@ -57,7 +57,7 @@ func (t *ComputeTool) Renderer() *ChartRenderer { return t.renderer }
 func (t *ComputeTool) Name() string             { return "compute" }
 func (t *ComputeTool) ReadOnly() bool           { return true }
 func (t *ComputeTool) Description() string {
-	return "Execute pure-Go Starlark calculations with preloaded math, json, time, stats (mean/median/stdev/percentile/corr/linreg), finance (pmt/npv/irr/xirr/cagr/drawdown/dca/volatility/sharpe/sortino/sma/ema/rsi/macd/bollinger/bs_option), and chart (line/bar/pie/scatter/kline/compare/table/card PNG)."
+	return "Execute pure-Go Starlark calculations with preloaded math, json, time, stats (mean/median/stdev/percentile/corr/linreg), finance (pmt/npv/irr/xirr/cagr/drawdown/dca/volatility/sharpe/sortino/sma/ema/rsi/macd/bollinger/bs_option), and chart (line/bar/pie/scatter/kline/compare PNG, plus chart.table(title, headers, rows, subtitle, highlight_col) and chart.card(title, sections, subtitle, footer) for travel itineraries & side-by-side comparisons)."
 }
 
 // ValidateStarlarkAST inspects the parsed AST before execution to block single-step & exponential OOM DoS

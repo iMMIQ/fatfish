@@ -293,10 +293,11 @@ type Room struct {
 	turnCancel context.CancelFunc
 
 	// Thread continuation state
-	threadUserID   string
-	threadTurns    int
-	threadLastAt   time.Time
-	threadAdvisory bool
+	threadUserID         string
+	threadTurns          int
+	threadLastAt         time.Time
+	threadAdvisory       bool
+	threadAdvisoryDomain AdvisoryDomain
 
 	// +1 repeater state
 	plusOnePhrase string
@@ -318,6 +319,7 @@ type turnOutcome struct {
 	proactiveActed   bool
 	skippedThread    bool
 	advisory         bool
+	advisoryDomain   AdvisoryDomain
 	uncommittedBatch []model.Message
 	segID            int64
 	seenMembers      []string
@@ -353,6 +355,7 @@ type triggerState struct {
 	kind             string // "mention" | "reply" | "poke" | "thread" | "proactive" | "dm" | "cron"
 	proactive        bool
 	inAdvisoryThread bool
+	advisoryDomain   AdvisoryDomain
 	enqueuedAt       time.Time
 	enqMsgCnt        uint64
 }
@@ -611,6 +614,7 @@ func (r *Room) onAdminCommand(cmd model.AdminCommand) {
 		r.threadUserID = ""
 		r.threadTurns = 0
 		r.threadAdvisory = false
+		r.threadAdvisoryDomain = AdvisoryDomainNone
 		if cmd.Reply != nil {
 			cmd.Reply <- fmt.Sprintf("已重置当前频道上下文 (epoch=%d)", r.epoch.Load())
 		}
@@ -1095,11 +1099,18 @@ func (r *Room) onMessage(msg *model.Message) (time.Duration, bool) {
 		return 0, false
 	}
 
+	inAdvisoryActive := r.threadAdvisory &&
+		r.threadUserID == msg.SenderID &&
+		!mentionedOther &&
+		!repliedToOther &&
+		time.Since(r.threadLastAt) <= time.Duration(threadWindowSec)*time.Second
+
 	r.pendingTrigger = &triggerState{
 		msg:              cloneMessage(*msg),
 		kind:             trigKind,
 		proactive:        proactive,
-		inAdvisoryThread: inThread && r.threadAdvisory,
+		inAdvisoryThread: inAdvisoryActive,
+		advisoryDomain:   r.threadAdvisoryDomain,
 		enqueuedAt:       time.Now(),
 		enqMsgCnt:        r.msgCount.Load(),
 	}
@@ -1576,6 +1587,7 @@ func (r *Room) applyTurnOutcome(out turnOutcome) {
 		r.threadUserID = ""
 		r.threadTurns = 0
 		r.threadAdvisory = false
+		r.threadAdvisoryDomain = AdvisoryDomainNone
 	}
 	if out.segID > 0 {
 		if out.segID != r.lastSegID {
@@ -1603,6 +1615,7 @@ func (r *Room) applyTurnOutcome(out turnOutcome) {
 				r.threadTurns = 1
 			}
 			r.threadAdvisory = out.advisory
+			r.threadAdvisoryDomain = out.advisoryDomain
 			r.threadLastAt = time.Now()
 		}
 		return
@@ -1732,9 +1745,13 @@ func (r *Room) runTurnWorker(
 		batch, cfg.Location(), newMemberDelta, trig.msg.PlatformMsgID,
 		cfg.Frame.MaxBackgroundImages, cfg.Frame.MaxImagesPerRequest,
 	)
-	advisoryMode := cfg.Policy.Advisory.IsEnabled() &&
-		DetectAdvisoryIntent(trig.msg.TextOnly(), trig.kind, trig.inAdvisoryThread)
+	advisoryDomain := AdvisoryDomainNone
+	if cfg.Policy.Advisory.IsEnabled() {
+		advisoryDomain = DetectAdvisoryDomainWithPrev(trig.msg.TextOnly(), trig.kind, trig.inAdvisoryThread, trig.advisoryDomain)
+	}
+	advisoryMode := advisoryDomain != AdvisoryDomainNone
 	outcome.advisory = advisoryMode
+	outcome.advisoryDomain = advisoryDomain
 
 	if trig.kind == "plus_one_break" {
 		userPayload.Text += "\n[提示: 多名群友正在刷屏复读同一句话，用一句简短俏皮的话自然打断复读。]"
@@ -1744,6 +1761,8 @@ func (r *Room) runTurnWorker(
 		userPayload.Text += "\n[提示: 群友刚秒撤回了一条消息，顺口吃瓜调侃一句（1~12字，别原封不动复述敏感或隐私内容），没意思就直接输出 [[skip]]。]"
 	} else if trig.kind == "link" {
 		userPayload.Text += "\n[提示: 系统已将这条链接的纯文本基础解析发到群里了，不要重复复读标题和播放量等基础信息；只按你的性格顺口吐槽、接梗或补一句有意思的点评，觉得解析本身已经够清楚、没必要再补话就直接输出 [[skip]]。]"
+	} else if advisoryDomain == AdvisoryDomainTravel {
+		userPayload.Text += "\n[提示: 群友在认真问旅游/出行/酒店/美食/航旅攻略，切入“嘴硬但真懂行的旅行老哥”模式：1) 先注意对方群名片或上下文里的常驻地、出发日期、航班车次和预算；2) 涉及时效攻略/酒店/新规/退税/物价，先并发用 web_search_prime(content_size=\"high\", search_recency_filter=\"oneYear\") 查最新实况与避坑，查目的地未来天气/日落用 weather，查外币汇率用 quote，顺手可用 recall(mode=\"memory\"或\"raw\", query=\"目的地\") 翻本群群友近期去过的实测经验；3) 先甩结论，按地理分区排顺路动线不折返跑，落到具体片区/地铁站或店名，补1~2条实战避坑（闭馆日/预约抢票/交通耗时/退税或溢价坑），查不到实时房价舱位就坦诚说明并给查价动作绝不瞎编；4) 多日行程或酒店对比可直接用 compute 的 chart.card/chart.table 出图，正文保持高密度纯文本分段，不要写 Markdown #/** 符号和 AI 客服腔。]"
 	} else if advisoryMode {
 		userPayload.Text += "\n[提示: 群友在认真问攻略/建议，切入“嘴硬但真懂行的群友”模式：先给结论、给带取舍条件的方案、补1~2条实战避坑（涉及时效价格/版本/新规先并发查证再答）；做多款参数横评或多日行程表可直接用 compute 的 chart.table/chart.card 出图，正文保持高密度纯文本分段，不要写 Markdown #/** 符号和 AI 客服腔。]"
 	} else if trig.kind == "thread" && !hasRichMediaPart(trig.msg) && len([]rune(strings.TrimSpace(trig.msg.TextOnly()))) <= 6 {
@@ -1802,15 +1821,26 @@ func (r *Room) runTurnWorker(
 	}
 
 	// Build TurnPlan with natural output formatting using LIVE message displacement count.
-	bubbles := FormatBubbles(out.Text, cfg.Policy)
+	cleanOutText := SanitizeReplyMarkdown(out.Text)
+	bubbles := FormatBubbles(cleanOutText, cfg.Policy)
 	var forwardLead string
 	var forwardNodeTexts []string
-	if r.ch.IsGroup() && advisoryMode && cfg.Policy.Advisory.ForwardMinChars > 0 && len([]rune(strings.TrimSpace(out.Text))) >= cfg.Policy.Advisory.ForwardMinChars {
+	fwdMin := cfg.Policy.Advisory.ForwardMinChars
+	if len(out.DirectMedia) > 0 && fwdMin > 0 {
+		// When a guide/comparison PNG card was already generated, avoid redundant forward-card wrapping
+		// unless the accompanying prose itself is very long.
+		if doubled := fwdMin * 2; doubled > 700 {
+			fwdMin = doubled
+		} else {
+			fwdMin = 700
+		}
+	}
+	if r.ch.IsGroup() && advisoryMode && fwdMin > 0 && len([]rune(strings.TrimSpace(cleanOutText))) >= fwdMin {
 		selfID := ""
 		if r.mgr.tr != nil {
 			selfID = r.mgr.tr.SelfID()
 		}
-		if lead, fnodes := BuildForwardGuide(out.Text, r.botDisplayName(cfg), selfID); len(fnodes) >= 2 {
+		if lead, fnodes := BuildForwardGuide(cleanOutText, r.botDisplayName(cfg), selfID); len(fnodes) >= 2 {
 			forwardLead = lead
 			for _, fn := range fnodes {
 				forwardNodeTexts = append(forwardNodeTexts, fn.Text)
@@ -1822,8 +1852,8 @@ func (r *Room) runTurnWorker(
 	if cfg.Policy.Poke.Mode != "ignore" &&
 		cfg.Policy.Poke.AfterReplyProb > 0 &&
 		trig.msg.SenderID != "" && trig.msg.SenderID != "system" &&
-		len([]rune(out.Text)) > 0 &&
-		(cfg.Policy.Poke.AfterReplyMaxChars <= 0 || len([]rune(out.Text)) <= cfg.Policy.Poke.AfterReplyMaxChars) &&
+		len([]rune(cleanOutText)) > 0 &&
+		(cfg.Policy.Poke.AfterReplyMaxChars <= 0 || len([]rune(cleanOutText)) <= cfg.Policy.Poke.AfterReplyMaxChars) &&
 		rand.Float64() < cfg.Policy.Poke.AfterReplyProb {
 		pokeAfter = true
 	}
@@ -1835,7 +1865,7 @@ func (r *Room) runTurnWorker(
 		TriggerUserID:  trig.msg.SenderID,
 		TriggerKind:    trig.kind,
 		Advisory:       advisoryMode,
-		RawText:        out.Text,
+		RawText:        cleanOutText,
 		Bubbles:        bubbles,
 		ForwardLead:    forwardLead,
 		ForwardNodes:   forwardNodeTexts,
@@ -1895,7 +1925,7 @@ func (r *Room) deliverPlan(ctx context.Context, seg *store.SegmentRecord, plan m
 					Text:       txt,
 				})
 			}
-			fpid, ferr := r.mgr.tr.SendForward(ctx, r.ch, fnodes, botName+" 攻略卡片")
+			fpid, ferr := r.mgr.tr.SendForward(ctx, r.ch, fnodes, ExtractGuideTitle(plan.RawText, botName))
 			if ferr == nil {
 				forwardDelivered = true
 				r.recordOutbound(time.Now())
@@ -2495,7 +2525,7 @@ func (r *Room) summarizeClosedSegment(seg *store.SegmentRecord) {
 // FormatBubbles splits prose newlines into <= maxBubbles short bubbles while keeping fenced code
 // blocks and Markdown tables intact, and optionally strips isolated trailing periods.
 func FormatBubbles(text string, pol config.PolicyConfig) []string {
-	text = strings.TrimSpace(text)
+	text = SanitizeReplyMarkdown(text)
 	if text == "" {
 		return nil
 	}

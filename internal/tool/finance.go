@@ -30,17 +30,26 @@ import (
 
 type QuoteArgs struct {
 	Mode      string `json:"mode,omitempty" jsonschema:"enum=quote,enum=market,enum=news,enum=fundamentals,enum=search,description=Operation mode: quote (default realtime+K-line+indicators), market (A/HK/US indices+breadth+sectors+capital flow), news (realtime CLS/Eastmoney finance telegraph), fundamentals (F10 financials+valuation), search (resolve Chinese/English name to ticker)"`
-	Symbol    string `json:"symbol,omitempty" jsonschema:"description=Single or comma-separated tickers or names (up to 5), e.g. 'usNVDA', 'sh600519,sz000858', '中芯国际', '510300', 'hk00700', '恒生科技', '标普500', 'BTC', '黄金', 'USDCNY', 'fund:110011'"`
+	Symbol    string `json:"symbol,omitempty" jsonschema:"description=Single or comma-separated tickers or names (up to 5), e.g. 'usNVDA', 'sh600519,sz000858', '中芯国际', '510300', 'hk00700', '恒生科技', '标普500', 'BTC', '黄金', 'USDCNY', '日元', 'HKDCNY', 'THBCNY', 'EURCNY', 'fund:110011'"`
 	Days      int    `json:"days,omitempty" jsonschema:"description=Number of K-line bars to fetch (default 20, max 250; use >=60 for MA60 or 250 for 1Y/YTD)"`
 	Period    string `json:"period,omitempty" jsonschema:"enum=day,enum=week,enum=month,description=K-line period (default day)"`
 	ChartMode string `json:"chart_mode,omitempty" jsonschema:"enum=none,enum=kline,enum=compare,description=Optional direct PNG chart output without copying OHLCV: kline (candlestick+MA+volume) or compare (normalized % return comparison for 2-5 symbols)"`
 	Query     string `json:"query,omitempty" jsonschema:"description=Optional search keyword for mode=search or keyword filter for mode=news"`
 }
 
+type fxCacheEntry struct {
+	rates     map[string]float64
+	updatedAt string
+	expiresAt time.Time
+}
+
 type QuoteTool struct {
-	mu       sync.RWMutex
-	client   *http.Client
-	renderer *ChartRenderer
+	mu        sync.RWMutex
+	client    *http.Client
+	renderer  *ChartRenderer
+	fxBaseURL string
+	fxMu      sync.Mutex
+	fxCache   map[string]fxCacheEntry
 }
 
 func NewQuoteTool(allowHosts []string, renderer *ChartRenderer) *QuoteTool {
@@ -49,7 +58,9 @@ func NewQuoteTool(allowHosts []string, renderer *ChartRenderer) *QuoteTool {
 			Timeout:    12 * time.Second,
 			AllowHosts: allowHosts,
 		}),
-		renderer: renderer,
+		renderer:  renderer,
+		fxBaseURL: "https://open.er-api.com/v6/latest",
+		fxCache:   make(map[string]fxCacheEntry),
 	}
 }
 
@@ -70,7 +81,7 @@ func (t *QuoteTool) httpClient() *http.Client {
 func (t *QuoteTool) Name() string   { return "quote" }
 func (t *QuoteTool) ReadOnly() bool { return true }
 func (t *QuoteTool) Description() string {
-	return "Pure-Go financial intelligence tool: realtime quotes + K-lines + auto technical indicators + direct PNG K-line/comparison charts for A-share/ETF/BSE, HK, US, indices, crypto (BTC/ETH/SOL), FX (USDCNY/DXY), commodities (gold/oil), and CN mutual funds; also supports fuzzy name search, market pulse (breadth/sectors/southbound), realtime finance news telegraph, and company F10 fundamentals."
+	return "Pure-Go financial intelligence tool: realtime quotes + K-lines + auto technical indicators + direct PNG K-line/comparison charts for A-share/ETF/BSE, HK, US, indices, crypto (BTC/ETH/SOL), FX (USDCNY/JPYCNY/HKDCNY/EURCNY/THBCNY/KRWCNY/GBPCNY/SGDCNY/TWDCNY/AUDCNY/DXY), commodities (gold/oil), and CN mutual funds; also supports fuzzy name search, market pulse (breadth/sectors/southbound), realtime finance news telegraph, and company F10 fundamentals."
 }
 
 type quoteSnapshot struct {
@@ -321,7 +332,7 @@ func (t *QuoteTool) FetchLivePrices(ctx context.Context, symbols []string) map[s
 	var tencentSyms []string
 	var otherSyms []string
 	for _, s := range symbols {
-		if strings.HasPrefix(s, "crypto:") || strings.HasPrefix(s, "em:") || strings.HasPrefix(s, "fund:") {
+		if strings.HasPrefix(s, "crypto:") || strings.HasPrefix(s, "em:") || strings.HasPrefix(s, "fund:") || strings.HasPrefix(s, "fx:") {
 			otherSyms = append(otherSyms, s)
 		} else {
 			tencentSyms = append(tencentSyms, s)
@@ -422,6 +433,9 @@ func normalizeTicker(s string) string {
 	if strings.HasPrefix(low, "fund:") {
 		return "fund:" + strings.TrimSpace(s[5:])
 	}
+	if strings.HasPrefix(low, "fx:") {
+		return "fx:" + strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(s[3:]), "/", ""))
+	}
 
 	// Common index, crypto, FX, and commodity aliases.
 	switch low {
@@ -502,6 +516,51 @@ func normalizeTicker(s string) string {
 		return "em:119.EURUSD"
 	case "美元指数", "dxy", "udi":
 		return "em:100.UDI"
+	// Travel & Global FX pairs (open.er-api.com zero-key spot rates)
+	case "日元", "日元汇率", "日元人民币", "jpycny", "jpy/cny", "cnyjpy", "cny/jpy", "jpy":
+		return "fx:JPYCNY"
+	case "港币", "港元", "港币汇率", "港元汇率", "hkdcny", "hkd/cny", "hkd":
+		return "fx:HKDCNY"
+	case "欧元", "欧元汇率", "欧元人民币", "eurcny", "eur/cny", "eur":
+		return "fx:EURCNY"
+	case "英镑", "英镑汇率", "英镑人民币", "gbpcny", "gbp/cny", "gbp":
+		return "fx:GBPCNY"
+	case "泰铢", "泰铢汇率", "thbcny", "thb/cny", "thb":
+		return "fx:THBCNY"
+	case "韩元", "韩元汇率", "krwcny", "krw/cny", "krw":
+		return "fx:KRWCNY"
+	case "新币", "新加坡元", "新币汇率", "sgdcny", "sgd/cny", "sgd":
+		return "fx:SGDCNY"
+	case "台币", "新台币", "台币汇率", "twdcny", "twd/cny", "twd":
+		return "fx:TWDCNY"
+	case "澳元", "澳币", "澳元汇率", "audcny", "aud/cny", "aud":
+		return "fx:AUDCNY"
+	case "加元", "加币", "加元汇率", "cadcny", "cad/cny", "cad":
+		return "fx:CADCNY"
+	case "纽币", "新西兰元", "nzdcny", "nzd/cny", "nzd":
+		return "fx:NZDCNY"
+	case "瑞郎", "瑞士法郎", "chfcny", "chf/cny", "chf":
+		return "fx:CHFCNY"
+	case "马币", "马来西亚林吉特", "林吉特", "myrcny", "myr/cny", "myr":
+		return "fx:MYRCNY"
+	case "越南盾", "vndcny", "vnd/cny", "vnd":
+		return "fx:VNDCNY"
+	case "印尼盾", "印尼卢比", "idrcny", "idr/cny", "idr":
+		return "fx:IDRCNY"
+	case "菲律宾比索", "phpcny", "php/cny":
+		return "fx:PHPCNY"
+	case "卢布", "俄罗斯卢布", "rubcny", "rub/cny", "rub":
+		return "fx:RUBCNY"
+	case "迪拉姆", "aedcny", "aed/cny":
+		return "fx:AEDCNY"
+	case "澳门元", "澳门币", "mopcny", "mop/cny", "mop":
+		return "fx:MOPCNY"
+	}
+
+	// Generic 6-letter FX pair ending/starting with CNY (e.g. TRYCNY, SEKCNY, CNYJPY).
+	cleanFX := strings.ToUpper(strings.ReplaceAll(s, "/", ""))
+	if len(cleanFX) == 6 && isASCIIAlphaOnly(cleanFX) && (strings.HasSuffix(cleanFX, "CNY") || strings.HasPrefix(cleanFX, "CNY")) {
+		return "fx:" + cleanFX
 	}
 
 	// Crypto pair suffix pattern e.g. PEPEUSDT / LINK-USDT.
@@ -560,6 +619,8 @@ func inferMarket(sym string) string {
 		return "crypto"
 	case strings.HasPrefix(sym, "fund:"):
 		return "fund"
+	case strings.HasPrefix(sym, "fx:"):
+		return "fx"
 	case strings.HasPrefix(sym, "em:"):
 		if strings.Contains(sym, "USD") || strings.Contains(sym, "EUR") || strings.Contains(sym, "UDI") ||
 			strings.HasPrefix(sym, "em:101.") || strings.HasPrefix(sym, "em:102.") || strings.HasPrefix(sym, "em:118.") {
@@ -725,8 +786,19 @@ func (t *QuoteTool) fetchOneQuoteOnly(ctx context.Context, raw string) (*quoteSn
 	switch {
 	case strings.HasPrefix(sym, "crypto:"):
 		return t.fetchCryptoQuote(ctx, strings.TrimPrefix(sym, "crypto:"))
+	case strings.HasPrefix(sym, "fx:"):
+		return t.fetchFXQuote(ctx, strings.TrimPrefix(sym, "fx:"))
 	case strings.HasPrefix(sym, "em:"):
-		return t.fetchEastmoneyQuote(ctx, strings.TrimPrefix(sym, "em:"), sym)
+		secid := strings.TrimPrefix(sym, "em:")
+		sn, err := t.fetchEastmoneyQuote(ctx, secid, sym)
+		if err != nil {
+			if pair := eastmoneyFXFallbackPair(secid); pair != "" {
+				if fsn, ferr := t.fetchFXQuote(ctx, pair); ferr == nil && fsn != nil {
+					return fsn, nil
+				}
+			}
+		}
+		return sn, err
 	case strings.HasPrefix(sym, "fund:"):
 		return t.fetchFundQuote(ctx, strings.TrimPrefix(sym, "fund:"))
 	default:
@@ -766,10 +838,18 @@ func (t *QuoteTool) fetchOneFull(ctx context.Context, raw, period string, days i
 		sn.Candles, _ = t.fetchCryptoKlines(ctx, base, period, days)
 		return sn, nil
 
+	case strings.HasPrefix(sym, "fx:"):
+		return t.fetchFXQuote(ctx, strings.TrimPrefix(sym, "fx:"))
+
 	case strings.HasPrefix(sym, "em:"):
 		secid := strings.TrimPrefix(sym, "em:")
 		sn, err := t.fetchEastmoneyQuote(ctx, secid, sym)
 		if err != nil {
+			if pair := eastmoneyFXFallbackPair(secid); pair != "" {
+				if fsn, ferr := t.fetchFXQuote(ctx, pair); ferr == nil && fsn != nil {
+					return fsn, nil
+				}
+			}
 			return nil, err
 		}
 		sn.Candles, _ = t.fetchEastmoneyKlines(ctx, secid, period, days)
@@ -2233,6 +2313,143 @@ func isASCIIAlphaNum(s string) bool {
 		}
 	}
 	return true
+}
+
+func isASCIIAlphaOnly(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+			return false
+		}
+	}
+	return true
+}
+
+func eastmoneyFXFallbackPair(secid string) string {
+	switch strings.ToUpper(strings.TrimSpace(secid)) {
+	case "120.USDCNY", "133.USDCNH":
+		return "USDCNY"
+	case "119.USDJPY":
+		return "USDJPY"
+	case "119.EURUSD":
+		return "EURUSD"
+	default:
+		return ""
+	}
+}
+
+var fxCurrencyNamesZH = map[string]string{
+	"CNY": "人民币", "USD": "美元", "JPY": "日元", "HKD": "港币", "EUR": "欧元",
+	"GBP": "英镑", "THB": "泰铢", "KRW": "韩元", "SGD": "新加坡元", "TWD": "新台币",
+	"AUD": "澳元", "CAD": "加元", "NZD": "新西兰元", "CHF": "瑞士法郎", "MYR": "马来西亚林吉特",
+	"VND": "越南盾", "IDR": "印尼盾", "PHP": "菲律宾比索", "RUB": "俄罗斯卢布",
+	"AED": "阿联酋迪拉姆", "MOP": "澳门元", "TRY": "土耳其里拉",
+}
+
+func (t *QuoteTool) fetchFXQuote(ctx context.Context, pair string) (*quoteSnapshot, error) {
+	clean := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(pair), "/", ""))
+	if len(clean) != 6 || !isASCIIAlphaOnly(clean) {
+		return nil, fmt.Errorf("fx: invalid currency pair %q", pair)
+	}
+	base, quote := clean[:3], clean[3:]
+	if base == quote {
+		return nil, fmt.Errorf("fx: identical currencies in %q", pair)
+	}
+
+	rates, updatedAt, err := t.fetchFXRatesMap(ctx, base)
+	if err != nil {
+		return nil, err
+	}
+	rate, ok := rates[quote]
+	if !ok || rate <= 0 {
+		return nil, fmt.Errorf("fx: currency %s not available against %s", quote, base)
+	}
+	inv := 1.0 / rate
+	baseZH := fxCurrencyNamesZH[base]
+	if baseZH == "" {
+		baseZH = base
+	}
+	quoteZH := fxCurrencyNamesZH[quote]
+	if quoteZH == "" {
+		quoteZH = quote
+	}
+
+	// Build traveler-friendly conversion note (100/1000-unit scale for low-unit currencies like JPY/KRW/VND).
+	var note string
+	if rate < 0.01 {
+		note = fmt.Sprintf("1000 %s ≈ %.2f %s | 1 %s ≈ %.2f %s", base, rate*1000, quote, quote, inv, base)
+	} else if rate < 0.2 {
+		note = fmt.Sprintf("100 %s ≈ %.2f %s | 1 %s ≈ %.2f %s", base, rate*100, quote, quote, inv, base)
+	} else {
+		note = fmt.Sprintf("1 %s ≈ %.4f %s | 1 %s ≈ %.4f %s", base, rate, quote, quote, inv, base)
+	}
+
+	ts := updatedAt
+	if ts == "" {
+		ts = time.Now().Format("2006-01-02 15:04")
+	}
+	return &quoteSnapshot{
+		Symbol:    "fx:" + clean,
+		Name:      fmt.Sprintf("%s兑%s", baseZH, quoteZH),
+		Code:      base + "/" + quote,
+		Market:    "fx",
+		Price:     rate,
+		PrevClose: rate,
+		Timestamp: ts,
+		Status:    "参考汇率",
+		ExtraNote: note,
+	}, nil
+}
+
+func (t *QuoteTool) fetchFXRatesMap(ctx context.Context, base string) (map[string]float64, string, error) {
+	now := time.Now()
+	t.fxMu.Lock()
+	if ent, ok := t.fxCache[base]; ok && now.Before(ent.expiresAt) && len(ent.rates) > 0 {
+		t.fxMu.Unlock()
+		return ent.rates, ent.updatedAt, nil
+	}
+	t.fxMu.Unlock()
+
+	baseURL := t.fxBaseURL
+	if baseURL == "" {
+		baseURL = "https://open.er-api.com/v6/latest"
+	}
+	u := strings.TrimRight(baseURL, "/") + "/" + url.PathEscape(base)
+	raw, _, code, err := netutil.FetchLimited(ctx, t.httpClient(), u, 256<<10, map[string]string{
+		"User-Agent": "fatfish-quote/1.0",
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("fx: fetch failed: %w", err)
+	}
+	if code >= 400 {
+		return nil, "", fmt.Errorf("fx: HTTP %d", code)
+	}
+	var parsed struct {
+		Result            string             `json:"result"`
+		TimeLastUpdateUTC string             `json:"time_last_update_utc"`
+		Rates             map[string]float64 `json:"rates"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil || len(parsed.Rates) == 0 {
+		return nil, "", fmt.Errorf("fx: invalid rate payload for %s", base)
+	}
+	upd := strings.TrimSpace(parsed.TimeLastUpdateUTC)
+	if len(upd) > 25 {
+		upd = upd[:25]
+	}
+
+	t.fxMu.Lock()
+	if t.fxCache == nil {
+		t.fxCache = make(map[string]fxCacheEntry)
+	}
+	t.fxCache[base] = fxCacheEntry{
+		rates:     parsed.Rates,
+		updatedAt: upd,
+		expiresAt: now.Add(15 * time.Minute),
+	}
+	t.fxMu.Unlock()
+	return parsed.Rates, upd, nil
 }
 
 func isASCIIStockRest(s string) bool {

@@ -121,6 +121,88 @@ func TestBuildForwardGuide(t *testing.T) {
 	}
 }
 
+func TestTravelAdvisoryRegressionSuiteFromProdHistory(t *testing.T) {
+	// Real-world anonymized travel/dining/hotel/aviation questions distilled from production chat patterns.
+	travelCases := []struct {
+		name             string
+		text             string
+		trigKind         string
+		inAdvisoryThread bool
+		prevDomain       AdvisoryDomain
+		want             AdvisoryDomain
+	}{
+		// Positive travel queries (previously missed or generic)
+		{name: "hot spring recommend", text: "广东温泉有推荐的嘛？", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "local food ask", text: "杭州下沙有什么好吃的店", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "bathhouse recommend", text: "太原有什么洗浴中心推荐", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "city food and fun", text: "辽阳有什么好玩的好吃的", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "one day trip", text: "辽阳一日游怎么玩比较好", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "destination recommend", text: "香港有推荐去的地方吗", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "hotel budget pick", text: "深圳500左右酒店哪家强", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "hotel review", text: "点评一下深圳东华假日酒店", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "hotel sharp review", text: "锐评一下深航国际酒店怎么样，我特别喜欢这家", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "iceland cost estimate", text: "北京出发，去冰岛看极光需要看多少钱，考虑往返路费和酒店", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "3-day departure ask", text: "11月杭州出发3天旅游去哪里合适", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "winter destination ask", text: "12月份如果被裁了适合去哪儿玩", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "border lazy trip cost", text: "北京出发去海参崴延边懒人游来回开销多少", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "mileage run flight", text: "推荐下近一个月北京出发的国航刷段性价比捡漏票", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "connecting flight rule", text: "连程航班，可以甩掉第一程吗？", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "tax refund policy", text: "日本现在对外国游客的退税政策是怎样的？", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "xiamen pace choice", text: "我没想好落地厦门是特种兵还是玩两天", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "hk 2-day plan", text: "我计划24~25去hk看电影，住一晚丽晶酒店，帮我规划下剩下的行程", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "spot photo guide", text: "帮我制定个打卡攻略和最佳出行时间计划吧", trigKind: "mention", want: AdvisoryDomainTravel},
+		{name: "station food recommend", text: "高铁站附近有啥具体到店的推荐", trigKind: "mention", want: AdvisoryDomainTravel},
+
+		// Follow-ups with explicit @mention inside active travel thread must stay in Travel domain!
+		{name: "mention followup exclude region", text: "不要江浙沪", trigKind: "mention", inAdvisoryThread: true, prevDomain: AdvisoryDomainTravel, want: AdvisoryDomainTravel},
+		{name: "mention followup unlimited budget", text: "预算不限，最推荐哪个", trigKind: "mention", inAdvisoryThread: true, prevDomain: AdvisoryDomainTravel, want: AdvisoryDomainTravel},
+		{name: "mention followup add stop", text: "能不能中午再加一个锡林浩特", trigKind: "mention", inAdvisoryThread: true, prevDomain: AdvisoryDomainTravel, want: AdvisoryDomainTravel},
+
+		// Non-travel general advisory stays General
+		{name: "monitor buying stays general", text: "预算3000想买个27寸4K显示器，写代码偶尔打FPS，帮我选选", trigKind: "mention", want: AdvisoryDomainGeneral},
+		{name: "docker debug stays general", text: "Docker 配 Nginx 反代老是 502，宿主机端口通的，咋排查？", trigKind: "reply", want: AdvisoryDomainGeneral},
+
+		// Banter / trolling / proactive guards must NOT falsely trigger
+		{name: "banter group travels", text: "群友怎么天天旅游", trigKind: "mention", want: AdvisoryDomainNone},
+		{name: "banter tasty members", text: "那你记得好吃的群友吗", trigKind: "mention", want: AdvisoryDomainNone},
+		{name: "banter ask bot location", text: "你最近在哪旅游呢", trigKind: "mention", want: AdvisoryDomainNone},
+		{name: "banter ask bot visited", text: "你去过日本吗", trigKind: "mention", want: AdvisoryDomainNone},
+		{name: "proactive travel never advisory", text: "深圳500左右酒店哪家强", trigKind: "proactive", want: AdvisoryDomainNone},
+	}
+
+	for _, tc := range travelCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := DetectAdvisoryDomainWithPrev(tc.text, tc.trigKind, tc.inAdvisoryThread, tc.prevDomain)
+			if got != tc.want {
+				t.Fatalf("DetectAdvisoryDomainWithPrev(%q, %q, %v, %q) = %q, want %q",
+					tc.text, tc.trigKind, tc.inAdvisoryThread, tc.prevDomain, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSanitizeReplyMarkdownAndGuideTitle(t *testing.T) {
+	raw := strings.Join([]string{
+		"### 关西4日攻略",
+		"**核心结论**：大阪住到底，抽2天往返京都。",
+		"> 避坑：清水寺早8点前冲。",
+		"```python",
+		"x = 2 ** 3  # keep code intact",
+		"```",
+	}, "\n")
+	got := SanitizeReplyMarkdown(raw)
+	if strings.Contains(got, "###") || strings.Contains(got, "**核心结论**") || strings.Contains(got, "> 避坑") {
+		t.Fatalf("markdown markers leaked into plain text:\n%s", got)
+	}
+	if !strings.Contains(got, "【关西4日攻略】") || !strings.Contains(got, "x = 2 ** 3") {
+		t.Fatalf("expected heading conversion and preserved code block, got:\n%s", got)
+	}
+	title := ExtractGuideTitle(got, "大肥鱼")
+	if title != "大肥鱼 · 关西4日攻略" {
+		t.Fatalf("ExtractGuideTitle() = %q, want %q", title, "大肥鱼 · 关西4日攻略")
+	}
+}
+
 func TestAdvisoryDynamicParamsAndForwardDelivery(t *testing.T) {
 	var mu sync.Mutex
 	var captured []infer.ChatRequest

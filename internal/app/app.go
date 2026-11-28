@@ -122,8 +122,9 @@ func New(configPath string, enableTransport bool) (*App, error) {
 	readSourceTool.SetParser(linkParser)
 	quoteTool := tool.NewQuoteTool(cfg.Tools.SSRFAllowHosts, computeTool.Renderer())
 	sched.SetPriceFetcher(quoteTool)
+	weatherTool := tool.NewWeatherTool(cfg.Tools.SSRFAllowHosts)
 	interactTool := tool.NewInteractTool(tr, cfg.Tools.AllowRelayChannels)
-	if err := registerBuiltins(reg, st, memSvc, stkEng, sched, computeTool, webSearchTool, readSourceTool, quoteTool, interactTool, travelSvc, cfg.Travel.Enabled); err != nil {
+	if err := registerBuiltins(reg, st, memSvc, stkEng, sched, computeTool, webSearchTool, readSourceTool, quoteTool, weatherTool, interactTool, travelSvc, cfg.Travel.Enabled); err != nil {
 		_ = st.Close()
 		return nil, err
 	}
@@ -199,6 +200,7 @@ func New(configPath string, enableTransport bool) (*App, error) {
 		webSearchTool.UpdateAllowHosts(newCfg.Tools.SSRFAllowHosts)
 		readSourceTool.UpdateAllowHosts(newCfg.Tools.SSRFAllowHosts)
 		quoteTool.UpdateAllowHosts(newCfg.Tools.SSRFAllowHosts)
+		weatherTool.UpdateAllowHosts(newCfg.Tools.SSRFAllowHosts)
 		interactTool.UpdateAllowRelayChannels(newCfg.Tools.AllowRelayChannels)
 		logger.Info("configuration hot-reloaded")
 	})
@@ -247,6 +249,7 @@ func registerBuiltins(
 	webSearch *tool.WebSearchTool,
 	readSource *tool.ReadSourceTool,
 	quote *tool.QuoteTool,
+	weather *tool.WeatherTool,
 	interact *tool.InteractTool,
 	travelSvc *travel.Service,
 	travelEnabled bool,
@@ -267,6 +270,9 @@ func registerBuiltins(
 		return err
 	}
 	if err := tool.Register[tool.QuoteArgs](reg, quote); err != nil {
+		return err
+	}
+	if err := tool.Register[tool.WeatherArgs](reg, weather); err != nil {
 		return err
 	}
 	if err := tool.Register[tool.ScheduleArgs](reg, tool.NewScheduleTool(sched, st)); err != nil {

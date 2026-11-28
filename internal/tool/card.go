@@ -291,7 +291,7 @@ func (c *ChartRenderer) RenderCard(title, subtitle string, sections []CardSectio
 			if it == "" {
 				continue
 			}
-			wrapped := wrapTextToWidth(bodyFace, "• "+it, contentW-12, 4)
+			wrapped := wrapTextToWidth(bodyFace, "• "+it, contentW-12, 5)
 			ls.items = append(ls.items, wrapped)
 			h += len(wrapped)*lineH + 6
 		}
@@ -301,7 +301,7 @@ func (c *ChartRenderer) RenderCard(title, subtitle string, sections []CardSectio
 		totalSecH += h + 12
 	}
 
-	footerLines := wrapTextToWidth(subFace, strings.TrimSpace(footer), contentW-16, 3)
+	footerLines := wrapTextToWidth(subFace, strings.TrimSpace(footer), contentW-16, 6)
 	footerH := 0
 	if len(footerLines) > 0 {
 		footerH = len(footerLines)*19 + 24
@@ -312,8 +312,8 @@ func (c *ChartRenderer) RenderCard(title, subtitle string, sections []CardSectio
 		headerH = 98
 	}
 	H := outerPad + headerH + 14 + totalSecH + footerH + outerPad
-	if H > 2400 {
-		H = 2400
+	if H > 2800 {
+		H = 2800
 	}
 
 	bgCol := color.RGBA{241, 245, 249, 255}
@@ -359,7 +359,10 @@ func (c *ChartRenderer) RenderCard(title, subtitle string, sections []CardSectio
 
 		y := curY + 26
 		if ls.heading != "" {
-			tag := fmt.Sprintf("%d. %s", si+1, ls.heading)
+			tag := ls.heading
+			if !hasLeadingOrdinalOrTag(ls.heading) {
+				tag = fmt.Sprintf("%d. %s", si+1, ls.heading)
+			}
 			hLines := wrapTextToWidth(secFace, tag, contentW, 1)
 			if len(hLines) > 0 {
 				drawText(img, secFace, hLines[0], outerPad+innerPad, y, textDark)
@@ -402,6 +405,24 @@ func drawRectBorder(img *image.RGBA, x0, y0, x1, y1 int, col color.RGBA) {
 	drawLine(img, x0, y1, x1, y1, col)
 	drawLine(img, x0, y0, x0, y1, col)
 	drawLine(img, x1, y0, x1, y1, col)
+}
+
+func hasLeadingOrdinalOrTag(heading string) bool {
+	h := strings.TrimSpace(heading)
+	if h == "" {
+		return false
+	}
+	low := strings.ToLower(h)
+	if strings.HasPrefix(low, "day") || strings.HasPrefix(h, "【") || strings.HasPrefix(h, "[") || strings.HasPrefix(h, "第") {
+		return true
+	}
+	if len(low) >= 2 && low[0] == 'd' && low[1] >= '0' && low[1] <= '9' {
+		return true
+	}
+	if h[0] >= '0' && h[0] <= '9' {
+		return true
+	}
+	return false
 }
 
 // wrapTextToWidth wraps mixed CJK/ASCII text by rendered pixel width up to maxLines.

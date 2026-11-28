@@ -771,13 +771,14 @@ func (s *Service) DistillWindow(ctx context.Context, ch model.ChannelID, win []m
 	sysPrompt := `Extract a concise structured JSON summary of this chat episode STRICTLY in Simplified Chinese (keep English only for proper acronyms/tickers).
 Rules:
 1. Key every participant strictly by their immutable member_id shown in parentheses, NEVER by nickname.
-2. candidate_facts: ONLY enduring personal traits, job/school, city, hobbies, or recurring habits. NEVER record one-off stock/crypto prices, transient news headlines, single trade orders, bot commands, or sarcasm/jokes.
-3. Separate jokes/sarcasm/shitposting into candidate_jokes or candidate_lore; NEVER record sarcasm as candidate_facts.
-4. Never extract candidate_facts, candidate_jokes, or member_styles for the bot itself or other bots.
-5. candidate_lore: ONLY genuine recurring group slang, inside jokes, or nicknames (at most 3 items). NEVER record standalone numbers/prices, ordinary dictionary words, or generic product/library names.
-6. For member_styles, capture brief interaction vibe with the group/bot when clear (e.g. "爱互怼的熟人", "爱聊技术的老哥", "话少但爱发图"), at most 12 chars.
-7. Keep arrays compact (at most 5 items each) so the JSON stays concise and valid.
-8. Keep all summaries, facts, jokes, and lore SFW and neutral: if chat contains explicit sexual, vulgar, or politically sensitive details, abstract them neutrally in Chinese (e.g. "成人玩笑", "敏感话题调侃") and NEVER copy explicit sexual/vulgar/political terms verbatim into lore, summary, or facts.
+2. candidate_facts: ONLY enduring personal traits, job/school, base city, hobbies, recurring habits, or concrete travel/venue preferences & real experiences (e.g. "常驻杭州", "持有希尔顿钻卡", "去过某温泉/酒店并给出具体好坏评价"). NEVER record one-off stock/crypto prices, transient news headlines, single trade orders, bot commands, or sarcasm/jokes.
+3. In summary: when members discuss trips, hotels, restaurants, airlines, visas, or tax-refund pitfalls, keep concrete destination names, specific hotel/shop names, approximate prices, and real pros/cons or pitfall warnings so future travel recall can reuse them.
+4. Separate jokes/sarcasm/shitposting into candidate_jokes or candidate_lore; NEVER record sarcasm as candidate_facts.
+5. Never extract candidate_facts, candidate_jokes, or member_styles for the bot itself or other bots.
+6. candidate_lore: ONLY genuine recurring group slang, inside jokes, or nicknames (at most 3 items). NEVER record standalone numbers/prices, ordinary dictionary words, or generic product/library names.
+7. For member_styles, capture brief interaction vibe with the group/bot when clear (e.g. "爱互怼的熟人", "爱聊技术的老哥", "话少但爱发图"), at most 12 chars.
+8. Keep arrays compact (at most 5 items each) so the JSON stays concise and valid.
+9. Keep all summaries, facts, jokes, and lore SFW and neutral: if chat contains explicit sexual, vulgar, or politically sensitive details, abstract them neutrally in Chinese (e.g. "成人玩笑", "敏感话题调侃") and NEVER copy explicit sexual/vulgar/political terms verbatim into lore, summary, or facts.
 9. Output ONLY valid compact JSON matching:
 {"topic":"...","summary":"...","participants":[{"id":"...","role_in_topic":"..."}],"notable_quotes":["..."],"candidate_facts":[{"member_id":"...","fact":"...","serious":true}],"candidate_jokes":[{"member_id":"...","joke":"..."}],"member_styles":[{"member_id":"...","style":"..."}],"candidate_lore":[{"term":"...","meaning":"..."}]}`
 

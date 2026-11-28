@@ -562,6 +562,7 @@ var shortenerHosts = map[string]struct{}{
 	"dwz.cn":       {},
 	"163cn.tv":     {},
 	"xhslink.com":  {},
+	"xhslink.cn":   {},
 	"v.douyin.com": {},
 }
 
